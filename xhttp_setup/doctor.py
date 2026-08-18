@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from .errors import InstallerError, VerificationError
+from .exit_installer import Layout, XRAY_ASSETS, XRAY_VERSION, install_xray_binary
+from .front import check_public_tls, https_status
+from .models import Handoff
+from .osutil import command_exists, ensure_dir, load_json, run, sha256_file
+from .render import pretty_json, render_xray_client_config
+from .validate import validate_ipv4
+
+
+@dataclass(frozen=True)
+class Check:
+    name: str
+    ok: bool
+    detail: str
+
+
+def resolve_front(domain: str) -> tuple[list[str], list[str]]:
+    ipv4: set[str] = set()
+    ipv6: set[str] = set()
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(domain, 443):
+            if family == socket.AF_INET:
+                ipv4.add(sockaddr[0])
+            elif family == socket.AF_INET6:
+                ipv6.add(sockaddr[0])
+    except socket.gaierror as exc:
+        raise VerificationError(f"DNS {domain} не разрешается: {exc}") from exc
+    return sorted(ipv4), sorted(ipv6)
+
+
+def doctor_front(domain: str, path: str) -> list[Check]:
+    checks: list[Check] = []
+    try:
+        ipv4, ipv6 = resolve_front(domain)
+        checks.append(Check("DNS A", bool(ipv4), ", ".join(ipv4) or "A-записей нет"))
+        checks.append(
+            Check(
+                "DNS AAAA",
+                not ipv6,
+                "AAAA отсутствует" if not ipv6 else f"обнаружено: {', '.join(ipv6)}",
+            )
+        )
+    except VerificationError as exc:
+        checks.append(Check("DNS", False, str(exc)))
+    try:
+        certificate = check_public_tls(domain)
+        checks.append(
+            Check("TLS", True, f"CA/hostname OK, expires {certificate['notAfter']}")
+        )
+    except VerificationError as exc:
+        checks.append(Check("TLS", False, str(exc)))
+    try:
+        status = https_status(f"https://{domain}/")
+        checks.append(Check("HTTPS root", status < 500, f"HTTP {status}"))
+    except VerificationError as exc:
+        checks.append(Check("HTTPS root", False, str(exc)))
+    try:
+        status = https_status(f"https://{domain}{path}/doctor")
+        checks.append(
+            Check("XHTTP route", status not in {500, 502, 503, 504}, f"HTTP {status}")
+        )
+    except VerificationError as exc:
+        checks.append(Check("XHTTP route", False, str(exc)))
+    return checks
+
+
+def doctor_exit(layout: Layout | None = None) -> list[Check]:
+    layout = layout or Layout()
+    checks: list[Check] = []
+    architecture = __import__("platform").machine().lower()
+    expected = XRAY_ASSETS.get(architecture, (None, None))[1]
+    if layout.binary.exists() and expected:
+        manifest_path = layout.binary_dir / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest is not an object")
+            files = manifest.get("files")
+            if not isinstance(files, dict):
+                raise ValueError("manifest files is not an object")
+            required = ("xray", "geoip.dat", "geosite.dat")
+            intact = (
+                manifest.get("archive_sha256") == expected
+                and all(isinstance(files.get(name), str) for name in required)
+                and all(
+                    (layout.binary_dir / name).is_file()
+                    and files[name] == sha256_file(layout.binary_dir / name)
+                    for name in required
+                )
+            )
+            detail = (
+                f"v{XRAY_VERSION}, archive {manifest.get('archive_sha256', 'missing')}"
+            )
+        except (OSError, ValueError):
+            intact, detail = False, "manifest отсутствует или повреждён"
+        checks.append(Check("Xray supply chain", intact, detail))
+    else:
+        checks.append(Check("Xray binary", False, f"не найден {layout.binary}"))
+    if layout.config.exists() and layout.binary.exists():
+        result = run(
+            [str(layout.binary), "run", "-test", "-c", str(layout.config)], check=False
+        )
+        checks.append(
+            Check(
+                "Xray config",
+                result.returncode == 0,
+                "Configuration OK" if result.returncode == 0 else "config test failed",
+            )
+        )
+    else:
+        checks.append(Check("Xray config", False, "managed config отсутствует"))
+    if layout.root == Path("/") and command_exists("systemctl"):
+        result = run(["systemctl", "is-active", "xhttp-setup-xray"], check=False)
+        checks.append(
+            Check("systemd", result.stdout.strip() == "active", result.stdout.strip())
+        )
+        if layout.receipt.exists():
+            try:
+                port = int(load_json(layout.receipt)["listen_port"])
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    pass
+                checks.append(Check("Xray listener", True, f"127.0.0.1:{port}"))
+            except (KeyError, TypeError, ValueError, OSError, InstallerError) as exc:
+                checks.append(Check("Xray listener", False, str(exc)))
+    for path, required_mode in ((layout.secrets, 0o600), (layout.handoff, 0o600)):
+        if path.exists():
+            actual_mode = path.stat().st_mode & 0o777
+            checks.append(
+                Check(
+                    f"permissions {path.name}",
+                    actual_mode == required_mode,
+                    f"{actual_mode:04o}",
+                )
+            )
+        else:
+            checks.append(Check(f"permissions {path.name}", False, "файл отсутствует"))
+    return checks
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        return int(server.getsockname()[1])
+
+
+def _parse_cloudflare_trace_ip(payload: str) -> str:
+    for line in payload.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "ip":
+            return validate_ipv4(value.strip())
+    raise VerificationError("E2E endpoint не вернул строку ip=...")
+
+
+def _curl_through_socks(*, socks_port: int, url: str):
+    clean_env = os.environ.copy()
+    for key in list(clean_env):
+        if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}:
+            clean_env.pop(key, None)
+    return run(
+        [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "25",
+            "--noproxy",
+            "",
+            "--socks5-hostname",
+            f"127.0.0.1:{socks_port}",
+            url,
+        ],
+        env=clean_env,
+        check=False,
+        timeout=35,
+    )
+
+
+def e2e_probe(
+    *,
+    handoff: Handoff,
+    domain: str,
+    front_address: str,
+    layout: Layout,
+    probe_url: str = "https://www.cloudflare.com/cdn-cgi/trace",
+) -> str:
+    if not command_exists("curl"):
+        raise InstallerError("Для E2E-проверки нужен curl")
+    if not layout.binary.exists():
+        install_xray_binary(layout)
+    port = _free_tcp_port()
+    config = render_xray_client_config(
+        handoff=handoff,
+        domain=domain,
+        socks_port=port,
+        front_address=front_address,
+    )
+    ensure_dir(layout.state, 0o700)
+    descriptor, name = tempfile.mkstemp(
+        prefix="probe-", suffix=".json", dir=layout.state
+    )
+    config_path = Path(name)
+    log_path = layout.state / f"probe-{os.getpid()}.log"
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(pretty_json(config))
+        os.chmod(config_path, 0o600)
+        run([str(layout.binary), "run", "-test", "-c", str(config_path)])
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                [str(layout.binary), "run", "-c", str(config_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        try:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise VerificationError(
+                        "Диагностический Xray завершился до запуска SOCKS"
+                    )
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise VerificationError(
+                    "Диагностический SOCKS не открыл локальный порт"
+                )
+            result = _curl_through_socks(socks_port=port, url=probe_url)
+            if result.returncode != 0 or not result.stdout.strip():
+                raise VerificationError("E2E-запрос через XHTTP/TLS не прошёл")
+            observed_ip = _parse_cloudflare_trace_ip(result.stdout)
+            expected_ip = handoff.expected_egress_ip or handoff.exit_address
+            if observed_ip != expected_ip:
+                raise VerificationError(
+                    f"E2E прошёл через неожиданный egress {observed_ip}; ожидался {expected_ip}"
+                )
+            return f"ip={observed_ip}"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+    finally:
+        config_path.unlink(missing_ok=True)
+        log_path.unlink(missing_ok=True)

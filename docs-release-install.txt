@@ -1,0 +1,48 @@
+Replace OWNER/REPOSITORY once before publishing. Keep the release tag pinned.
+
+(
+  set -Eeuo pipefail
+
+  repo="OWNER/REPOSITORY"
+  tag="v0.1.0"
+  asset="xhttp-setup-0.1.0.pyz"
+
+  command -v curl >/dev/null
+  command -v python3 >/dev/null
+  command -v sha256sum >/dev/null
+
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$temp_dir"' EXIT
+  base="https://github.com/$repo/releases/download/$tag"
+
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --retry 3 \
+    --output "$temp_dir/$asset" "$base/$asset"
+
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --retry 3 \
+    --output "$temp_dir/$asset.sha256" "$base/$asset.sha256"
+
+  expected="$(tr -d '\r\n' < "$temp_dir/$asset.sha256")"
+  case "$expected" in
+    ""|*[!0-9a-fA-F]*) echo "Invalid SHA-256 file" >&2; exit 1 ;;
+  esac
+  [ "${#expected}" -eq 64 ] || { echo "Invalid SHA-256 length" >&2; exit 1; }
+
+  actual="$(sha256sum "$temp_dir/$asset" | awk '{print $1}')"
+  [ "${actual,,}" = "${expected,,}" ] || {
+    echo "SHA-256 mismatch; refusing to execute" >&2
+    exit 1
+  }
+
+  if command -v gh >/dev/null 2>&1 \
+     && gh auth status >/dev/null 2>&1 \
+     && gh release verify-asset --help >/dev/null 2>&1; then
+    gh release verify-asset "$tag" "$temp_dir/$asset" --repo "$repo"
+  else
+    echo "GitHub CLI unavailable: SHA-256 checked; attestation not checked." >&2
+  fi
+
+  sudo install -m 0755 "$temp_dir/$asset" /usr/local/bin/xhttp-setup
+  sudo /usr/local/bin/xhttp-setup
+)
