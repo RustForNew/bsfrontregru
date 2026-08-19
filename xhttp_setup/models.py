@@ -17,7 +17,30 @@ from .validate import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+DEFAULT_TLS_FINGERPRINT = "edge"
+TLS_FINGERPRINTS = frozenset(
+    {
+        "360",
+        "android",
+        "chrome",
+        "edge",
+        "firefox",
+        "ios",
+        "qq",
+        "random",
+        "randomized",
+        "safari",
+    }
+)
+
+
+def validate_tls_fingerprint(value: str) -> str:
+    fingerprint = value.strip().lower()
+    if fingerprint not in TLS_FINGERPRINTS:
+        allowed = ", ".join(sorted(TLS_FINGERPRINTS))
+        raise ValidationError(f"TLS fingerprint должен быть одним из: {allowed}")
+    return fingerprint
 
 
 @dataclass(frozen=True)
@@ -29,6 +52,7 @@ class Handoff:
     encryption: str = field(repr=False)
     label: str = "XHTTP TLS"
     expected_egress_ip: str | None = None
+    tls_fingerprint: str = DEFAULT_TLS_FINGERPRINT
     schema_version: int = SCHEMA_VERSION
 
     def validate(self) -> "Handoff":
@@ -50,6 +74,7 @@ class Handoff:
             expected_egress_ip=validate_ipv4(
                 self.expected_egress_ip or self.exit_address
             ),
+            tls_fingerprint=validate_tls_fingerprint(self.tls_fingerprint),
             schema_version=SCHEMA_VERSION,
         )
 
@@ -58,7 +83,16 @@ class Handoff:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Handoff":
-        return cls(**data).validate()
+        payload = dict(data)
+        if payload.get("schema_version", 1) == 1:
+            # Legacy schema v1 hard-coded Chrome in the smoke client and URI.
+            # Preserve that behaviour when an older protected handoff is reused.
+            payload["tls_fingerprint"] = "chrome"
+            payload["schema_version"] = SCHEMA_VERSION
+        try:
+            return cls(**payload).validate()
+        except TypeError as exc:
+            raise ValidationError("Некорректная структура handoff.json") from exc
 
 
 @dataclass(frozen=True)
@@ -70,6 +104,7 @@ class ExitDesired:
     client_id: str = field(repr=False)
     label: str = "XHTTP TLS"
     expected_egress_ip: str | None = None
+    tls_fingerprint: str = DEFAULT_TLS_FINGERPRINT
 
     def validate(self) -> "ExitDesired":
         listen_port = validate_port(self.listen_port)
@@ -87,13 +122,15 @@ class ExitDesired:
             expected_egress_ip=validate_ipv4(
                 self.expected_egress_ip or self.public_address
             ),
+            tls_fingerprint=validate_tls_fingerprint(self.tls_fingerprint),
         )
 
 
 @dataclass(frozen=True)
 class FrontDesired:
     domain: str
-    front_public_ip: str
+    client_connect_ip: str
+    dns_ipv4: str
     sftp_host: str
     sftp_port: int
     sftp_user: str
@@ -109,7 +146,8 @@ class FrontDesired:
             raise ValidationError("placeholder_mode должен быть keep или neutral")
         return FrontDesired(
             domain=normalize_domain(self.domain),
-            front_public_ip=validate_ipv4(self.front_public_ip),
+            client_connect_ip=validate_ipv4(self.client_connect_ip),
+            dns_ipv4=validate_ipv4(self.dns_ipv4),
             sftp_host=validate_host(self.sftp_host),
             sftp_port=validate_port(self.sftp_port),
             sftp_user=validate_ssh_user(self.sftp_user),

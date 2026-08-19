@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import socket
 import ssl
 import urllib.error
@@ -37,7 +38,7 @@ class _RemoteMutation:
     switch_attempted: bool = False
 
 
-def check_front_dns(domain: str, expected_ipv4: str) -> None:
+def check_front_dns(domain: str, dns_ipv4: str) -> None:
     ipv4: set[str] = set()
     ipv6: set[str] = set()
     try:
@@ -48,10 +49,10 @@ def check_front_dns(domain: str, expected_ipv4: str) -> None:
                 ipv6.add(sockaddr[0])
     except socket.gaierror as exc:
         raise VerificationError(f"DNS {domain} не разрешается: {exc}") from exc
-    if ipv4 != {expected_ipv4}:
+    if ipv4 != {dns_ipv4}:
         actual = ", ".join(sorted(ipv4)) or "A-записей нет"
         raise VerificationError(
-            f"DNS A для {domain}: ожидался только {expected_ipv4}, получено: {actual}"
+            f"DNS A для {domain}: ожидался только {dns_ipv4}, получено: {actual}"
         )
     if ipv6:
         raise VerificationError(
@@ -60,10 +61,13 @@ def check_front_dns(domain: str, expected_ipv4: str) -> None:
         )
 
 
-def check_public_tls(domain: str, *, timeout: int = 12) -> dict[str, str]:
+def check_public_tls(
+    domain: str, *, connect_ip: str | None = None, timeout: int = 12
+) -> dict[str, str]:
+    target = connect_ip or domain
     context = ssl.create_default_context()
     try:
-        with socket.create_connection((domain, 443), timeout=timeout) as raw:
+        with socket.create_connection((target, 443), timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=domain) as tls:
                 certificate = tls.getpeercert()
                 cipher = tls.cipher()
@@ -74,14 +78,49 @@ def check_public_tls(domain: str, *, timeout: int = 12) -> dict[str, str]:
                 }
     except (OSError, ssl.SSLError) as exc:
         raise VerificationError(
-            f"TLS для {domain}:443 не прошёл проверку системным CA: {exc}"
+            f"TLS для {domain} через {target}:443 не прошёл проверку системным CA: {exc}"
         ) from exc
 
 
-def https_status(url: str, *, timeout: int = 15) -> int:
+def https_status(url: str, *, connect_ip: str | None = None, timeout: int = 15) -> int:
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or not parsed.hostname:
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
         raise VerificationError("Диагностический URL должен использовать HTTPS")
+    if connect_ip is not None:
+        target = (connect_ip, parsed.port or 443)
+        request_target = urllib.parse.urlunsplit(
+            ("", "", parsed.path or "/", parsed.query, "")
+        )
+        if any(char in request_target for char in "\r\n"):
+            raise VerificationError("Некорректный диагностический URL")
+        host = parsed.hostname
+        if parsed.port and parsed.port != 443:
+            host = f"{host}:{parsed.port}"
+        context = ssl.create_default_context()
+        try:
+            with socket.create_connection(target, timeout=timeout) as raw:
+                with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
+                    request = (
+                        f"GET {request_target} HTTP/1.1\r\n"
+                        f"Host: {host}\r\n"
+                        "User-Agent: xhttp-setup-doctor/0.1\r\n"
+                        "Connection: close\r\n\r\n"
+                    )
+                    tls.sendall(request.encode("ascii"))
+                    response = http.client.HTTPResponse(tls)
+                    response.begin()
+                    status = int(response.status)
+                    response.close()
+                    return status
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            raise VerificationError(
+                f"HTTPS-запрос {url} через {connect_ip} не выполнен: {exc}"
+            ) from exc
     request = urllib.request.Request(
         url, headers={"User-Agent": "xhttp-setup-doctor/0.1"}
     )
@@ -102,7 +141,8 @@ def build_front_plan(desired: FrontDesired) -> list[str]:
         else "сохранить существующий сайт без изменений"
     )
     return [
-        f"Проверить DNS A={desired.front_public_ip}, отсутствие AAAA и публичный TLS https://{desired.domain}:443",
+        f"Проверить DNS A={desired.dns_ipv4} и отсутствие AAAA для домена {desired.domain}",
+        f"Проверить публичный TLS на клиентском адресе {desired.client_connect_ip}:443 с SNI {desired.domain}",
         f"Закрепить SFTP host key {desired.ssh_host_key_sha256}",
         f"Скачать и сохранить резервную копию {desired.document_root}/.htaccess",
         "Изменить только блок между XHTTP-SETUP managed-маркерами",
@@ -454,9 +494,11 @@ def _apply_front_locked(
     auth: SSHAuth,
     state_dir: Path,
 ) -> FrontResult:
-    check_front_dns(desired.domain, desired.front_public_ip)
-    check_public_tls(desired.domain)
-    root_before = https_status(f"https://{desired.domain}/")
+    check_front_dns(desired.domain, desired.dns_ipv4)
+    check_public_tls(desired.domain, connect_ip=desired.client_connect_ip)
+    root_before = https_status(
+        f"https://{desired.domain}/", connect_ip=desired.client_connect_ip
+    )
     if root_before >= 500:
         raise VerificationError(
             "До изменений главная страница frontend уже возвращает 5xx"
@@ -540,9 +582,12 @@ def _apply_front_locked(
                 work_dir=backup_dir,
                 journal=journal,
             )
-        root_status = https_status(f"https://{desired.domain}/")
+        root_status = https_status(
+            f"https://{desired.domain}/", connect_ip=desired.client_connect_ip
+        )
         path_status = https_status(
-            f"https://{desired.domain}{desired.xhttp_path}/doctor"
+            f"https://{desired.domain}{desired.xhttp_path}/doctor",
+            connect_ip=desired.client_connect_ip,
         )
         if root_status >= 500 or path_status in {500, 502, 503, 504}:
             raise VerificationError(

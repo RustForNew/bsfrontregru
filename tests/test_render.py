@@ -3,6 +3,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 
 from xhttp_setup.models import Handoff
+from xhttp_setup.errors import ValidationError
 from xhttp_setup.render import (
     BEGIN_MARKER,
     END_MARKER,
@@ -29,16 +30,47 @@ def handoff():
 
 
 class RenderTests(unittest.TestCase):
+    def test_legacy_handoff_migrates_with_original_chrome_fingerprint(self):
+        legacy = handoff().to_dict()
+        legacy.pop("tls_fingerprint")
+        legacy["schema_version"] = 1
+        migrated = Handoff.from_dict(legacy)
+        self.assertEqual(migrated.schema_version, 2)
+        self.assertEqual(migrated.tls_fingerprint, "chrome")
+
+    def test_unknown_handoff_field_fails_as_validation_error(self):
+        malformed = handoff().to_dict()
+        malformed["unexpected"] = "value"
+        with self.assertRaises(ValidationError):
+            Handoff.from_dict(malformed)
+
     def test_server_is_packet_up_and_vless_encrypted(self):
         config = render_xray_server_config(
             client_id=UUID, decryption=DECRYPTION, port=8083, path=PATH
         )
         inbound = config["inbounds"][0]
+        self.assertEqual(
+            config["dns"]["servers"],
+            [
+                "https://1.1.1.1/dns-query",
+                "https://8.8.8.8/dns-query",
+                "1.1.1.1",
+                "8.8.8.8",
+            ],
+        )
         self.assertEqual(inbound["settings"]["clients"][0]["id"], UUID)
         self.assertEqual(inbound["settings"]["decryption"], DECRYPTION)
         self.assertEqual(inbound["streamSettings"]["security"], "none")
         self.assertEqual(
             inbound["streamSettings"]["xhttpSettings"]["mode"], "packet-up"
+        )
+        self.assertEqual(
+            inbound["streamSettings"]["xhttpSettings"],
+            {
+                "mode": "packet-up",
+                "path": PATH,
+                "scMaxEachPostBytes": 1_000_000,
+            },
         )
 
     def test_client_uses_tls_sni_host_and_packet_up(self):
@@ -52,8 +84,10 @@ class RenderTests(unittest.TestCase):
         stream = outbound["streamSettings"]
         self.assertEqual(stream["security"], "tls")
         self.assertEqual(stream["tlsSettings"]["serverName"], "front.example.org")
+        self.assertEqual(stream["tlsSettings"]["fingerprint"], "edge")
         self.assertEqual(stream["xhttpSettings"]["host"], "front.example.org")
         self.assertEqual(stream["xhttpSettings"]["mode"], "packet-up")
+        self.assertEqual(stream["xhttpSettings"]["scMaxEachPostBytes"], 1_000_000)
         self.assertEqual(
             outbound["settings"]["vnext"][0]["users"][0]["encryption"], ENCRYPTION
         )
@@ -72,7 +106,29 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(query["encryption"], [ENCRYPTION])
         self.assertEqual(query["path"], [PATH])
         self.assertEqual(query["mode"], ["packet-up"])
+        self.assertEqual(query["fp"], ["edge"])
         self.assertEqual(json.loads(query["extra"][0])["scMaxEachPostBytes"], 1_000_000)
+
+    def test_tls_fingerprint_can_be_overridden_in_handoff(self):
+        custom = Handoff(
+            "203.0.113.10",
+            8083,
+            UUID,
+            PATH,
+            ENCRYPTION,
+            tls_fingerprint="firefox",
+        ).validate()
+        config = render_xray_client_config(
+            handoff=custom,
+            domain="front.example.org",
+            socks_port=10808,
+        )
+        uri = render_vless_uri(custom, "front.example.org")
+        self.assertEqual(
+            config["outbounds"][0]["streamSettings"]["tlsSettings"]["fingerprint"],
+            "firefox",
+        )
+        self.assertEqual(parse_qs(urlsplit(uri).query)["fp"], ["firefox"])
 
     def test_htaccess_is_fixed_target_and_covers_suffix(self):
         block = render_htaccess_block(

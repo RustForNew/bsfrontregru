@@ -6,6 +6,9 @@ from urllib.parse import quote, urlencode
 from .models import Handoff
 
 
+SC_MAX_EACH_POST_BYTES = 1_000_000
+
+
 BEGIN_MARKER = "# BEGIN XHTTP-SETUP MANAGED BLOCK"
 END_MARKER = "# END XHTTP-SETUP MANAGED BLOCK"
 
@@ -17,7 +20,12 @@ def render_xray_server_config(
         "log": {"loglevel": "warning"},
         "dns": {
             "queryStrategy": "UseIPv4",
-            "servers": ["https://1.1.1.1/dns-query", "1.1.1.1"],
+            "servers": [
+                "https://1.1.1.1/dns-query",
+                "https://8.8.8.8/dns-query",
+                "1.1.1.1",
+                "8.8.8.8",
+            ],
         },
         "inbounds": [
             {
@@ -40,8 +48,7 @@ def render_xray_server_config(
                     "xhttpSettings": {
                         "mode": "packet-up",
                         "path": path,
-                        "scMaxEachPostBytes": 1_000_000,
-                        "scMaxBufferedPosts": 30,
+                        "scMaxEachPostBytes": SC_MAX_EACH_POST_BYTES,
                     },
                 },
             }
@@ -113,13 +120,13 @@ def render_xray_client_config(
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": domain,
-                        "fingerprint": "chrome",
+                        "fingerprint": handoff.tls_fingerprint,
                     },
                     "xhttpSettings": {
                         "host": domain,
                         "path": handoff.xhttp_path,
                         "mode": "packet-up",
-                        "scMaxEachPostBytes": 1_000_000,
+                        "scMaxEachPostBytes": SC_MAX_EACH_POST_BYTES,
                         "scMinPostsIntervalMs": 30,
                     },
                 },
@@ -161,7 +168,10 @@ def render_vless_uri(
     handoff: Handoff, domain: str, *, front_address: str | None = None
 ) -> str:
     extra = json.dumps(
-        {"scMaxEachPostBytes": 1_000_000, "scMinPostsIntervalMs": 30},
+        {
+            "scMaxEachPostBytes": SC_MAX_EACH_POST_BYTES,
+            "scMinPostsIntervalMs": 30,
+        },
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -171,7 +181,7 @@ def render_vless_uri(
             ("encryption", handoff.encryption),
             ("security", "tls"),
             ("sni", domain),
-            ("fp", "chrome"),
+            ("fp", handoff.tls_fingerprint),
             ("host", domain),
             ("path", handoff.xhttp_path),
             ("mode", "packet-up"),

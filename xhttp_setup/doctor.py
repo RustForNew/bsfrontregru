@@ -39,11 +39,21 @@ def resolve_front(domain: str) -> tuple[list[str], list[str]]:
     return sorted(ipv4), sorted(ipv6)
 
 
-def doctor_front(domain: str, path: str) -> list[Check]:
+def doctor_front(
+    domain: str,
+    path: str,
+    *,
+    client_connect_ip: str | None = None,
+    dns_ipv4: str | None = None,
+) -> list[Check]:
     checks: list[Check] = []
     try:
         ipv4, ipv6 = resolve_front(domain)
-        checks.append(Check("DNS A", bool(ipv4), ", ".join(ipv4) or "A-записей нет"))
+        dns_ok = ipv4 == [dns_ipv4] if dns_ipv4 else bool(ipv4)
+        dns_detail = ", ".join(ipv4) or "A-записей нет"
+        if dns_ipv4:
+            dns_detail = f"ожидался {dns_ipv4}; получено: {dns_detail}"
+        checks.append(Check("DNS A", dns_ok, dns_detail))
         checks.append(
             Check(
                 "DNS AAAA",
@@ -54,19 +64,26 @@ def doctor_front(domain: str, path: str) -> list[Check]:
     except VerificationError as exc:
         checks.append(Check("DNS", False, str(exc)))
     try:
-        certificate = check_public_tls(domain)
+        certificate = check_public_tls(domain, connect_ip=client_connect_ip)
+        endpoint = client_connect_ip or domain
         checks.append(
-            Check("TLS", True, f"CA/hostname OK, expires {certificate['notAfter']}")
+            Check(
+                "TLS",
+                True,
+                f"{endpoint}:443, SNI/hostname/CA OK, expires {certificate['notAfter']}",
+            )
         )
     except VerificationError as exc:
         checks.append(Check("TLS", False, str(exc)))
     try:
-        status = https_status(f"https://{domain}/")
+        status = https_status(f"https://{domain}/", connect_ip=client_connect_ip)
         checks.append(Check("HTTPS root", status < 500, f"HTTP {status}"))
     except VerificationError as exc:
         checks.append(Check("HTTPS root", False, str(exc)))
     try:
-        status = https_status(f"https://{domain}{path}/doctor")
+        status = https_status(
+            f"https://{domain}{path}/doctor", connect_ip=client_connect_ip
+        )
         checks.append(
             Check("XHTTP route", status not in {500, 502, 503, 504}, f"HTTP {status}")
         )

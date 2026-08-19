@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from xhttp_setup.cli import main
+from xhttp_setup.cli import _ack_provider, main
 from xhttp_setup.doctor import _parse_cloudflare_trace_ip
 from xhttp_setup.errors import InstallerError, VerificationError
 from xhttp_setup.exit_installer import Layout, _parse_vlessenc, build_exit_plan
@@ -123,6 +123,12 @@ Authentication: ML-KEM
         with contextlib.redirect_stdout(output):
             self.assertEqual(main(args), 0)
         self.assertIn("изменений нет", output.getvalue())
+
+    def test_provider_warning_is_informational_and_non_blocking(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _ack_provider()
+        self.assertIn("не блокирует", output.getvalue())
 
     def test_cloudflare_trace_requires_valid_ipv4(self):
         self.assertEqual(

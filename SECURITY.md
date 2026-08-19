@@ -11,7 +11,9 @@
   service.
 - Managed state/lock paths reject symlinks and unexpected ownership or modes.
 - Release and Xray versions are pinned. Checksums, regular-file type, ownership
-  and modes are verified before execution.
+  and modes are verified by installer install/re-apply. Subsequent systemd
+  restarts rely on the root-owned managed directory; they do not re-hash the
+  binary before every ExecStart.
 - A failed end-to-end probe must not create or print a client URI.
 
 Threats not solved by this project:

@@ -731,6 +731,7 @@ def apply_exit(desired: ExitDesired, *, layout: Layout | None = None) -> Handoff
             encryption=encryption,
             label=desired.label,
             expected_egress_ip=desired.expected_egress_ip,
+            tls_fingerprint=desired.tls_fingerprint,
         ).validate()
         config = render_xray_server_config(
             client_id=desired.client_id,
