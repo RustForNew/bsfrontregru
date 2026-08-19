@@ -66,6 +66,24 @@ class XrayIntegrationTests(unittest.TestCase):
             )
         )
 
+    def test_generated_client_config_with_leaf_certificate_pin(self):
+        handoff = Handoff(
+            "203.0.113.10",
+            8083,
+            UUID,
+            PATH,
+            ENCRYPTION,
+            pinned_peer_cert_sha256="ab" * 32,
+        ).validate()
+        self._assert_config_ok(
+            render_xray_client_config(
+                handoff=handoff,
+                domain="front.example.org",
+                socks_port=10808,
+                front_address="198.51.100.20",
+            )
+        )
+
     def test_pinned_vlessenc_pair_builds_valid_server_and_client(self):
         generated = subprocess.run(
             [self.binary, "vlessenc"],

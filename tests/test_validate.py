@@ -1,7 +1,11 @@
 import unittest
 
 from xhttp_setup.errors import ValidationError
-from xhttp_setup.models import ExitDesired
+from xhttp_setup.models import (
+    ExitDesired,
+    validate_cert_sha256,
+    validate_front_tls,
+)
 from xhttp_setup.validate import (
     normalize_domain,
     validate_fingerprint,
@@ -11,6 +15,24 @@ from xhttp_setup.validate import (
 
 
 class ValidateTests(unittest.TestCase):
+    def test_certificate_sha256_accepts_openssl_form_and_normalizes(self):
+        colon_form = "SHA256:" + ":".join(["AB"] * 32)
+        self.assertEqual(validate_cert_sha256(colon_form), "ab" * 32)
+        with self.assertRaises(ValidationError):
+            validate_cert_sha256("ab" * 31)
+        with self.assertRaises(ValidationError):
+            validate_cert_sha256(123)  # type: ignore[arg-type]
+
+    def test_front_tls_policy_requires_pin_only_in_pinned_mode(self):
+        self.assertEqual(validate_front_tls("public", None), ("public", None))
+        self.assertEqual(validate_front_tls("pinned", "AB" * 32), ("pinned", "ab" * 32))
+        with self.assertRaises(ValidationError):
+            validate_front_tls("pinned", None)
+        with self.assertRaises(ValidationError):
+            validate_front_tls("public", "ab" * 32)
+        with self.assertRaises(ValidationError):
+            validate_front_tls(123, None)  # type: ignore[arg-type]
+
     def test_domain_is_idna_and_lowercase(self):
         self.assertEqual(normalize_domain("ПРИМЕР.РФ."), "xn--e1afmkfd.xn--p1ai")
 

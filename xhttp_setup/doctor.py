@@ -45,6 +45,7 @@ def doctor_front(
     *,
     client_connect_ip: str | None = None,
     dns_ipv4: str | None = None,
+    pinned_peer_cert_sha256: str | None = None,
 ) -> list[Check]:
     checks: list[Check] = []
     try:
@@ -64,28 +65,49 @@ def doctor_front(
     except VerificationError as exc:
         checks.append(Check("DNS", False, str(exc)))
     try:
-        certificate = check_public_tls(domain, connect_ip=client_connect_ip)
+        certificate = check_public_tls(
+            domain,
+            connect_ip=client_connect_ip,
+            pinned_peer_cert_sha256=pinned_peer_cert_sha256,
+        )
         endpoint = client_connect_ip or domain
+        tls_policy = (
+            f"leaf pin {certificate['leafSha256']} OK; "
+            "обычные CA/SAN/срок/revocation не проверены; "
+            "pcs не доказывает выбор правильного HTTPS vhost"
+            if pinned_peer_cert_sha256
+            else "SNI/hostname/CA OK"
+        )
         checks.append(
             Check(
                 "TLS",
                 True,
-                f"{endpoint}:443, SNI/hostname/CA OK, expires {certificate['notAfter']}",
+                f"{endpoint}:443, {tls_policy}, expires {certificate['notAfter']}",
             )
         )
     except VerificationError as exc:
         checks.append(Check("TLS", False, str(exc)))
     try:
-        status = https_status(f"https://{domain}/", connect_ip=client_connect_ip)
+        status = https_status(
+            f"https://{domain}/",
+            connect_ip=client_connect_ip,
+            pinned_peer_cert_sha256=pinned_peer_cert_sha256,
+        )
         checks.append(Check("HTTPS root", status < 500, f"HTTP {status}"))
     except VerificationError as exc:
         checks.append(Check("HTTPS root", False, str(exc)))
     try:
         status = https_status(
-            f"https://{domain}{path}/doctor", connect_ip=client_connect_ip
+            f"https://{domain}{path}/doctor",
+            connect_ip=client_connect_ip,
+            pinned_peer_cert_sha256=pinned_peer_cert_sha256,
         )
         checks.append(
-            Check("XHTTP route", status not in {500, 502, 503, 504}, f"HTTP {status}")
+            Check(
+                "XHTTP route",
+                status not in {500, 502, 503, 504},
+                f"HTTP {status}; правильный vhost окончательно подтверждает только E2E",
+            )
         )
     except VerificationError as exc:
         checks.append(Check("XHTTP route", False, str(exc)))

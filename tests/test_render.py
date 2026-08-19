@@ -23,6 +23,7 @@ DECRYPTION = (
 ENCRYPTION = (
     "mlkem768x25519plus.native.0rtt.yFAUa9gUf_hlvbaqG6nYRyTqpfo2kE-BYoFqCqq6vQ4"
 )
+CERT_SHA256 = "ab" * 32
 
 
 def handoff():
@@ -33,16 +34,43 @@ class RenderTests(unittest.TestCase):
     def test_legacy_handoff_migrates_with_original_chrome_fingerprint(self):
         legacy = handoff().to_dict()
         legacy.pop("tls_fingerprint")
+        legacy.pop("pinned_peer_cert_sha256")
         legacy["schema_version"] = 1
         migrated = Handoff.from_dict(legacy)
-        self.assertEqual(migrated.schema_version, 2)
+        self.assertEqual(migrated.schema_version, 3)
         self.assertEqual(migrated.tls_fingerprint, "chrome")
+        self.assertIsNone(migrated.pinned_peer_cert_sha256)
+
+    def test_schema_two_handoff_migrates_to_strict_public_tls(self):
+        schema_two = handoff().to_dict()
+        schema_two.pop("pinned_peer_cert_sha256")
+        schema_two["schema_version"] = 2
+        migrated = Handoff.from_dict(schema_two)
+        self.assertEqual(migrated.schema_version, 3)
+        self.assertIsNone(migrated.pinned_peer_cert_sha256)
+
+    def test_legacy_handoff_cannot_smuggle_new_pin_field(self):
+        malformed = handoff().to_dict()
+        malformed["schema_version"] = 2
+        with self.assertRaises(ValidationError):
+            Handoff.from_dict(malformed)
 
     def test_unknown_handoff_field_fails_as_validation_error(self):
         malformed = handoff().to_dict()
         malformed["unexpected"] = "value"
         with self.assertRaises(ValidationError):
             Handoff.from_dict(malformed)
+
+    def test_malformed_schema_and_pin_types_fail_as_validation_errors(self):
+        malformed_schema = handoff().to_dict()
+        malformed_schema["schema_version"] = []
+        with self.assertRaises(ValidationError):
+            Handoff.from_dict(malformed_schema)
+
+        malformed_pin = handoff().to_dict()
+        malformed_pin["pinned_peer_cert_sha256"] = 123
+        with self.assertRaises(ValidationError):
+            Handoff.from_dict(malformed_pin)
 
     def test_server_is_packet_up_and_vless_encrypted(self):
         config = render_xray_server_config(
@@ -85,6 +113,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(stream["security"], "tls")
         self.assertEqual(stream["tlsSettings"]["serverName"], "front.example.org")
         self.assertEqual(stream["tlsSettings"]["fingerprint"], "edge")
+        self.assertNotIn("pinnedPeerCertSha256", stream["tlsSettings"])
         self.assertEqual(stream["xhttpSettings"]["host"], "front.example.org")
         self.assertEqual(stream["xhttpSettings"]["mode"], "packet-up")
         self.assertEqual(stream["xhttpSettings"]["scMaxEachPostBytes"], 1_000_000)
@@ -107,6 +136,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(query["path"], [PATH])
         self.assertEqual(query["mode"], ["packet-up"])
         self.assertEqual(query["fp"], ["edge"])
+        self.assertNotIn("pcs", query)
         self.assertEqual(json.loads(query["extra"][0])["scMaxEachPostBytes"], 1_000_000)
 
     def test_tls_fingerprint_can_be_overridden_in_handoff(self):
@@ -129,6 +159,26 @@ class RenderTests(unittest.TestCase):
             "firefox",
         )
         self.assertEqual(parse_qs(urlsplit(uri).query)["fp"], ["firefox"])
+
+    def test_pinned_leaf_cert_is_emitted_only_when_selected(self):
+        pinned = handoff().with_pinned_peer_cert(CERT_SHA256.upper())
+        config = render_xray_client_config(
+            handoff=pinned,
+            domain="front.example.org",
+            socks_port=10808,
+            front_address="198.51.100.20",
+        )
+        uri = render_vless_uri(
+            pinned, "front.example.org", front_address="198.51.100.20"
+        )
+        stream = config["outbounds"][0]["streamSettings"]
+        query = parse_qs(urlsplit(uri).query)
+        self.assertEqual(stream["tlsSettings"]["pinnedPeerCertSha256"], CERT_SHA256)
+        self.assertEqual(stream["tlsSettings"]["serverName"], "front.example.org")
+        self.assertEqual(stream["xhttpSettings"]["host"], "front.example.org")
+        self.assertEqual(query["pcs"], [CERT_SHA256])
+        self.assertEqual(query["sni"], ["front.example.org"])
+        self.assertEqual(query["host"], ["front.example.org"])
 
     def test_htaccess_is_fixed_target_and_covers_suffix(self):
         block = render_htaccess_block(

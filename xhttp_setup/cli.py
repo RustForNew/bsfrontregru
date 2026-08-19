@@ -25,9 +25,14 @@ from .ispmanager import inspect_site
 from .models import (
     DEFAULT_TLS_FINGERPRINT,
     TLS_FINGERPRINTS,
+    TLS_MODE_PINNED,
+    TLS_MODE_PUBLIC,
+    TLS_MODES,
     ExitDesired,
     FrontDesired,
     Handoff,
+    validate_cert_sha256,
+    validate_front_tls,
     validate_tls_fingerprint,
 )
 from .osutil import atomic_write_text, load_json
@@ -163,10 +168,29 @@ def _collect_exit() -> ExitDesired:
     ).validate()
 
 
+def _collect_front_tls_policy() -> tuple[str, str | None]:
+    if not _yes_no(
+        "Закрепить SHA-256 текущего leaf-сертификата вместо проверки публичным CA?"
+    ):
+        return TLS_MODE_PUBLIC, None
+    print(
+        "ВНИМАНИЕ: pinned-режим доверяет только точному текущему leaf-сертификату. "
+        "CA, SAN/hostname, срок и revocation при exact match не проверяются. После "
+        "перевыпуска сертификата pin и клиентскую ссылку нужно обновить вручную. "
+        "Клиент обязан поддерживать pcs. "
+        "Снимайте pin только после включения SSL/443 у сайта и проверки, что SNI "
+        "попадает в его vhost, а не в default-vhost провайдера."
+    )
+    pin = _validated_prompt(
+        "SHA-256 текущего leaf-сертификата (64 hex)", validate_cert_sha256
+    )
+    return TLS_MODE_PINNED, pin
+
+
 def _collect_front(handoff: Handoff) -> FrontDesired:
     print("\nFrontend shared-hosting")
     domain = _validated_prompt(
-        "FQDN сайта с уже выпущенным публичным TLS", normalize_domain
+        "FQDN/SNI существующего сайта frontend", normalize_domain
     )
     client_connect_ip = _validated_prompt(
         "IPv4 подключения клиента (адрес в VLESS URI)", validate_ipv4
@@ -176,6 +200,7 @@ def _collect_front(handoff: Handoff) -> FrontDesired:
         validate_ipv4,
         client_connect_ip,
     )
+    tls_mode, pinned_peer_cert_sha256 = _collect_front_tls_policy()
     sftp_host = _validated_prompt("SFTP hostname/IP", validate_host)
     sftp_port = _validated_prompt("SFTP port", validate_port, "22")
     sftp_user = _validated_prompt("SFTP user", validate_ssh_user)
@@ -227,6 +252,8 @@ def _collect_front(handoff: Handoff) -> FrontDesired:
         exit_port=handoff.exit_port,
         xhttp_path=handoff.xhttp_path,
         placeholder_mode=placeholder,
+        tls_mode=tls_mode,
+        pinned_peer_cert_sha256=pinned_peer_cert_sha256,
     ).validate()
 
 
@@ -307,9 +334,14 @@ def wizard_front() -> int:
     )
     handoff = Handoff.from_dict(load_json(handoff_path))
     desired = _collect_front(handoff)
+    client_handoff = handoff.with_pinned_peer_cert(desired.pinned_peer_cert_sha256)
     _show_plan("План frontend", build_front_plan(desired))
     check_front_dns(desired.domain, desired.dns_ipv4)
-    check_public_tls(desired.domain, connect_ip=desired.client_connect_ip)
+    check_public_tls(
+        desired.domain,
+        connect_ip=desired.client_connect_ip,
+        pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+    )
     _ack_provider()
     _confirm_apply(desired.domain)
     _require_linux_apply()
@@ -320,7 +352,7 @@ def wizard_front() -> int:
     _ack_firewall()
     probe_layout = Layout(root=state_dir / "probe-runtime")
     _run_probe_and_issue(
-        handoff=handoff,
+        handoff=client_handoff,
         domain=desired.domain,
         client_connect_ip=desired.client_connect_ip,
         state_dir=state_dir,
@@ -351,11 +383,18 @@ def wizard_full() -> int:
         "используйте exit и front раздельно, а front запускайте с разрешённого российского IP."
     )
     check_front_dns(desired_front.domain, desired_front.dns_ipv4)
-    check_public_tls(desired_front.domain, connect_ip=desired_front.client_connect_ip)
+    check_public_tls(
+        desired_front.domain,
+        connect_ip=desired_front.client_connect_ip,
+        pinned_peer_cert_sha256=desired_front.pinned_peer_cert_sha256,
+    )
     _ack_provider()
     _confirm_apply(desired_front.domain)
     auth = _collect_auth()
     handoff = apply_exit(desired_exit)
+    client_handoff = handoff.with_pinned_peer_cert(
+        desired_front.pinned_peer_cert_sha256
+    )
     _ack_firewall(plan_path=Layout().firewall_plan)
     desired_front = FrontDesired(
         **{
@@ -370,7 +409,7 @@ def wizard_full() -> int:
         result = apply_front(desired_front, auth=auth, state_dir=state_dir)
         _print_front_result(result)
         _run_probe_and_issue(
-            handoff=handoff,
+            handoff=client_handoff,
             domain=desired_front.domain,
             client_connect_ip=desired_front.client_connect_ip,
             state_dir=state_dir,
@@ -395,11 +434,13 @@ def wizard_doctor() -> int:
         "IPv4 в DNS A домена", validate_ipv4, client_connect_ip
     )
     path = _validated_prompt("XHTTP path", validate_xhttp_path)
+    _, pinned_peer_cert_sha256 = _collect_front_tls_policy()
     checks = doctor_front(
         domain,
         path,
         client_connect_ip=client_connect_ip,
         dns_ipv4=dns_ipv4,
+        pinned_peer_cert_sha256=pinned_peer_cert_sha256,
     )
     if os.name == "posix" and Path("/var/lib/xhttp-setup").exists():
         checks.extend(doctor_exit())
@@ -481,6 +522,9 @@ def _frontend_ips_from_args(args: argparse.Namespace) -> tuple[str, str]:
 def _front_from_args(args: argparse.Namespace) -> int:
     handoff = Handoff.from_dict(load_json(Path(args.handoff)))
     client_connect_ip, dns_ipv4 = _frontend_ips_from_args(args)
+    tls_mode, pinned_peer_cert_sha256 = validate_front_tls(
+        args.tls_mode, args.tls_cert_sha256
+    )
     desired = FrontDesired(
         domain=args.domain,
         client_connect_ip=client_connect_ip,
@@ -494,7 +538,10 @@ def _front_from_args(args: argparse.Namespace) -> int:
         exit_port=handoff.exit_port,
         xhttp_path=handoff.xhttp_path,
         placeholder_mode=args.placeholder,
+        tls_mode=tls_mode,
+        pinned_peer_cert_sha256=pinned_peer_cert_sha256,
     ).validate()
+    client_handoff = handoff.with_pinned_peer_cert(pinned_peer_cert_sha256)
     _show_plan("План frontend", build_front_plan(desired))
     if not args.apply:
         print("\nПлан завершён; изменений нет. Добавьте --apply и подтверждение.")
@@ -521,7 +568,7 @@ def _front_from_args(args: argparse.Namespace) -> int:
     _print_front_result(result)
     _ack_firewall(supplied=args.ack_firewall)
     _run_probe_and_issue(
-        handoff=handoff,
+        handoff=client_handoff,
         domain=desired.domain,
         client_connect_ip=desired.client_connect_ip,
         state_dir=state_dir,
@@ -543,12 +590,16 @@ def _doctor_from_args(args: argparse.Namespace) -> int:
                 "Для doctor front нужны --domain, --path, "
                 "--client-connect-ip и --dns-ipv4"
             )
+        _, pinned_peer_cert_sha256 = validate_front_tls(
+            args.tls_mode, args.tls_cert_sha256
+        )
         checks.extend(
             doctor_front(
                 normalize_domain(args.domain),
                 validate_xhttp_path(args.path),
                 client_connect_ip=validate_ipv4(args.client_connect_ip),
                 dns_ipv4=validate_ipv4(args.dns_ipv4),
+                pinned_peer_cert_sha256=pinned_peer_cert_sha256,
             )
         )
     if args.scope in {"exit", "full"}:
@@ -608,6 +659,16 @@ def build_parser() -> argparse.ArgumentParser:
     front_parser.add_argument("--document-root", required=True)
     front_parser.add_argument("--fingerprint", required=True)
     front_parser.add_argument(
+        "--tls-mode",
+        choices=tuple(sorted(TLS_MODES)),
+        default=TLS_MODE_PUBLIC,
+        help="public: системный CA+hostname; pinned: точный SHA-256 leaf-сертификата",
+    )
+    front_parser.add_argument(
+        "--tls-cert-sha256",
+        help="64-hex SHA-256 текущего leaf-сертификата; нужен только для --tls-mode pinned",
+    )
+    front_parser.add_argument(
         "--placeholder", choices=("keep", "neutral"), default="keep"
     )
     front_parser.add_argument(
@@ -628,6 +689,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--path")
     doctor_parser.add_argument("--client-connect-ip")
     doctor_parser.add_argument("--dns-ipv4")
+    doctor_parser.add_argument(
+        "--tls-mode", choices=tuple(sorted(TLS_MODES)), default=TLS_MODE_PUBLIC
+    )
+    doctor_parser.add_argument("--tls-cert-sha256")
     return parser
 
 

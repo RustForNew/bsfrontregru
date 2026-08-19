@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
+import hmac
 import socket
 import ssl
 import urllib.error
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import InstallerError, VerificationError
-from .models import FrontDesired
+from .models import FrontDesired, TLS_MODE_PINNED, validate_cert_sha256
 from .osutil import atomic_write_text, ensure_dir, exclusive_lock, sha256_file
 from .placeholder import neutral_placeholder
 from .render import merge_managed_block, render_htaccess_block
@@ -61,28 +63,72 @@ def check_front_dns(domain: str, dns_ipv4: str) -> None:
         )
 
 
+def _client_tls_context(pinned_peer_cert_sha256: str | None) -> ssl.SSLContext:
+    if not pinned_peer_cert_sha256:
+        return ssl.create_default_context()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _verify_leaf_pin(tls: ssl.SSLSocket, expected_sha256: str) -> str:
+    expected = validate_cert_sha256(expected_sha256)
+    certificate_der = tls.getpeercert(binary_form=True)
+    if not certificate_der:
+        raise VerificationError("TLS endpoint не предоставил leaf-сертификат")
+    actual = hashlib.sha256(certificate_der).hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise VerificationError(
+            f"SHA-256 leaf-сертификата не совпал: ожидался {expected}, получен {actual}"
+        )
+    return actual
+
+
 def check_public_tls(
-    domain: str, *, connect_ip: str | None = None, timeout: int = 12
+    domain: str,
+    *,
+    connect_ip: str | None = None,
+    pinned_peer_cert_sha256: str | None = None,
+    timeout: int = 12,
 ) -> dict[str, str]:
     target = connect_ip or domain
-    context = ssl.create_default_context()
+    pin = (
+        validate_cert_sha256(pinned_peer_cert_sha256)
+        if pinned_peer_cert_sha256
+        else None
+    )
+    context = _client_tls_context(pin)
     try:
         with socket.create_connection((target, 443), timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=domain) as tls:
+                leaf_sha256 = _verify_leaf_pin(tls, pin) if pin else ""
                 certificate = tls.getpeercert()
                 cipher = tls.cipher()
                 return {
                     "subject": str(certificate.get("subject", "")),
-                    "notAfter": str(certificate.get("notAfter", "")),
+                    "notAfter": str(certificate.get("notAfter", "unknown")),
                     "cipher": cipher[0] if cipher else "unknown",
+                    "leafSha256": leaf_sha256,
                 }
     except (OSError, ssl.SSLError) as exc:
+        policy = (
+            "закреплённому SHA-256 leaf-сертификата"
+            if pin
+            else "системному CA и hostname"
+        )
         raise VerificationError(
-            f"TLS для {domain} через {target}:443 не прошёл проверку системным CA: {exc}"
+            f"TLS для {domain} через {target}:443 не прошёл проверку по {policy}: {exc}"
         ) from exc
 
 
-def https_status(url: str, *, connect_ip: str | None = None, timeout: int = 15) -> int:
+def https_status(
+    url: str,
+    *,
+    connect_ip: str | None = None,
+    pinned_peer_cert_sha256: str | None = None,
+    timeout: int = 15,
+) -> int:
     parsed = urllib.parse.urlsplit(url)
     if (
         parsed.scheme != "https"
@@ -91,8 +137,13 @@ def https_status(url: str, *, connect_ip: str | None = None, timeout: int = 15) 
         or parsed.password
     ):
         raise VerificationError("Диагностический URL должен использовать HTTPS")
-    if connect_ip is not None:
-        target = (connect_ip, parsed.port or 443)
+    pin = (
+        validate_cert_sha256(pinned_peer_cert_sha256)
+        if pinned_peer_cert_sha256
+        else None
+    )
+    if connect_ip is not None or pin is not None:
+        target = (connect_ip or parsed.hostname, parsed.port or 443)
         request_target = urllib.parse.urlunsplit(
             ("", "", parsed.path or "/", parsed.query, "")
         )
@@ -101,10 +152,12 @@ def https_status(url: str, *, connect_ip: str | None = None, timeout: int = 15) 
         host = parsed.hostname
         if parsed.port and parsed.port != 443:
             host = f"{host}:{parsed.port}"
-        context = ssl.create_default_context()
+        context = _client_tls_context(pin)
         try:
             with socket.create_connection(target, timeout=timeout) as raw:
                 with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
+                    if pin:
+                        _verify_leaf_pin(tls, pin)
                     request = (
                         f"GET {request_target} HTTP/1.1\r\n"
                         f"Host: {host}\r\n"
@@ -119,7 +172,7 @@ def https_status(url: str, *, connect_ip: str | None = None, timeout: int = 15) 
                     return status
         except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
             raise VerificationError(
-                f"HTTPS-запрос {url} через {connect_ip} не выполнен: {exc}"
+                f"HTTPS-запрос {url} через {target[0]} не выполнен: {exc}"
             ) from exc
     request = urllib.request.Request(
         url, headers={"User-Agent": "xhttp-setup-doctor/0.1"}
@@ -140,9 +193,17 @@ def build_front_plan(desired: FrontDesired) -> list[str]:
         if desired.placeholder_mode == "neutral"
         else "сохранить существующий сайт без изменений"
     )
+    tls_check = (
+        "Проверить TLS на клиентском адресе "
+        f"{desired.client_connect_ip}:443 с SNI {desired.domain} и закреплённым "
+        f"SHA-256 leaf-сертификата {desired.pinned_peer_cert_sha256}"
+        if desired.tls_mode == TLS_MODE_PINNED
+        else "Проверить публичный TLS на клиентском адресе "
+        f"{desired.client_connect_ip}:443 с SNI {desired.domain}"
+    )
     return [
         f"Проверить DNS A={desired.dns_ipv4} и отсутствие AAAA для домена {desired.domain}",
-        f"Проверить публичный TLS на клиентском адресе {desired.client_connect_ip}:443 с SNI {desired.domain}",
+        tls_check,
         f"Закрепить SFTP host key {desired.ssh_host_key_sha256}",
         f"Скачать и сохранить резервную копию {desired.document_root}/.htaccess",
         "Изменить только блок между XHTTP-SETUP managed-маркерами",
@@ -495,9 +556,15 @@ def _apply_front_locked(
     state_dir: Path,
 ) -> FrontResult:
     check_front_dns(desired.domain, desired.dns_ipv4)
-    check_public_tls(desired.domain, connect_ip=desired.client_connect_ip)
+    check_public_tls(
+        desired.domain,
+        connect_ip=desired.client_connect_ip,
+        pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+    )
     root_before = https_status(
-        f"https://{desired.domain}/", connect_ip=desired.client_connect_ip
+        f"https://{desired.domain}/",
+        connect_ip=desired.client_connect_ip,
+        pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
     )
     if root_before >= 500:
         raise VerificationError(
@@ -583,11 +650,14 @@ def _apply_front_locked(
                 journal=journal,
             )
         root_status = https_status(
-            f"https://{desired.domain}/", connect_ip=desired.client_connect_ip
+            f"https://{desired.domain}/",
+            connect_ip=desired.client_connect_ip,
+            pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
         )
         path_status = https_status(
             f"https://{desired.domain}{desired.xhttp_path}/doctor",
             connect_ip=desired.client_connect_ip,
+            pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
         )
         if root_status >= 500 or path_status in {500, 502, 503, 504}:
             raise VerificationError(

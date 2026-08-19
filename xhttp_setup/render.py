@@ -87,6 +87,12 @@ def render_xray_server_config(
 def render_xray_client_config(
     *, handoff: Handoff, domain: str, socks_port: int, front_address: str | None = None
 ) -> dict:
+    tls_settings = {
+        "serverName": domain,
+        "fingerprint": handoff.tls_fingerprint,
+    }
+    if handoff.pinned_peer_cert_sha256:
+        tls_settings["pinnedPeerCertSha256"] = handoff.pinned_peer_cert_sha256
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -118,10 +124,7 @@ def render_xray_client_config(
                 "streamSettings": {
                     "network": "xhttp",
                     "security": "tls",
-                    "tlsSettings": {
-                        "serverName": domain,
-                        "fingerprint": handoff.tls_fingerprint,
-                    },
+                    "tlsSettings": tls_settings,
                     "xhttpSettings": {
                         "host": domain,
                         "path": handoff.xhttp_path,
@@ -175,21 +178,24 @@ def render_vless_uri(
         ensure_ascii=True,
         separators=(",", ":"),
     )
-    query = urlencode(
+    parameters = [
+        ("type", "xhttp"),
+        ("encryption", handoff.encryption),
+        ("security", "tls"),
+        ("sni", domain),
+        ("fp", handoff.tls_fingerprint),
+    ]
+    if handoff.pinned_peer_cert_sha256:
+        parameters.append(("pcs", handoff.pinned_peer_cert_sha256))
+    parameters.extend(
         [
-            ("type", "xhttp"),
-            ("encryption", handoff.encryption),
-            ("security", "tls"),
-            ("sni", domain),
-            ("fp", handoff.tls_fingerprint),
             ("host", domain),
             ("path", handoff.xhttp_path),
             ("mode", "packet-up"),
             ("extra", extra),
-        ],
-        quote_via=quote,
-        safe="",
+        ]
     )
+    query = urlencode(parameters, quote_via=quote, safe="")
     label = quote(handoff.label, safe="")
     address = front_address or domain
     return f"vless://{handoff.client_id}@{address}:443?{query}#{label}"

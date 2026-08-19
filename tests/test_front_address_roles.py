@@ -1,12 +1,20 @@
 import contextlib
+import hashlib
 import io
+import ssl
 import unittest
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from xhttp_setup.cli import _collect_front, _frontend_ips_from_args
 from xhttp_setup.doctor import doctor_front
-from xhttp_setup.front import build_front_plan, check_public_tls, https_status
+from xhttp_setup.errors import VerificationError
+from xhttp_setup.front import (
+    _client_tls_context,
+    build_front_plan,
+    check_public_tls,
+    https_status,
+)
 from xhttp_setup.ispmanager import SiteInfo
 from xhttp_setup.models import FrontDesired, Handoff
 
@@ -17,6 +25,8 @@ ENCRYPTION = (
     "mlkem768x25519plus.native.0rtt.yFAUa9gUf_hlvbaqG6nYRyTqpfo2kE-BYoFqCqq6vQ4"
 )
 FINGERPRINT = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+CERT_DER = b"test leaf certificate der"
+CERT_SHA256 = hashlib.sha256(CERT_DER).hexdigest()
 
 
 def front_desired() -> FrontDesired:
@@ -47,7 +57,9 @@ class _FakeTLS(_ContextObject):
     def __init__(self):
         self.sent = b""
 
-    def getpeercert(self):
+    def getpeercert(self, binary_form=False):
+        if binary_form:
+            return CERT_DER
         return {
             "subject": ((("commonName", "front.example.org"),),),
             "notAfter": "date",
@@ -109,6 +121,45 @@ class FrontAddressRoleTests(unittest.TestCase):
         self.assertEqual(context.server_name, "front.example.org")
         self.assertEqual(certificate["cipher"], "TLS_AES_256_GCM_SHA384")
 
+    def test_pinned_tls_requires_exact_leaf_hash_and_keeps_sni(self):
+        context = _FakeContext()
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ),
+            patch("xhttp_setup.front._client_tls_context", return_value=context),
+        ):
+            certificate = check_public_tls(
+                "front.example.org",
+                connect_ip="198.51.100.20",
+                pinned_peer_cert_sha256=CERT_SHA256.upper(),
+            )
+        self.assertEqual(context.server_name, "front.example.org")
+        self.assertEqual(certificate["leafSha256"], CERT_SHA256)
+
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ),
+            patch("xhttp_setup.front._client_tls_context", return_value=context),
+            self.assertRaises(VerificationError),
+        ):
+            check_public_tls(
+                "front.example.org",
+                connect_ip="198.51.100.20",
+                pinned_peer_cert_sha256="00" * 32,
+            )
+
+    def test_only_pinned_context_disables_ca_and_hostname_validation(self):
+        pinned = _client_tls_context(CERT_SHA256)
+        self.assertFalse(pinned.check_hostname)
+        self.assertEqual(pinned.verify_mode, ssl.CERT_NONE)
+        with patch("xhttp_setup.front.ssl.create_default_context") as create_default:
+            _client_tls_context(None)
+        create_default.assert_called_once_with()
+
     def test_https_status_uses_client_ip_with_domain_sni_and_host(self):
         context = _FakeContext()
         with (
@@ -131,6 +182,25 @@ class FrontAddressRoleTests(unittest.TestCase):
         self.assertIn("GET /api/check?probe=1 HTTP/1.1\r\n", request)
         self.assertIn("Host: front.example.org\r\n", request)
 
+    def test_https_status_checks_pin_before_request_and_preserves_host(self):
+        context = _FakeContext()
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ),
+            patch("xhttp_setup.front._client_tls_context", return_value=context),
+            patch("xhttp_setup.front.http.client.HTTPResponse", _FakeResponse),
+        ):
+            status = https_status(
+                "https://front.example.org/api/check",
+                connect_ip="198.51.100.20",
+                pinned_peer_cert_sha256=CERT_SHA256,
+            )
+        self.assertEqual(status, 204)
+        self.assertEqual(context.server_name, "front.example.org")
+        self.assertIn("Host: front.example.org\r\n", context.tls.sent.decode("ascii"))
+
     def test_doctor_checks_dns_and_client_endpoint_independently(self):
         certificate = {"subject": "", "notAfter": "date", "cipher": "cipher"}
         with (
@@ -151,19 +221,63 @@ class FrontAddressRoleTests(unittest.TestCase):
             )
 
         self.assertTrue(all(check.ok for check in checks))
-        tls.assert_called_once_with("front.example.org", connect_ip="198.51.100.20")
+        tls.assert_called_once_with(
+            "front.example.org",
+            connect_ip="198.51.100.20",
+            pinned_peer_cert_sha256=None,
+        )
         self.assertEqual(
             status.call_args_list,
             [
                 call(
                     "https://front.example.org/",
                     connect_ip="198.51.100.20",
+                    pinned_peer_cert_sha256=None,
                 ),
                 call(
                     f"https://front.example.org{PATH}/doctor",
                     connect_ip="198.51.100.20",
+                    pinned_peer_cert_sha256=None,
                 ),
             ],
+        )
+
+    def test_doctor_verifies_pinned_leaf_for_tls_and_http_checks(self):
+        certificate = {
+            "subject": "",
+            "notAfter": "unknown",
+            "cipher": "cipher",
+            "leafSha256": CERT_SHA256,
+        }
+        with (
+            patch(
+                "xhttp_setup.doctor.resolve_front",
+                return_value=(["192.0.2.30"], []),
+            ),
+            patch(
+                "xhttp_setup.doctor.check_public_tls", return_value=certificate
+            ) as tls,
+            patch("xhttp_setup.doctor.https_status", side_effect=(200, 404)) as status,
+        ):
+            checks = doctor_front(
+                "front.example.org",
+                PATH,
+                client_connect_ip="198.51.100.20",
+                dns_ipv4="192.0.2.30",
+                pinned_peer_cert_sha256=CERT_SHA256,
+            )
+        self.assertTrue(all(check.ok for check in checks))
+        self.assertIn("leaf pin", next(c.detail for c in checks if c.name == "TLS"))
+        tls.assert_called_once_with(
+            "front.example.org",
+            connect_ip="198.51.100.20",
+            pinned_peer_cert_sha256=CERT_SHA256,
+        )
+        self.assertTrue(
+            all(
+                call_.kwargs["pinned_peer_cert_sha256"] == CERT_SHA256
+                for call_ in status.call_args_list
+            )
         )
 
     def test_ispmanager_assigned_ip_mismatch_is_informational(self):
@@ -181,7 +295,7 @@ class FrontAddressRoleTests(unittest.TestCase):
         output = io.StringIO()
         with (
             patch("xhttp_setup.cli._validated_prompt", side_effect=prompts),
-            patch("xhttp_setup.cli._yes_no", side_effect=(True, False)),
+            patch("xhttp_setup.cli._yes_no", side_effect=(False, True, False)),
             patch(
                 "xhttp_setup.cli._prompt",
                 side_effect=("https://panel.example.org:1500/ispmgr", "site_user"),
