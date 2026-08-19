@@ -234,6 +234,63 @@ class FrontTransactionTests(unittest.TestCase):
             self.assertTrue(mutated)
             self.assertEqual(client.files, {"index.html": b"concurrent-edit"})
 
+    def test_unswitched_changed_remote_temp_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work_dir = Path(temp)
+            local = work_dir / "new-index"
+            local.write_bytes(b"new")
+            remote_temp = None
+            mutated = False
+
+            def replace_temp_after_verification(client, parts):
+                nonlocal remote_temp, mutated
+                if parts[0] == "put" and "xhttp-new-" in parts[2]:
+                    remote_temp = parts[2]
+                elif (
+                    not mutated
+                    and remote_temp is not None
+                    and parts[0] == "get"
+                    and parts[1] == remote_temp
+                ):
+                    client.files["index.html"] = b"concurrent-edit"
+                    client.files[remote_temp] = b"owner-temp-bytes"
+                    mutated = True
+
+            client = MemorySFTP(
+                {"index.html": b"old"},
+                after_command=replace_temp_after_verification,
+            )
+            journal = []
+
+            try:
+                _upload_verified(
+                    client,
+                    remote_dir="/remote",
+                    local=local,
+                    target="index.html",
+                    backup_name=".xhttp-backup-index-test",
+                    work_dir=work_dir,
+                    journal=journal,
+                )
+            except InstallerError as original:
+                with self.assertRaisesRegex(
+                    InstallerError, "rollback неполон"
+                ) as raised:
+                    _rollback_journal(
+                        client,
+                        remote_dir="/remote",
+                        journal=journal,
+                        original=original,
+                    )
+            else:
+                self.fail("expected precondition mismatch")
+
+            self.assertTrue(mutated)
+            self.assertIsNotNone(remote_temp)
+            self.assertEqual(client.files["index.html"], b"concurrent-edit")
+            self.assertEqual(client.files[remote_temp], b"owner-temp-bytes")
+            self.assertIn(f"/remote/{remote_temp}", str(raised.exception))
+
     def test_journal_restores_both_files(self):
         with tempfile.TemporaryDirectory() as temp:
             work_dir = Path(temp)
@@ -278,7 +335,9 @@ class FrontTransactionTests(unittest.TestCase):
                     remote_temp=f"temp-{target}",
                     original_local=work_dir / f"original-{index}",
                     original_existed=False,
+                    original_sha256=None,
                     work_dir=work_dir,
+                    installed_sha256="00" * 32,
                 )
                 for index, target in enumerate(("index.html", ".htaccess"))
             ]

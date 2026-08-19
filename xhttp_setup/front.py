@@ -11,6 +11,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .errors import InstallerError, VerificationError
 from .models import FrontDesired, TLS_MODE_PINNED, validate_cert_sha256
@@ -36,8 +37,14 @@ class _RemoteMutation:
     remote_temp: str
     original_local: Path
     original_existed: bool
+    original_sha256: str | None
     work_dir: Path
+    installed_sha256: str
     switch_attempted: bool = False
+
+
+class _RemoteStateConflict(InstallerError):
+    """The target no longer matches either transaction-owned exact state."""
 
 
 def check_front_dns(domain: str, dns_ipv4: str) -> None:
@@ -265,7 +272,9 @@ def _upload_verified(
         remote_temp=remote_temp,
         original_local=existing_probe,
         original_existed=existed,
+        original_sha256=sha256_file(existing_probe) if existed else None,
         work_dir=work_dir,
+        installed_sha256=sha256_file(local),
     )
     # Register before the first remote write. A transport failure can happen after
     # the server accepted a command but before the client received its result.
@@ -277,7 +286,7 @@ def _upload_verified(
             f"get {sftp_quote(remote_temp)} {sftp_quote(str(verify))}",
         ]
     )
-    if sha256_file(local) != sha256_file(verify):
+    if mutation.installed_sha256 != sha256_file(verify):
         raise VerificationError(f"SHA-256 загруженного {target} не совпал")
     commands = [f"cd {sftp_quote(remote_dir)}"]
     if existed:
@@ -327,7 +336,7 @@ def _is_restored(
         mutation=mutation,
     )
     if mutation.original_existed:
-        if actual != sha256_file(mutation.original_local):
+        if actual != mutation.original_sha256:
             return False
     elif actual is not None:
         return False
@@ -354,12 +363,117 @@ def _try_batch(client: SFTPClient, commands: list[str], errors: list[str]) -> No
         errors.append(str(exc))
 
 
-def _rollback_mutation(
-    client: SFTPClient, *, remote_dir: str, mutation: _RemoteMutation
+def _remote_artifact_path(remote_dir: str, name: str) -> str:
+    return f"{remote_dir.rstrip('/')}/{name}"
+
+
+def _cleanup_unswitched_temp(
+    client: SFTPClient,
+    *,
+    remote_dir: str,
+    mutation: _RemoteMutation,
 ) -> None:
+    """Remove only the exact verified temp from an aborted pre-switch upload."""
+    quarantine = f"{mutation.remote_temp}.rollback-{uuid.uuid4().hex}"
     errors: list[str] = []
-    if not mutation.switch_attempted:
-        for _ in range(2):
+
+    for _ in range(4):
+        temp_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.remote_temp,
+            mutation=mutation,
+        )
+        quarantine_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=quarantine,
+            mutation=mutation,
+        )
+        if temp_digest is None and quarantine_digest is None:
+            return
+        if temp_digest == mutation.installed_sha256 and quarantine_digest is None:
+            _try_batch(
+                client,
+                [
+                    f"cd {sftp_quote(remote_dir)}",
+                    f"rename {sftp_quote(mutation.remote_temp)} {sftp_quote(quarantine)}",
+                ],
+                errors,
+            )
+            continue
+        if temp_digest is None and quarantine_digest == mutation.installed_sha256:
+            _try_batch(
+                client,
+                [
+                    f"cd {sftp_quote(remote_dir)}",
+                    f"rm {sftp_quote(quarantine)}",
+                ],
+                errors,
+            )
+            continue
+        preserved_name = (
+            quarantine if quarantine_digest is not None else mutation.remote_temp
+        )
+        raise _RemoteStateConflict(
+            f"Изменённый remote temp сохранён: "
+            f"{_remote_artifact_path(remote_dir, preserved_name)}"
+        )
+
+    detail = "; ".join(errors[-4:]) or "temporary upload остался"
+    raise InstallerError(
+        f"Не удалось безопасно очистить remote temp для {mutation.target}: {detail}"
+    )
+
+
+def _remove_installed_target(
+    client: SFTPClient,
+    *,
+    remote_dir: str,
+    mutation: _RemoteMutation,
+) -> None:
+    """Remove a newly-created target without digest-then-unlink on its live name."""
+    quarantine = f".{mutation.target}.xhttp-current-{uuid.uuid4().hex}"
+    errors: list[str] = []
+
+    for _ in range(4):
+        target_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.target,
+            mutation=mutation,
+        )
+        quarantine_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=quarantine,
+            mutation=mutation,
+        )
+        backup_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.backup_name,
+            mutation=mutation,
+        )
+        temp_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.remote_temp,
+            mutation=mutation,
+        )
+
+        if backup_digest is not None:
+            raise _RemoteStateConflict(
+                f"Неожиданный remote artifact сохранён: "
+                f"{_remote_artifact_path(remote_dir, mutation.backup_name)}"
+            )
+        if temp_digest not in {None, mutation.installed_sha256}:
+            raise _RemoteStateConflict(
+                f"Изменённый remote artifact сохранён: "
+                f"{_remote_artifact_path(remote_dir, mutation.remote_temp)}"
+            )
+
+        if target_digest is None and quarantine_digest is None:
             _try_batch(
                 client,
                 [
@@ -368,29 +482,327 @@ def _rollback_mutation(
                 ],
                 errors,
             )
-            try:
-                if (
-                    _remote_digest(
-                        client,
-                        remote_dir=remote_dir,
-                        name=mutation.remote_temp,
-                        mutation=mutation,
-                    )
-                    is None
-                ):
-                    return
-            except Exception as exc:
-                errors.append(str(exc))
-        detail = "; ".join(errors[-4:]) or "temporary upload остался"
-        raise InstallerError(
-            f"Не удалось очистить remote temp для {mutation.target}: {detail}"
+            if _is_restored(client, remote_dir=remote_dir, mutation=mutation):
+                return
+            continue
+
+        if target_digest == mutation.installed_sha256 and quarantine_digest is None:
+            # The rename is the destructive boundary. If target changed after the
+            # digest probe, the changed bytes move to quarantine and are retained.
+            _try_batch(
+                client,
+                [
+                    f"cd {sftp_quote(remote_dir)}",
+                    f"rename {sftp_quote(mutation.target)} {sftp_quote(quarantine)}",
+                ],
+                errors,
+            )
+            continue
+
+        if target_digest is None and quarantine_digest == mutation.installed_sha256:
+            # A new canonical target may appear after this probe, but removing our
+            # unique quarantine cannot delete it. The final verification detects it.
+            _try_batch(
+                client,
+                [
+                    f"cd {sftp_quote(remote_dir)}",
+                    f"rm {sftp_quote(quarantine)}",
+                    f"-rm {sftp_quote(mutation.remote_temp)}",
+                ],
+                errors,
+            )
+            if _is_restored(client, remote_dir=remote_dir, mutation=mutation):
+                return
+            continue
+
+        if quarantine_digest is not None:
+            raise _RemoteStateConflict(
+                f"Remote {mutation.target} изменён во время rollback; "
+                f"чужое состояние сохранено в "
+                f"{_remote_artifact_path(remote_dir, quarantine)}"
+            )
+        raise _RemoteStateConflict(
+            f"Remote {mutation.target} изменён после применения; "
+            "автоматический rollback оставил его без изменений"
         )
 
-    cleanup = [
-        f"cd {sftp_quote(remote_dir)}",
-        f"-rm {sftp_quote(mutation.backup_name)}",
-        f"-rm {sftp_quote(mutation.remote_temp)}",
-    ]
+    detail = "; ".join(errors[-4:]) or "не удалось изолировать installed target"
+    raise InstallerError(
+        f"Не удалось безопасно удалить remote {mutation.target}: {detail}"
+    )
+
+
+def _restore_expected_backup(
+    client: SFTPClient,
+    *,
+    remote_dir: str,
+    mutation: _RemoteMutation,
+    expected_sha256: str,
+) -> None:
+    """Restore a verified backup without ever unlinking an unchecked target."""
+    quarantine = f".{mutation.target}.xhttp-current-{uuid.uuid4().hex}"
+    late_quarantine = f".{mutation.target}.xhttp-late-{uuid.uuid4().hex}"
+    errors: list[str] = []
+
+    def cleanup_and_verify() -> bool:
+        quarantine_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=quarantine,
+            mutation=mutation,
+        )
+        backup_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.backup_name,
+            mutation=mutation,
+        )
+        temp_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.remote_temp,
+            mutation=mutation,
+        )
+        late_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=late_quarantine,
+            mutation=mutation,
+        )
+        if late_digest is not None:
+            raise _RemoteStateConflict(
+                f"Remote {mutation.target} появился во время rollback; "
+                f"чужое состояние сохранено в "
+                f"{_remote_artifact_path(remote_dir, late_quarantine)}"
+            )
+        artifact_states = (
+            (quarantine, quarantine_digest, {None, mutation.installed_sha256}),
+            (mutation.backup_name, backup_digest, {None, expected_sha256}),
+            (mutation.remote_temp, temp_digest, {None, mutation.installed_sha256}),
+        )
+        for name, digest, allowed in artifact_states:
+            if digest not in allowed:
+                raise _RemoteStateConflict(
+                    f"Изменённый remote artifact сохранён: "
+                    f"{_remote_artifact_path(remote_dir, name)}"
+                )
+        _try_batch(
+            client,
+            [
+                f"cd {sftp_quote(remote_dir)}",
+                f"-rm {sftp_quote(quarantine)}",
+                f"-rm {sftp_quote(mutation.backup_name)}",
+                f"-rm {sftp_quote(mutation.remote_temp)}",
+            ],
+            errors,
+        )
+        quarantine_digest_after = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=quarantine,
+            mutation=mutation,
+        )
+        return quarantine_digest_after is None and _is_restored(
+            client, remote_dir=remote_dir, mutation=mutation
+        )
+
+    # Rename, rather than unlink, the current target. If an owner edit lands
+    # after our first digest check, it moves into quarantine and is detected.
+    for _ in range(3):
+        target_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.target,
+            mutation=mutation,
+        )
+        quarantine_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=quarantine,
+            mutation=mutation,
+        )
+        if target_digest == expected_sha256:
+            if quarantine_digest not in {None, mutation.installed_sha256}:
+                raise _RemoteStateConflict(
+                    f"Remote {mutation.target} изменён во время rollback; "
+                    f"чужое состояние сохранено в "
+                    f"{_remote_artifact_path(remote_dir, quarantine)}"
+                )
+            if cleanup_and_verify():
+                return
+            continue
+        if target_digest == mutation.installed_sha256 and quarantine_digest is None:
+            _try_batch(
+                client,
+                [
+                    f"cd {sftp_quote(remote_dir)}",
+                    f"rename {sftp_quote(mutation.target)} {sftp_quote(quarantine)}",
+                ],
+                errors,
+            )
+            continue
+        if target_digest is None and quarantine_digest == mutation.installed_sha256:
+            break
+        if target_digest is None and quarantine_digest is None:
+            backup_digest = _remote_digest(
+                client,
+                remote_dir=remote_dir,
+                name=mutation.backup_name,
+                mutation=mutation,
+            )
+            temp_digest = _remote_digest(
+                client,
+                remote_dir=remote_dir,
+                name=mutation.remote_temp,
+                mutation=mutation,
+            )
+            if (
+                backup_digest == expected_sha256
+                and temp_digest == mutation.installed_sha256
+            ):
+                # The first switch rename completed but the verified temp was not
+                # promoted. There is no installed target to quarantine.
+                break
+        if target_digest is None and quarantine_digest is not None:
+            raise _RemoteStateConflict(
+                f"Remote {mutation.target} изменён во время rollback; "
+                f"чужое состояние сохранено в "
+                f"{_remote_artifact_path(remote_dir, quarantine)}"
+            )
+        raise _RemoteStateConflict(
+            f"Remote {mutation.target} изменён во время rollback; "
+            "чужое состояние сохранено"
+        )
+    else:
+        detail = "; ".join(errors[-4:]) or "не удалось изолировать installed target"
+        raise InstallerError(
+            f"Не удалось безопасно подготовить rollback remote {mutation.target}: {detail}"
+        )
+
+    # Target is absent and the exact installed file is quarantined. Re-check the
+    # backup after both renames so a changed backup is never promoted silently.
+    for _ in range(3):
+        target_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.target,
+            mutation=mutation,
+        )
+        quarantine_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=quarantine,
+            mutation=mutation,
+        )
+        backup_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.backup_name,
+            mutation=mutation,
+        )
+        temp_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=mutation.remote_temp,
+            mutation=mutation,
+        )
+        late_digest = _remote_digest(
+            client,
+            remote_dir=remote_dir,
+            name=late_quarantine,
+            mutation=mutation,
+        )
+        if late_digest is not None:
+            raise _RemoteStateConflict(
+                f"Remote {mutation.target} появился во время rollback; "
+                f"чужое состояние сохранено в "
+                f"{_remote_artifact_path(remote_dir, late_quarantine)}"
+            )
+        if target_digest == expected_sha256:
+            if quarantine_digest not in {None, mutation.installed_sha256}:
+                raise _RemoteStateConflict(
+                    f"Remote {mutation.target} изменён во время rollback; "
+                    f"изменённый quarantine сохранён: "
+                    f"{_remote_artifact_path(remote_dir, quarantine)}"
+                )
+            if cleanup_and_verify():
+                return
+            continue
+        if target_digest is not None:
+            raise _RemoteStateConflict(
+                f"Remote {mutation.target} изменён во время rollback; "
+                "чужое состояние сохранено"
+            )
+        if (
+            quarantine_digest not in {None, mutation.installed_sha256}
+            or backup_digest != expected_sha256
+            or temp_digest not in {None, mutation.installed_sha256}
+            or (quarantine_digest is None and temp_digest != mutation.installed_sha256)
+        ):
+            if quarantine_digest not in {None, mutation.installed_sha256}:
+                preserved_name = quarantine
+            elif backup_digest != expected_sha256:
+                preserved_name = (
+                    mutation.backup_name if backup_digest is not None else None
+                )
+            elif temp_digest not in {None, mutation.installed_sha256}:
+                preserved_name = mutation.remote_temp
+            else:
+                preserved_name = None
+            artifact_detail = (
+                f"artifact сохранён: "
+                f"{_remote_artifact_path(remote_dir, preserved_name)}"
+                if preserved_name is not None
+                else "recoverable artifact отсутствует"
+            )
+            raise _RemoteStateConflict(
+                f"Remote {mutation.target} или его backup изменён во время rollback; "
+                f"автоматическое восстановление остановлено; {artifact_detail}"
+            )
+        _try_batch(
+            client,
+            [
+                f"cd {sftp_quote(remote_dir)}",
+                # Catch a target created at this command boundary. SFTP has no
+                # compare-and-swap, so the exact residual limitation is documented.
+                f"-rename {sftp_quote(mutation.target)} {sftp_quote(late_quarantine)}",
+                f"rename {sftp_quote(mutation.backup_name)} {sftp_quote(mutation.target)}",
+                f"-rm {sftp_quote(mutation.remote_temp)}",
+            ],
+            errors,
+        )
+
+    detail = "; ".join(errors[-4:]) or "не удалось восстановить verified backup"
+    raise InstallerError(
+        f"Не удалось безопасно восстановить remote {mutation.target}: {detail}"
+    )
+
+
+def _rollback_mutation(
+    client: SFTPClient, *, remote_dir: str, mutation: _RemoteMutation
+) -> None:
+    errors: list[str] = []
+    if not mutation.switch_attempted:
+        _cleanup_unswitched_temp(
+            client,
+            remote_dir=remote_dir,
+            mutation=mutation,
+        )
+        return
+
+    if not mutation.original_existed:
+        _remove_installed_target(
+            client,
+            remote_dir=remote_dir,
+            mutation=mutation,
+        )
+        return
+
+    expected = mutation.original_sha256
+    if expected is None:  # Internal invariant; keep rollback fail-closed.
+        raise InstallerError(
+            f"Нет pre-apply SHA-256 для существовавшего remote {mutation.target}"
+        )
 
     # First reconcile the common states left by an interrupted rename batch.
     for _ in range(2):
@@ -401,87 +813,71 @@ def _rollback_mutation(
                 name=mutation.target,
                 mutation=mutation,
             )
-            expected = (
-                sha256_file(mutation.original_local)
-                if mutation.original_existed
-                else None
-            )
             if target_digest == expected:
-                _try_batch(client, cleanup, errors)
-            elif mutation.original_existed:
-                _try_batch(
+                _restore_expected_backup(
                     client,
-                    [
-                        f"cd {sftp_quote(remote_dir)}",
-                        f"-rm {sftp_quote(mutation.target)}",
-                        f"-rename {sftp_quote(mutation.backup_name)} {sftp_quote(mutation.target)}",
-                        f"-rm {sftp_quote(mutation.remote_temp)}",
-                    ],
-                    errors,
+                    remote_dir=remote_dir,
+                    mutation=mutation,
+                    expected_sha256=expected,
                 )
-            else:
-                _try_batch(
-                    client,
-                    [
-                        f"cd {sftp_quote(remote_dir)}",
-                        f"-rm {sftp_quote(mutation.target)}",
-                        *cleanup[1:],
-                    ],
-                    errors,
-                )
-            if _is_restored(client, remote_dir=remote_dir, mutation=mutation):
                 return
+            elif target_digest == mutation.installed_sha256:
+                backup_digest = _remote_digest(
+                    client,
+                    remote_dir=remote_dir,
+                    name=mutation.backup_name,
+                    mutation=mutation,
+                )
+                if backup_digest != expected:
+                    raise _RemoteStateConflict(
+                        f"Remote backup для {mutation.target} не совпал с "
+                        "pre-apply снимком; возможная правка владельца сохранена в "
+                        f"{_remote_artifact_path(remote_dir, mutation.backup_name)}"
+                    )
+                _restore_expected_backup(
+                    client,
+                    remote_dir=remote_dir,
+                    mutation=mutation,
+                    expected_sha256=expected,
+                )
+                return
+            elif target_digest is None:
+                backup_digest = _remote_digest(
+                    client,
+                    remote_dir=remote_dir,
+                    name=mutation.backup_name,
+                    mutation=mutation,
+                )
+                temp_digest = _remote_digest(
+                    client,
+                    remote_dir=remote_dir,
+                    name=mutation.remote_temp,
+                    mutation=mutation,
+                )
+                if (
+                    backup_digest != expected
+                    or temp_digest != mutation.installed_sha256
+                ):
+                    raise _RemoteStateConflict(
+                        f"Remote {mutation.target} изменён после применения; "
+                        "автоматический rollback отказался перезаписывать чужое состояние"
+                    )
+                _restore_expected_backup(
+                    client,
+                    remote_dir=remote_dir,
+                    mutation=mutation,
+                    expected_sha256=expected,
+                )
+                return
+            else:
+                raise _RemoteStateConflict(
+                    f"Remote {mutation.target} изменён после применения; "
+                    "автоматический rollback отказался перезаписывать чужое состояние"
+                )
+        except _RemoteStateConflict:
+            raise
         except Exception as exc:
             errors.append(str(exc))
-
-    # If the backup rename cannot be reconciled, restore the downloaded original
-    # through another verified temporary file. This also handles a lost backup.
-    if mutation.original_existed:
-        restore_temps: list[str] = []
-        for _ in range(2):
-            restore_temp = f".{mutation.target}.xhttp-restore-{uuid.uuid4().hex}"
-            restore_temps.append(restore_temp)
-            verify = mutation.work_dir / f"rollback-restore-{uuid.uuid4().hex}"
-            try:
-                client.batch(
-                    [
-                        f"cd {sftp_quote(remote_dir)}",
-                        f"put {sftp_quote(str(mutation.original_local))} {sftp_quote(restore_temp)}",
-                        f"get {sftp_quote(restore_temp)} {sftp_quote(str(verify))}",
-                    ]
-                )
-                if sha256_file(verify) != sha256_file(mutation.original_local):
-                    raise VerificationError(
-                        f"SHA-256 rollback-копии {mutation.target} не совпал"
-                    )
-                _try_batch(
-                    client,
-                    [
-                        f"cd {sftp_quote(remote_dir)}",
-                        f"-rm {sftp_quote(mutation.target)}",
-                        f"-rename {sftp_quote(restore_temp)} {sftp_quote(mutation.target)}",
-                        f"-chmod 644 {sftp_quote(mutation.target)}",
-                        *cleanup[1:],
-                        *(f"-rm {sftp_quote(name)}" for name in restore_temps),
-                    ],
-                    errors,
-                )
-                restore_temp_left = any(
-                    _remote_digest(
-                        client,
-                        remote_dir=remote_dir,
-                        name=name,
-                        mutation=mutation,
-                    )
-                    is not None
-                    for name in restore_temps
-                )
-                if not restore_temp_left and _is_restored(
-                    client, remote_dir=remote_dir, mutation=mutation
-                ):
-                    return
-            except Exception as exc:
-                errors.append(str(exc))
 
     detail = "; ".join(errors[-4:]) or "удалённое состояние не совпало"
     raise InstallerError(
@@ -494,7 +890,7 @@ def _rollback_journal(
     *,
     remote_dir: str,
     journal: list[_RemoteMutation],
-    original: Exception,
+    original: BaseException,
 ) -> None:
     failures: list[str] = []
     for mutation in reversed(journal):
@@ -515,6 +911,9 @@ def apply_front(
     *,
     auth: SSHAuth,
     state_dir: Path,
+    pre_apply: Callable[[], None] | None = None,
+    post_apply: Callable[[FrontResult], None] | None = None,
+    on_failure: Callable[[BaseException], None] | None = None,
 ) -> FrontResult:
     desired = desired.validate()
     expanded_state = state_dir.expanduser()
@@ -546,7 +945,22 @@ def apply_front(
     else:
         atomic_write_text(marker, marker_text, 0o600)
     with exclusive_lock(state_dir / "apply.lock"):
-        return _apply_front_locked(desired, auth=auth, state_dir=state_dir)
+        try:
+            if pre_apply is not None:
+                pre_apply()
+            return _apply_front_locked(
+                desired,
+                auth=auth,
+                state_dir=state_dir,
+                post_apply=post_apply,
+            )
+        except BaseException as exc:
+            if on_failure is not None:
+                try:
+                    on_failure(exc)
+                except BaseException as cleanup_error:
+                    raise cleanup_error from exc
+            raise
 
 
 def _apply_front_locked(
@@ -554,6 +968,7 @@ def _apply_front_locked(
     *,
     auth: SSHAuth,
     state_dir: Path,
+    post_apply: Callable[[FrontResult], None] | None = None,
 ) -> FrontResult:
     check_front_dns(desired.domain, desired.dns_ipv4)
     check_public_tls(
@@ -663,7 +1078,16 @@ def _apply_front_locked(
             raise VerificationError(
                 f"Frontend после применения вернул root={root_status}, path={path_status}"
             )
-    except Exception as exc:
+        result = FrontResult(
+            root_status=root_status,
+            path_status=path_status,
+            backup_dir=backup_dir,
+            remote_htaccess_backup=remote_htaccess_backup,
+            remote_index_backup=remote_index_backup,
+        )
+        if post_apply is not None:
+            post_apply(result)
+    except BaseException as exc:
         _rollback_journal(
             client,
             remote_dir=desired.document_root,
@@ -672,10 +1096,4 @@ def _apply_front_locked(
         )
         raise
 
-    return FrontResult(
-        root_status=root_status,
-        path_status=path_status,
-        backup_dir=backup_dir,
-        remote_htaccess_backup=remote_htaccess_backup,
-        remote_index_backup=remote_index_backup,
-    )
+    return result

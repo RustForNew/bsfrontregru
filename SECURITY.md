@@ -30,7 +30,23 @@
   and modes are verified by installer install/re-apply. Subsequent systemd
   restarts rely on the root-owned managed directory; they do not re-hash the
   binary before every ExecStart.
-- A failed end-to-end probe must not create or print a client URI.
+- A previous `client.vless` is withheld before a new attempt. Firewall
+  acknowledgement runs under the apply lock but before any SFTP mutation.
+  Failure or interruption during E2E or profile issuance rolls back only a
+  target that still exactly matches the digest installed by this transaction.
+  A later third-party edit is preserved and reported as an incomplete rollback;
+  the error names any hidden backup/quarantine needed for recovery, and no
+  unverified client URI is left behind. SFTP offers neither compare-and-swap nor
+  `renameat2`: quarantine-first checks protect observable command boundaries,
+  but absolute atomicity against an external writer between remote commands is
+  not guaranteed. Detected canonical-target conflicts fail closed. Random
+  `.xhttp-*` names are an installer-owned transaction namespace; an external
+  writer deliberately changing those cleanup artifacts between verification
+  and the next SFTP command is outside the rollback guarantee.
+- Failed probes retain only a bounded, redacted Xray log tail. UUID, VLESS
+  Encryption material, XHTTP path, encoded forms and complete `vless://` URIs
+  are removed from the full input before the tail is bounded and written with
+  mode `0600`.
 
 Threats not solved by this project:
 

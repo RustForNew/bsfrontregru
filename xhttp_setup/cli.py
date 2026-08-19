@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import getpass
 import os
 import platform
+import re
 import secrets
 import sys
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -278,6 +281,187 @@ def _save_verified_link(
     return link_path
 
 
+def _redact_failure_detail(error: BaseException, handoff: Handoff) -> str:
+    detail = " ".join(str(error).splitlines()).strip() or type(error).__name__
+    secrets_to_remove = (
+        handoff.encryption,
+        handoff.client_id,
+        handoff.xhttp_path,
+    )
+    for secret in secrets_to_remove:
+        encoded = urllib.parse.quote(secret, safe="")
+        encoded_plus = urllib.parse.quote_plus(secret, safe="")
+        json_escaped = secret.replace("\\", "\\\\").replace("/", "\\/")
+        for representation in {secret, json_escaped}:
+            if representation:
+                detail = detail.replace(representation, "[REDACTED]")
+        for representation in {encoded, encoded_plus}:
+            if representation:
+                detail = re.sub(
+                    re.escape(representation),
+                    "[REDACTED]",
+                    detail,
+                    flags=re.IGNORECASE,
+                )
+    detail = re.sub(
+        r"vless://\S+",
+        "[REDACTED VLESS URI]",
+        detail,
+        flags=re.IGNORECASE,
+    )
+    return detail[:2000]
+
+
+def _managed_front_state(state_dir: Path) -> bool:
+    marker = state_dir / ".xhttp-setup-state"
+    try:
+        return (
+            state_dir.is_dir()
+            and not state_dir.is_symlink()
+            and marker.is_file()
+            and not marker.is_symlink()
+            and marker.read_text("utf-8") == "xhttp-setup front state v1\n"
+        )
+    except (OSError, UnicodeError):
+        return False
+
+
+def _remove_client_link(state_dir: Path) -> None:
+    link_path = state_dir / "client.vless"
+    try:
+        link_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise InstallerError(
+            f"Не удалось убрать непроверенный client.vless из managed state: {exc}"
+        ) from exc
+
+
+def _record_front_failure(
+    *,
+    state_dir: Path,
+    stage: str,
+    error: BaseException,
+    handoff: Handoff,
+    rollback_status: str,
+    link_status: str,
+) -> Path | None:
+    if not _managed_front_state(state_dir):
+        return None
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    detail = _redact_failure_detail(error, handoff)
+    log_path = state_dir / "last-failure.log"
+    try:
+        atomic_write_text(
+            log_path,
+            "\n".join(
+                (
+                    f"time_utc={timestamp}",
+                    f"stage={stage}",
+                    f"error_type={type(error).__name__}",
+                    f"error={detail}",
+                    f"frontend_rollback={rollback_status}",
+                    f"client_link={link_status}",
+                    "",
+                )
+            ),
+            0o600,
+        )
+    except OSError:
+        return None
+    return log_path
+
+
+def _apply_front_and_issue(
+    *,
+    desired: FrontDesired,
+    auth: SSHAuth,
+    state_dir: Path,
+    handoff: Handoff,
+    layout: Layout,
+    firewall_plan_path: Path | None = None,
+    firewall_supplied: bool | None = None,
+) -> FrontResult:
+    stage = "frontend apply"
+    link_withholding_started = False
+
+    def prepare_transaction() -> None:
+        nonlocal stage, link_withholding_started
+        stage = "stale client link withholding"
+        link_withholding_started = True
+        _remove_client_link(state_dir)
+        if firewall_supplied is not None:
+            stage = "firewall acknowledgement"
+            _ack_firewall(
+                plan_path=firewall_plan_path,
+                supplied=firewall_supplied,
+            )
+        stage = "frontend apply"
+
+    def finish_transaction(_: FrontResult) -> None:
+        nonlocal stage, link_withholding_started
+        if not link_withholding_started:
+            stage = "stale client link withholding"
+            link_withholding_started = True
+            _remove_client_link(state_dir)
+        stage = "failure log rotation"
+        try:
+            (state_dir / "last-failure.log").unlink(missing_ok=True)
+        except OSError as exc:
+            raise InstallerError(
+                f"Не удалось удалить устаревший failure log из managed state: {exc}"
+            ) from exc
+        stage = "E2E probe and profile issuance"
+        _run_probe_and_issue(
+            handoff=handoff,
+            domain=desired.domain,
+            client_connect_ip=desired.client_connect_ip,
+            state_dir=state_dir,
+            layout=layout,
+        )
+
+    def record_failure(exc: BaseException) -> None:
+        nonlocal link_withholding_started
+        link_status = "not touched"
+        cleanup_error: InstallerError | None = None
+        if _managed_front_state(state_dir):
+            link_withholding_started = True
+            try:
+                _remove_client_link(state_dir)
+                link_status = "absent"
+            except InstallerError as link_error:
+                cleanup_error = link_error
+                link_status = "cleanup failed"
+        rollback_status = (
+            "failed; inspect error"
+            if "rollback неполон" in str(exc)
+            else "completed or no remote mutation"
+        )
+        log_path = _record_front_failure(
+            state_dir=state_dir,
+            stage=stage,
+            error=exc,
+            handoff=handoff,
+            rollback_status=rollback_status,
+            link_status=link_status,
+        )
+        if log_path is not None:
+            try:
+                print(f"Диагностика без секретов: {log_path}", file=sys.stderr)
+            except OSError:
+                pass
+        if cleanup_error is not None:
+            raise cleanup_error from exc
+
+    return apply_front(
+        desired,
+        auth=auth,
+        state_dir=state_dir,
+        pre_apply=prepare_transaction,
+        post_apply=finish_transaction,
+        on_failure=record_failure,
+    )
+
+
 def _run_probe_and_issue(
     *,
     handoff: Handoff,
@@ -347,17 +531,16 @@ def wizard_front() -> int:
     _require_linux_apply()
     auth = _collect_auth()
     state_dir = _default_state(desired.domain)
-    result = apply_front(desired, auth=auth, state_dir=state_dir)
-    _print_front_result(result)
-    _ack_firewall()
     probe_layout = Layout(root=state_dir / "probe-runtime")
-    _run_probe_and_issue(
-        handoff=client_handoff,
-        domain=desired.domain,
-        client_connect_ip=desired.client_connect_ip,
+    result = _apply_front_and_issue(
+        desired=desired,
+        auth=auth,
         state_dir=state_dir,
+        handoff=client_handoff,
         layout=probe_layout,
+        firewall_supplied=False,
     )
+    _print_front_result(result)
     return 0
 
 
@@ -395,7 +578,6 @@ def wizard_full() -> int:
     client_handoff = handoff.with_pinned_peer_cert(
         desired_front.pinned_peer_cert_sha256
     )
-    _ack_firewall(plan_path=Layout().firewall_plan)
     desired_front = FrontDesired(
         **{
             **desired_front.__dict__,
@@ -406,15 +588,16 @@ def wizard_full() -> int:
     ).validate()
     state_dir = _default_state(desired_front.domain)
     try:
-        result = apply_front(desired_front, auth=auth, state_dir=state_dir)
-        _print_front_result(result)
-        _run_probe_and_issue(
-            handoff=client_handoff,
-            domain=desired_front.domain,
-            client_connect_ip=desired_front.client_connect_ip,
+        result = _apply_front_and_issue(
+            desired=desired_front,
+            auth=auth,
             state_dir=state_dir,
+            handoff=client_handoff,
             layout=Layout(),
+            firewall_plan_path=Layout().firewall_plan,
+            firewall_supplied=False,
         )
+        _print_front_result(result)
     except Exception:
         print(
             "\nВыход уже настроен, но frontend/E2E не завершён. Ссылка не создана. "
@@ -564,16 +747,15 @@ def _front_from_args(args: argparse.Namespace) -> int:
         if args.state_dir
         else _default_state(desired.domain)
     )
-    result = apply_front(desired, auth=auth, state_dir=state_dir)
-    _print_front_result(result)
-    _ack_firewall(supplied=args.ack_firewall)
-    _run_probe_and_issue(
-        handoff=client_handoff,
-        domain=desired.domain,
-        client_connect_ip=desired.client_connect_ip,
+    result = _apply_front_and_issue(
+        desired=desired,
+        auth=auth,
         state_dir=state_dir,
+        handoff=client_handoff,
         layout=Layout(root=state_dir / "probe-runtime"),
+        firewall_supplied=args.ack_firewall,
     )
+    _print_front_result(result)
     return 0
 
 

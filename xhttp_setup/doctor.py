@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +15,14 @@ from .errors import InstallerError, VerificationError
 from .exit_installer import Layout, XRAY_ASSETS, XRAY_VERSION, install_xray_binary
 from .front import check_public_tls, https_status
 from .models import Handoff
-from .osutil import command_exists, ensure_dir, load_json, run, sha256_file
+from .osutil import (
+    atomic_write_text,
+    command_exists,
+    ensure_dir,
+    load_json,
+    run,
+    sha256_file,
+)
 from .render import pretty_json, render_xray_client_config
 from .validate import validate_ipv4
 
@@ -226,6 +235,58 @@ def _curl_through_socks(*, socks_port: int, url: str):
     )
 
 
+def _redact_probe_text(text: str, handoff: Handoff) -> str:
+    redacted = text
+    for secret in (handoff.encryption, handoff.client_id, handoff.xhttp_path):
+        encoded = urllib.parse.quote(secret, safe="")
+        encoded_plus = urllib.parse.quote_plus(secret, safe="")
+        json_escaped = secret.replace("\\", "\\\\").replace("/", "\\/")
+        for representation in {secret, json_escaped}:
+            if representation:
+                redacted = redacted.replace(representation, "[REDACTED]")
+        for representation in {encoded, encoded_plus}:
+            if representation:
+                redacted = re.sub(
+                    re.escape(representation),
+                    "[REDACTED]",
+                    redacted,
+                    flags=re.IGNORECASE,
+                )
+    return re.sub(
+        r"vless://\S+",
+        "[REDACTED VLESS URI]",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+
+
+def _preserve_probe_failure(
+    *,
+    log_path: Path,
+    failure_path: Path,
+    error: BaseException,
+    handoff: Handoff,
+) -> Path | None:
+    try:
+        runtime_log = log_path.read_text("utf-8", errors="replace")
+    except OSError:
+        runtime_log = ""
+    detail = " ".join(str(error).splitlines()).strip() or type(error).__name__
+    safe_detail = _redact_probe_text(detail, handoff)
+    safe_runtime_log = _redact_probe_text(runtime_log, handoff)
+    content = (
+        f"error_type={type(error).__name__}\n"
+        f"error={safe_detail}\n"
+        "xray_log_tail:\n"
+        f"{safe_runtime_log[-16384:]}"
+    )
+    try:
+        atomic_write_text(failure_path, content.rstrip() + "\n", 0o600)
+    except OSError:
+        return None
+    return failure_path
+
+
 def e2e_probe(
     *,
     handoff: Handoff,
@@ -251,6 +312,7 @@ def e2e_probe(
     )
     config_path = Path(name)
     log_path = layout.state / f"probe-{os.getpid()}.log"
+    failure_path = layout.state / "probe-failure.log"
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(pretty_json(config))
@@ -289,7 +351,7 @@ def e2e_probe(
                 raise VerificationError(
                     f"E2E прошёл через неожиданный egress {observed_ip}; ожидался {expected_ip}"
                 )
-            return f"ip={observed_ip}"
+            probe_result = f"ip={observed_ip}"
         finally:
             process.terminate()
             try:
@@ -297,6 +359,25 @@ def e2e_probe(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=3)
+    except BaseException as exc:
+        saved_failure = _preserve_probe_failure(
+            log_path=log_path,
+            failure_path=failure_path,
+            error=exc,
+            handoff=handoff,
+        )
+        if isinstance(exc, Exception):
+            safe_detail = _redact_probe_text(str(exc), handoff)
+            log_detail = (
+                f"; диагностический лог без секретов: {saved_failure}"
+                if saved_failure is not None
+                else "; диагностический лог сохранить не удалось"
+            )
+            raise VerificationError(f"{safe_detail}{log_detail}") from None
+        raise
+    else:
+        failure_path.unlink(missing_ok=True)
+        return probe_result
     finally:
         config_path.unlink(missing_ok=True)
         log_path.unlink(missing_ok=True)
