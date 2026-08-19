@@ -1,15 +1,78 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
+import signal
+import stat
 import subprocess
 import tempfile
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import InstallerError, VerificationError
 from .osutil import atomic_write_text, ensure_dir, run
 from .validate import validate_host, validate_port, validate_ssh_user
+
+
+@contextlib.contextmanager
+def _password_askpass(password: str) -> Iterator[dict[str, str]]:
+    """Expose one password prompt through a private, kernel-backed FIFO."""
+    if not hasattr(os, "mkfifo"):
+        raise InstallerError("Password-auth SSH/SFTP поддерживается только на POSIX")
+    with tempfile.TemporaryDirectory(prefix="xhttp-askpass-") as temp:
+        temp_dir = Path(temp)
+        os.chmod(temp_dir, 0o700)
+        fifo = temp_dir / "password.fifo"
+        helper = temp_dir / "askpass"
+        os.mkfifo(fifo, 0o600)
+        os.chmod(fifo, 0o600)
+        fifo_fd = os.open(
+            fifo,
+            os.O_RDWR | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            payload = (password + "\n").encode("utf-8")
+            if os.write(fifo_fd, payload) != len(payload):
+                raise InstallerError("Не удалось подготовить одноразовый askpass FIFO")
+            helper.write_text(
+                '#!/bin/sh\nIFS= read -r answer < "$XHTTP_ASKPASS_FIFO" || exit 1\n'
+                'printf "%s\\n" "$answer"\n',
+                encoding="utf-8",
+            )
+            os.chmod(helper, 0o700)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DISPLAY": "xhttp-setup",
+                    "SSH_ASKPASS": str(helper),
+                    "SSH_ASKPASS_REQUIRE": "force",
+                    "XHTTP_ASKPASS_FIFO": str(fifo),
+                }
+            )
+            yield env
+        finally:
+            os.close(fifo_fd)
+
+
+def _without_askpass_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (
+        "DISPLAY",
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "XHTTP_ASKPASS_FD",
+        "XHTTP_ASKPASS_FIFO",
+    ):
+        env.pop(name, None)
+    return env
+
+
+def _last_process_line(result: subprocess.CompletedProcess[str]) -> str:
+    lines = (result.stderr or result.stdout).strip().splitlines()
+    return lines[-1] if lines else f"код {result.returncode}"
 
 
 @dataclass(frozen=True)
@@ -104,7 +167,11 @@ class SFTPClient:
         self.known_hosts = known_hosts
         self.auth = auth.validate()
 
-    def _argv(self) -> list[str]:
+    def _destination(self) -> str:
+        destination_host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.user}@{destination_host}"
+
+    def _argv(self, *, control_path: Path | None = None) -> list[str]:
         argv = [
             "sftp",
             "-F",
@@ -135,22 +202,174 @@ class SFTPClient:
                     str(self.auth.private_key),
                 ]
             )
-        else:
+        elif control_path is not None:
             argv.extend(
                 [
                     "-o",
-                    "BatchMode=no",
+                    "ControlMaster=no",
                     "-o",
-                    "PreferredAuthentications=password",
+                    f"ControlPath={control_path}",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ProxyCommand=/bin/false",
+                    "-o",
+                    "PasswordAuthentication=no",
                     "-o",
                     "PubkeyAuthentication=no",
                     "-o",
                     "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
                 ]
             )
-        destination_host = f"[{self.host}]" if ":" in self.host else self.host
-        argv.append(f"{self.user}@{destination_host}")
+        else:
+            raise InstallerError(
+                "Password-auth SFTP требует предварительно аутентифицированный SSH transport"
+            )
+        argv.append(self._destination())
         return argv
+
+    def _master_argv(self, control_path: Path) -> list[str]:
+        return [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-N",
+            "-M",
+            "-S",
+            str(control_path),
+            "-p",
+            str(self.port),
+            "-o",
+            f"UserKnownHostsFile={self.known_hosts}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "NumberOfPasswordPrompts=1",
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "PreferredAuthentications=password",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ControlPersist=no",
+            self._destination(),
+        ]
+
+    def _control_argv(self, control_path: Path, operation: str) -> list[str]:
+        return [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-S",
+            str(control_path),
+            "-O",
+            operation,
+            "-p",
+            str(self.port),
+            "-o",
+            "BatchMode=yes",
+            self._destination(),
+        ]
+
+    def _wait_for_master(
+        self, master: subprocess.Popen[str], control_path: Path
+    ) -> None:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            returncode = master.poll()
+            if returncode is not None:
+                stderr = master.stderr.read() if master.stderr is not None else ""
+                lines = stderr.strip().splitlines()
+                detail = lines[-1] if lines else f"код {returncode}"
+                raise InstallerError(f"SFTP SSH-аутентификация не удалась: {detail}")
+            try:
+                check = subprocess.run(
+                    self._control_argv(control_path, "check"),
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=_without_askpass_env(),
+                    timeout=2,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise InstallerError(
+                    f"Не удалось проверить временный SSH transport: {exc}"
+                ) from exc
+            if check.returncode == 0:
+                try:
+                    metadata = control_path.lstat()
+                except OSError as exc:
+                    raise InstallerError(
+                        f"SSH сообщил готовность, но control socket недоступен: {exc}"
+                    ) from exc
+                if not stat.S_ISSOCK(metadata.st_mode):
+                    raise InstallerError("SSH ControlPath не является Unix socket")
+                if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                    raise InstallerError(
+                        "Небезопасные владелец или права SSH ControlPath"
+                    )
+                return
+            time.sleep(0.05)
+        raise InstallerError("SSH transport не стал готов за 20 секунд")
+
+    def _stop_master(self, master: subprocess.Popen[str], control_path: Path) -> None:
+        if master.poll() is None:
+            try:
+                subprocess.run(
+                    self._control_argv(control_path, "exit"),
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=_without_askpass_env(),
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            master.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(master.pid, signal.SIGTERM)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            try:
+                master.terminate()
+            except ProcessLookupError:
+                pass
+        try:
+            master.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(master.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            try:
+                master.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            master.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallerError(
+                f"Не удалось завершить временный SSH master pid={master.pid}"
+            ) from exc
 
     def batch(
         self, commands: list[str], *, check: bool = True
@@ -163,49 +382,42 @@ class SFTPClient:
     def _batch_password(
         self, batch_text: str, *, check: bool
     ) -> subprocess.CompletedProcess[str]:
-        read_fd, write_fd = os.pipe()
-        os.set_inheritable(read_fd, True)
-        try:
-            os.write(write_fd, (self.auth.password + "\n").encode("utf-8"))
-        finally:
-            os.close(write_fd)
-        with tempfile.TemporaryDirectory(prefix="xhttp-askpass-") as temp:
-            helper = Path(temp) / "askpass"
-            helper.write_text(
-                '#!/bin/sh\nIFS= read -r answer <&"$XHTTP_ASKPASS_FD"\nprintf "%s\\n" "$answer"\n',
-                encoding="utf-8",
-            )
-            os.chmod(helper, 0o700)
-            env = os.environ.copy()
-            env.update(
-                {
-                    "DISPLAY": "xhttp-setup",
-                    "SSH_ASKPASS": str(helper),
-                    "SSH_ASKPASS_REQUIRE": "force",
-                    "XHTTP_ASKPASS_FD": str(read_fd),
-                }
-            )
+        with tempfile.TemporaryDirectory(prefix=".xhttp-mux-", dir="/tmp") as temp:
+            temp_dir = Path(temp)
+            os.chmod(temp_dir, 0o700)
+            control_path = temp_dir / "c"
+            master: subprocess.Popen[str] | None = None
             try:
+                with _password_askpass(self.auth.password) as env:
+                    master = subprocess.Popen(
+                        self._master_argv(control_path),
+                        stdin=subprocess.DEVNULL,
+                        text=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        env=env,
+                        start_new_session=True,
+                    )
+                    self._wait_for_master(master, control_path)
                 result = subprocess.run(
-                    self._argv(),
+                    self._argv(control_path=control_path),
                     input=batch_text,
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    env=env,
-                    pass_fds=(read_fd,),
-                    start_new_session=True,
+                    env=_without_askpass_env(),
                     timeout=90,
                     check=False,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise InstallerError(f"SFTP не запустился: {exc}") from exc
             finally:
-                os.close(read_fd)
+                if master is not None:
+                    self._stop_master(master, control_path)
         if check and result.returncode != 0:
-            lines = (result.stderr or result.stdout).strip().splitlines()
-            detail = lines[-1] if lines else f"код {result.returncode}"
-            raise InstallerError(f"SFTP завершился с ошибкой: {detail}")
+            raise InstallerError(
+                f"SFTP завершился с ошибкой: {_last_process_line(result)}"
+            )
         return result
 
 
@@ -296,28 +508,7 @@ class SSHClient:
     def _command_password(
         self, argv: list[str], *, check: bool, timeout: int
     ) -> subprocess.CompletedProcess[str]:
-        read_fd, write_fd = os.pipe()
-        os.set_inheritable(read_fd, True)
-        try:
-            os.write(write_fd, (self.auth.password + "\n").encode("utf-8"))
-        finally:
-            os.close(write_fd)
-        with tempfile.TemporaryDirectory(prefix="xhttp-askpass-") as temp:
-            helper = Path(temp) / "askpass"
-            helper.write_text(
-                '#!/bin/sh\nIFS= read -r answer <&"$XHTTP_ASKPASS_FD"\nprintf "%s\\n" "$answer"\n',
-                encoding="utf-8",
-            )
-            os.chmod(helper, 0o700)
-            env = os.environ.copy()
-            env.update(
-                {
-                    "DISPLAY": "xhttp-setup",
-                    "SSH_ASKPASS": str(helper),
-                    "SSH_ASKPASS_REQUIRE": "force",
-                    "XHTTP_ASKPASS_FD": str(read_fd),
-                }
-            )
+        with _password_askpass(self.auth.password) as env:
             try:
                 result = subprocess.run(
                     argv,
@@ -326,19 +517,16 @@ class SSHClient:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
-                    pass_fds=(read_fd,),
                     start_new_session=True,
                     timeout=timeout,
                     check=False,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise InstallerError(f"SSH не запустился: {exc}") from exc
-            finally:
-                os.close(read_fd)
         if check and result.returncode != 0:
-            lines = (result.stderr or result.stdout).strip().splitlines()
-            detail = lines[-1] if lines else f"код {result.returncode}"
-            raise InstallerError(f"SSH завершился с ошибкой: {detail}")
+            raise InstallerError(
+                f"SSH завершился с ошибкой: {_last_process_line(result)}"
+            )
         return result
 
 

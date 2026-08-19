@@ -1,3 +1,4 @@
+import os
 import subprocess
 import tempfile
 import unittest
@@ -57,6 +58,7 @@ class SSHClientTests(unittest.TestCase):
             with self.assertRaises(InstallerError):
                 client.command(["printf", "unsafe\ncommand"])
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO")
     def test_password_is_not_placed_in_argv_or_environment(self):
         secret = "correct horse battery staple"
         with tempfile.TemporaryDirectory() as temp:

@@ -20,8 +20,12 @@
   from `xray tls ping`'s `Pinging without SNI` section: the same IP can select a
   different default certificate when SNI is absent.
 - SFTP uses `StrictHostKeyChecking=yes` with a dedicated known_hosts file.
-- Passwords are read with `getpass` and sent to OpenSSH askpass over an inherited
-  one-use pipe. They are not placed in argv, config files, or environment values.
+- Passwords are read with `getpass` and exposed once to OpenSSH askpass through
+  a kernel-backed FIFO inside a private temporary directory. Password-auth SFTP
+  first authenticates a short-lived foreground ControlMaster, then preserves
+  fail-on-command semantics by running `sftp -b` only through its private
+  control socket. Passwords are not placed in argv, regular files, config files,
+  or environment values.
 - UUID, VLESS Encryption material, handoff, backups and client URI are secrets.
 - Xray runs as a dedicated unprivileged user and does not replace another Xray
   service.

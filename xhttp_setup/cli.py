@@ -608,6 +608,12 @@ def wizard_full() -> int:
     return 0
 
 
+def _managed_exit_present(layout: Layout) -> bool:
+    return any(
+        path.exists() for path in (layout.config, layout.handoff, layout.receipt)
+    )
+
+
 def wizard_doctor() -> int:
     domain = _validated_prompt("Frontend domain", normalize_domain)
     client_connect_ip = _validated_prompt(
@@ -625,8 +631,9 @@ def wizard_doctor() -> int:
         dns_ipv4=dns_ipv4,
         pinned_peer_cert_sha256=pinned_peer_cert_sha256,
     )
-    if os.name == "posix" and Path("/var/lib/xhttp-setup").exists():
-        checks.extend(doctor_exit())
+    exit_layout = Layout()
+    if os.name == "posix" and _managed_exit_present(exit_layout):
+        checks.extend(doctor_exit(exit_layout))
     return _print_checks(checks)
 
 
