@@ -1,82 +1,181 @@
-REG.RU SHARED FRONTEND + XHTTP + TLS PIN
-Пошаговая подготовка сайта и запуск xhttp-setup
+XHTTP-SETUP: REG.RU FRONTEND + BARE XRAY EXIT
+Пошаговая установка с pinned TLS
 
-Назначение
-==========
+Схема после настройки:
 
-Схема:
+  клиент -- VLESS Encryption + XHTTP packet-up + TLS:443 --> сайт REG.RU
+  Apache REG.RU -- HTTP/XHTTP --> bare Xray exit:8083 --> интернет
 
-  клиент -- VLESS/XHTTP + TLS :443 --> Apache сайта на REG.RU
-  Apache -- HTTP/XHTTP --> Xray на зарубежном exit --> интернет
+В трафике участвуют два узла: сайт REG.RU и зарубежный exit. Российский bridge
+нужен только для запуска SFTP-настройки. На REG.RU не устанавливаются Xray,
+Docker или Remnawave. Домен exit в клиентской ссылке не используется.
 
-TLS в этой схеме заканчивается на Apache. На shared-hosting не устанавливаются
-Xray, Docker, RemnaNode или фоновые процессы. Для TLS не требуется менять
-зарубежный exit. Домен exit в клиентской ссылке не используется: address — это
-проверенный IPv4 frontend, а frontend-домен используется как SNI и XHTTP Host.
+Инструкция рассчитана на:
 
-Режим pinned нужен, когда Apache отдаёт на 443 сертификат хостинга, который не
-проходит обычную проверку для frontend-домена. Клиент закрепляет SHA-256 точно
-этого leaf-сертификата через pcs. Это не безусловный allowInsecure: соединение
-принимается только при точном совпадении сертификата. Но при exact match Xray
-не проверяет CA, SAN/hostname, срок действия и отзыв сертификата. Pin не равен
-обычной публичной TLS-проверке.
+  - новый сайт в ISPmanager REG.RU;
+  - чистый Ubuntu/Debian exit с systemd, root и UFW;
+  - Linux/WSL с обычным IP для управления exit;
+  - Linux-сервер с российским IP для обращения к REG.RU;
+  - опубликованный GitHub Release xhttp-setup v0.1.0.
 
-Важно: pin не создаёт HTTPS-vhost. Сначала ISPmanager должен направить порт 443
-с нужным SNI на созданный сайт. Только после этого снимается fingerprint.
+Не используйте раздел UFW на сервере с Docker, собственными nftables/iptables
+или другими сервисами. Для такого сервера правила нужно объединять вручную.
 
 
-1. DNS frontend
-===============
+0. Один раз опубликовать xhttp-setup в GitHub
+================================================
 
-Создать отдельный поддомен, например:
+Создать пустой репозиторий GitHub. Открыть Settings -> General -> Releases и
+включить immutable releases. Далее на компьютере владельца открыть корень
+проекта xhttp-setup, заменить OWNER/REPOSITORY и выполнить из Git Bash или WSL:
 
-  front.example.org
+  test -z "$(git status --porcelain)" || {
+    echo 'Есть незакоммиченные файлы'; exit 1;
+  }
+  test "$(git branch --show-current)" = main || {
+    echo 'Текущая ветка не main'; exit 1;
+  }
 
-В DNS Cloudflare создать одну запись:
+  XH_PUBLISH_URL='https://github.com/OWNER/REPOSITORY.git'
+  if git remote get-url publish >/dev/null 2>&1; then
+    test "$(git remote get-url publish)" = "$XH_PUBLISH_URL" || {
+      echo 'Remote publish указывает на другой репозиторий'; exit 1;
+    }
+  else
+    git remote add publish "$XH_PUBLISH_URL"
+  fi
 
-  Type: A
-  Name: front
-  Content: <IP shared-hosting, выданный для сайта>
-  Proxy status: DNS only, серое облако
-  TTL: Auto
+  git push -u publish main
+  git tag -a v0.1.0 -m 'xhttp-setup v0.1.0'
+  git push publish v0.1.0
 
-На этом имени не должно быть одновременно AAAA или CNAME. Cloudflare proxy для
-этой записи не включать.
+Открыть GitHub -> Actions -> Release. Дождаться зелёного результата. В Releases
+должны появиться два файла:
 
-Если личный кабинет REG.RU при «Подключении домена» пишет «Неверное имя
-домена» для поддомена, не добавлять его через это окно. Поддомен создаётся как
-отдельный сайт непосредственно в ISPmanager: Сайты -> Добавить сайт.
+  xhttp-setup-0.1.0.pyz
+  xhttp-setup-0.1.0.pyz.sha256
 
-Отдельная A-запись вроде exit.example.org допустима для администрирования, но
-данная XHTTP-схема её не использует. Сертификат для неё не нужен.
+На странице release должна быть отметка Immutable. Если её нет, не
+устанавливать этот release: включить immutable releases и выпустить новый
+тег.
+
+После публикации подключиться по SSH к exit и один раз выполнить там следующий
+блок. Затем один раз выполнить его на российском bridge. Заменить
+OWNER/REPOSITORY:
+
+  (
+    set -Eeuo pipefail
+
+    XH_REPO='OWNER/REPOSITORY'
+    XH_TAG='v0.1.0'
+    XH_ASSET='xhttp-setup-0.1.0.pyz'
+    XH_TMP="$(mktemp -d)"
+    trap 'rm -rf -- "$XH_TMP"' EXIT
+    XH_BASE="https://github.com/$XH_REPO/releases/download/$XH_TAG"
+
+    command -v curl >/dev/null
+    command -v python3 >/dev/null
+    command -v sha256sum >/dev/null
+    python3 -c 'import sys; sys.version_info >= (3, 10) or sys.exit("Python 3.10+ required")'
+
+    curl --fail --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' --retry 3 \
+      --output "$XH_TMP/$XH_ASSET" "$XH_BASE/$XH_ASSET"
+
+    curl --fail --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' --retry 3 \
+      --output "$XH_TMP/$XH_ASSET.sha256" "$XH_BASE/$XH_ASSET.sha256"
+
+    XH_EXPECTED="$(tr -d '\r\n' < "$XH_TMP/$XH_ASSET.sha256")"
+    case "$XH_EXPECTED" in
+      ''|*[!0-9a-fA-F]*) echo 'Некорректный SHA-256'; exit 1 ;;
+    esac
+    test "${#XH_EXPECTED}" -eq 64
+
+    XH_ACTUAL="$(sha256sum "$XH_TMP/$XH_ASSET" | awk '{print $1}')"
+    test "${XH_ACTUAL,,}" = "${XH_EXPECTED,,}" || {
+      echo 'SHA-256 не совпал'; exit 1;
+    }
+
+    python3 "$XH_TMP/$XH_ASSET" --version
+    sudo install -m 0755 "$XH_TMP/$XH_ASSET" \
+      /usr/local/bin/.xhttp-setup.new
+    sudo mv -f /usr/local/bin/.xhttp-setup.new /usr/local/bin/xhttp-setup
+    /usr/local/bin/xhttp-setup --version
+  )
+
+Ожидаемый вывод версии:
+
+  xhttp-setup 0.1.0
 
 
-2. Создание сайта в ISPmanager
-==============================
+1. Записать исходные данные
+===========================
 
-Открыть ISPmanager с российского IP, если хостинг ограничивает вход по стране.
-Не перебирать пароли: несколько ошибочных попыток могут вызвать временную
-блокировку.
+До настройки заполнить список:
 
-Сайты -> Добавить сайт. Заполнить:
+  FRONT_DOMAIN          полный домен сайта, например front.example.org
+  SITE_IP               IPv4, назначенный сайту в ISPmanager
+  DNS_IPV4              IPv4 единственной DNS A-записи
+  CLIENT_CONNECT_IP     IPv4 подключения клиента и адрес в VLESS URI
+  FRONT_EGRESS_IP       будет измерен в разделе 5
+  TLS_PIN               будет получен в разделе 4
+  EXIT_IP               публичный IPv4 зарубежного VPS
+  EXIT_EGRESS_IP        исходящий IPv4 зарубежного VPS
+  EXIT_SSH_PORT         фактический порт sshd, обычно 22
+  BACKEND_PORT          8083
+  SFTP_HOST             hosting-node вида vipNNN.hosting.reg.ru
+  SFTP_PORT             22
+  SFTP_USER             пользователь хостинга
+  DOCROOT               корень сайта из ISPmanager
+  SFTP_HOSTKEY_SHA256   fingerprint вида SHA256:...
+  BRIDGE_IP             IPv4 российского Linux-сервера
+  BRIDGE_SSH_PORT       фактический SSH-порт bridge
+  EXIT_HOSTKEY_SHA256   SSH fingerprint exit из консоли VPS
+  BRIDGE_HOSTKEY_SHA256 SSH fingerprint bridge из консоли VPS
 
-  Имя:                 полный FQDN, например front.example.org
-  Псевдонимы:          пусто
-  Корневая директория: предложенная ISPmanager директория этого FQDN
-  Источник IP-адреса:  получить автоматически
-  E-mail администратора: действующий адрес владельца
-  Кодировка:           не указывать
-  Индексная страница:  index.php index.html
-  Редирект домена:     не включён
-  Автоподдомены:       отключено
+Надпись «2222» в названии VPS не означает, что sshd слушает порт 2222. Порт
+проверяется командой на самом VPS:
 
-При первом создании сайта SSL можно оставить выключенным. Он включается
-отдельно после того, как сайт появился в списке.
+  sudo /usr/sbin/sshd -T | awk '$1 == "port" { print $2 }'
 
-Снять галочки:
 
-  HSTS
-  Перенаправлять HTTP-запросы в HTTPS
+2. Создать сайт в ISPmanager
+============================
+
+Если REG.RU в окне «Подключение домена» пишет «Неверное имя домена», закрыть это
+окно. Открыть ISPmanager с российского IP -> Сайты -> Добавить сайт.
+
+Заполнить:
+
+  Имя:                         FRONT_DOMAIN
+  Псевдонимы:                  пусто
+  Корневая директория:         предложенная для FRONT_DOMAIN
+  Источник IP-адреса:          получить автоматически
+  E-mail администратора:       адрес владельца
+  Кодировка:                   не указывать
+  Индексная страница:          index.php index.html
+  Редирект домена:             не включён
+  Автоподдомены:               отключено
+
+SSL:
+
+  Защищённое соединение SSL:   включено
+  SSL-порт:                    443
+  SSL-сертификат:              Новый самоподписанный
+  HSTS:                        выключено
+  HTTP -> HTTPS:               выключено
+
+Оставить включёнными:
+
+  PHP
+  Режим работы PHP: FastCGI (Apache)
+  Журнал ошибок
+  Период ротации: ежедневно
+  Хранить архивов: 3
+
+Выключить:
+
   SSI
   CGI-скрипты
   Python
@@ -85,198 +184,1027 @@ Xray, Docker, RemnaNode или фоновые процессы. Для TLS не 
   Журнал запросов
   Настроить сжатие
   Настроить кеширование
+  Генератор отчётов
 
-Оставить:
+Поле «Расширения файлов для кеширования» не менять. При выключенном кешировании
+оно не используется. Версия PHP не влияет на схему; PHP-файлы не запускаются.
+Переключатель FastCGI (Apache) нужен, чтобы nginx передавал неизвестный XHTTP path
+в Apache, где выполняется .htaccess.
 
-  PHP:                  включён
-  Режим работы PHP:     FastCGI (Apache)
-  Журнал ошибок:       включён
-  Период ротации:      ежедневно
-  Хранить архивов:     3
-  Генератор отчётов:   отключён
+Нажать «Создать». Затем открыть карточку сайта и записать:
 
-На проверенной конфигурации REG.RU галочка PHP и режим FastCGI (Apache) нужны
-не для исполнения PHP-кода, а чтобы nginx передавал отсутствующие пути в Apache,
-где срабатывает `.htaccess`. При выключенном PHP запрос к XHTTP path завершается
-nginx 404 до правил Apache. Версия PHP несущественна: схема не содержит и не
-запускает PHP-файлы. Опцию «php.ini для домена» оставить выключенной.
+  - назначенный IPv4 как SITE_IP;
+  - точную корневую директорию как DOCROOT;
+  - выбранный сертификат сайта.
 
-Поле «Расширения файлов для кеширования» не менять: при выключенной галочке
-«Настроить кеширование» оно не участвует в работе сайта.
-
-Нажать «Создать».
+Не составлять DOCROOT по шаблону. Скопировать его из карточки сайта.
 
 
-3. Проверка IP и обычного HTTP-vhost
-====================================
+3. Создать DNS-запись frontend
+==============================
 
-После создания открыть карточку сайта и посмотреть фактически назначенный ему
-IP. Не считать автоматически, что IP сайта, FTP IP и исходящий IP Apache
-совпадают: это три разные роли.
+В проверенном новом REG.RU-сайте SITE_IP, DNS_IPV4 и CLIENT_CONNECT_IP совпали:
 
-До дальнейшей настройки проверить, что запрос к нужному IPv4 с Host frontend-
-домена открывает именно новый сайт, а не чужой/default-vhost:
+  DNS_IPV4 = SITE_IP
+  CLIENT_CONNECT_IP = SITE_IP
 
-  curl -sS --resolve front.example.org:80:<FRONT_IP> \
-    http://front.example.org/ -o /tmp/front-http.html
+Создать в Cloudflare одну запись:
 
-Если открывается служебная страница другого сайта, остановиться. В ISPmanager
-нужно выбрать правильный доступный IP для сайта; угадывать его по FTP-письму
-нельзя.
+  Type:          A
+  Name:          нужный поддомен
+  Content:       DNS_IPV4
+  Proxy status:  DNS only, серое облако
+  TTL:           Auto
+
+Для FRONT_DOMAIN удалить AAAA и CNAME. Cloudflare proxy не включать. Запись
+exit.example.org не нужна для XHTTP и не попадёт в клиентскую ссылку.
+
+Проверить с Linux/WSL. SITE_IP показан как default для двух ролей; если DNS или
+адрес подключения фактически другой, ввести его. Эту shell-сессию
+не закрывать до конца раздела 5:
+
+  set -Eeuo pipefail
+  read -r -p 'FRONT_DOMAIN: ' FRONT_DOMAIN
+  read -r -p 'SITE_IP из ISPmanager: ' SITE_IP
+  read -r -p "DNS_IPV4 [$SITE_IP]: " DNS_IPV4
+  DNS_IPV4="${DNS_IPV4:-$SITE_IP}"
+  read -r -p "CLIENT_CONNECT_IP [$SITE_IP]: " CLIENT_CONNECT_IP
+  CLIENT_CONNECT_IP="${CLIENT_CONNECT_IP:-$SITE_IP}"
+
+  sudo apt-get update
+  sudo apt-get install -y curl dnsutils openssl python3
+
+  mapfile -t XH_A < <(dig +short A "$FRONT_DOMAIN")
+  test "${#XH_A[@]}" -eq 1
+  test "${XH_A[0]}" = "$DNS_IPV4"
+  XH_AAAA="$(dig +short AAAA "$FRONT_DOMAIN")"
+  test -z "$XH_AAAA"
+  echo 'DNS: OK'
+
+Эти команды требуют ровно одну A-запись DNS_IPV4 и отсутствие AAAA.
 
 
-4. Включение SSL у сайта без Let's Encrypt
+4. Проверить HTTPS-vhost и получить TLS_PIN
 ===========================================
 
-Открыть Сайты -> нужный сайт -> Изменить и задать:
+Открыть сайт на редактирование. Проверить:
 
-  Защищённое соединение (SSL): включено
-  SSL-порт:                    443
-  SSL-сертификат:              сертификат, который ISPmanager назначил сайту
-  HSTS:                        выключено
-  HTTP -> HTTPS:               выключено на время проверки
+  SSL включён
+  порт 443
+  выбран сертификат FRONT_DOMAIN
+  HSTS выключен
+  HTTP -> HTTPS выключен
 
-Сохранить. Собственный Let's Encrypt для режима pinned не обязателен. Но TLS на
-443 всё равно существует: Apache предъявляет сертификат, который мы закрепим в
-клиенте.
+Скачать HTTP- и HTTPS-страницы с точным IP, Host и SNI:
 
-Диагностически получить HTTPS-страницу с тем же SNI и тем же IPv4:
+  XH_HTTP_BODY="$(mktemp)"
+  XH_HTTPS_BODY="$(mktemp)"
+  trap 'rm -f -- "$XH_HTTP_BODY" "$XH_HTTPS_BODY"' EXIT
 
-  curl -skS --resolve front.example.org:443:<FRONT_IP> \
-    https://front.example.org/ -o /tmp/front-https.html
+  XH_HTTP_STATUS="$(
+    curl --fail-with-body --silent --show-error --noproxy '*' \
+      --connect-timeout 5 --max-time 20 \
+      --resolve "$FRONT_DOMAIN:80:$CLIENT_CONNECT_IP" \
+      "http://$FRONT_DOMAIN/" \
+      --output "$XH_HTTP_BODY" --write-out '%{http_code}'
+  )"
 
-Ключ -k здесь разрешён только для этой локальной проверки содержимого до
-снятия pin. В VLESS-клиенте allowInsecure не включается.
+  XH_HTTPS_STATUS="$(
+    curl --insecure --fail-with-body --silent --show-error --noproxy '*' \
+      --connect-timeout 5 --max-time 20 \
+      --resolve "$FRONT_DOMAIN:443:$CLIENT_CONNECT_IP" \
+      "https://$FRONT_DOMAIN/" \
+      --output "$XH_HTTPS_BODY" --write-out '%{http_code}'
+  )"
 
-Сравнить HTTP и HTTPS страницы:
+  test "$XH_HTTP_STATUS" = '200'
+  test "$XH_HTTPS_STATUS" = '200'
+  test -s "$XH_HTTP_BODY"
+  test -s "$XH_HTTPS_BODY"
+  cmp -s "$XH_HTTP_BODY" "$XH_HTTPS_BODY"
+  echo 'HTTP/HTTPS vhost: OK'
 
-  sha256sum /tmp/front-http.html /tmp/front-https.html
+Если проверка остановилась, по 80 и 443 открываются разные сайты или ошибочный
+ответ. Исправить IP/SSL-vhost в ISPmanager. Pin с неправильного vhost не
+использовать.
 
-Одинаковый хеш — простой признак, что 80 и 443 ведут на один vhost. Если по 443
-видна страница «домен не привязан» или другой сайт, pin снимать нельзя: сначала
-исправить SSL-привязку в ISPmanager.
+Получить SHA-256 полного DER leaf-сертификата:
+
+  XH_CERT_DER="$(mktemp)"
+  trap 'rm -f -- "$XH_HTTP_BODY" "$XH_HTTPS_BODY" "$XH_CERT_DER"' EXIT
+
+  if ! (
+    set -o pipefail
+    timeout 20 openssl s_client \
+      -connect "$CLIENT_CONNECT_IP:443" \
+      -servername "$FRONT_DOMAIN" \
+      </dev/null 2>/dev/null \
+    | openssl x509 -outform DER > "$XH_CERT_DER"
+  ); then
+    echo 'Не удалось получить leaf-сертификат'
+    exit 1
+  fi
+
+  test -s "$XH_CERT_DER"
+  TLS_PIN="$(sha256sum "$XH_CERT_DER" | awk '{print $1}')"
+  [[ "$TLS_PIN" =~ ^[0-9a-f]{64}$ ]]
+  rm -f -- "$XH_CERT_DER"
+  rm -f -- "$XH_HTTP_BODY" "$XH_HTTPS_BODY"
+  trap - EXIT
+  printf '%s\n' "$TLS_PIN"
+
+Записать результат как TLS_PIN. Параметр -servername обязателен. Не использовать
+hash из секции «without SNI», fingerprint CA или SPKI.
+
+В этом режиме публичный Let's Encrypt не нужен. Сертификат и SSL-vhost на 443
+обязательны. Клиент будет принимать только leaf с TLS_PIN. allowInsecure в ссылку
+не добавляется. После замены сертификата нужно получить новый TLS_PIN и заново
+выпустить ссылку.
 
 
-5. Получение SHA-256 leaf-сертификата
-=====================================
+5. Измерить FRONT_EGRESS_IP
+===========================
 
-Снимать pin только после шага 4. На доверенной Linux-машине/WSL:
+FRONT_EGRESS_IP — адрес, с которого Apache REG.RU подключается к exit. Он может
+не совпасть с CLIENT_CONNECT_IP или FTP IP. Измерение выполняется до установки
+Xray.
 
-  openssl s_client -connect <FRONT_IP>:443 \
-    -servername front.example.org </dev/null 2>/dev/null \
-    | openssl x509 -outform DER \
-    | sha256sum
+В той же Linux/WSL shell создать случайный path пробы и вывести готовый
+.htaccess. По запросу ввести EXIT_IP:
 
-Нужны первые 64 hex-символа результата. Это SHA-256 полного DER leaf-
-сертификата, не fingerprint CA и не SPKI.
+  read -r -p 'EXIT_IP: ' EXIT_IP
+  python3 -c 'import ipaddress,sys; v=ipaddress.ip_address(sys.argv[1]); (v.version == 4 and v.is_global) or sys.exit("EXIT_IP не публичный IPv4")' \
+    "$EXIT_IP"
+  XH_PROBE_PORT='18083'
+  XH_PROBE_TOKEN="xhttp-egress-$(openssl rand -hex 8)"
+  printf 'RewriteEngine On\nRewriteRule ^%s$ http://%s:%s/ [P,L]\n' \
+    "$XH_PROBE_TOKEN" "$EXIT_IP" "$XH_PROBE_PORT"
 
-Параметр -servername обязателен. Один и тот же Apache может предъявлять разные
-сертификаты с SNI и без SNI. Нельзя брать hash из секции «without SNI» команды
-`xray tls ping`: VLESS-клиент отправляет SNI frontend-домена, поэтому закреплять
-нужно сертификат именно этого SNI-vhost.
+На exit открыть SSH-сессию с обычного IP. Установить tcpdump и
+убедиться, что пробный порт свободен:
 
-Получение pin с одного сетевого пути является TOFU, а не независимой проверкой
-личности сервера. По возможности сверить результат из второй доверенной сети
-или с данными провайдера. После несовпадения pin нельзя автоматически принимать
-новый сертификат с того же непроверенного соединения.
+  (
+    set -Eeuo pipefail
+    sudo apt-get update
+    sudo apt-get install -y python3 tcpdump
+    XH_PROBE_PORT='18083'
+    if sudo ss -H -lnt "sport = :$XH_PROBE_PORT" | grep . >/dev/null; then
+      echo 'Порт 18083 занят'
+      exit 1
+    fi
+  )
+
+В ISPmanager открыть Файлы -> DOCROOT. На новом сайте .htaccess должен
+отсутствовать. Если он уже есть, остановиться: этот линейный порядок рассчитан
+на новый сайт и не должен перезаписывать существующие правила.
+
+Создать в DOCROOT временный файл .htaccess и вставить в него ровно две
+строки, которые напечатала команда выше.
+
+На exit запустить весь блок ниже. Он ждёт 12 SYN; пока он работает,
+выполнить следующий блок с Linux/WSL:
+
+  (
+    set -Eeuo pipefail
+    XH_PROBE_PORT='18083'
+    XH_CAPTURE="$(mktemp)"
+    trap 'rm -f -- "$XH_CAPTURE"' EXIT
+    sudo timeout 240 tcpdump -nn -l -i any -c 12 \
+      "tcp dst port $XH_PROBE_PORT and (tcp[tcpflags] & tcp-syn != 0)" \
+      | tee "$XH_CAPTURE"
+
+    XH_SYN_COUNT="$(awk '{for (i=1; i<=NF; i++) if ($i == ">") c++} END {print c+0}' \
+      "$XH_CAPTURE")"
+    test "$XH_SYN_COUNT" -eq 12
+    mapfile -t XH_SOURCES < <(
+      awk '{for (i=1; i<=NF; i++) if ($i == ">") {s=$(i-1); sub(/\.[0-9]+$/, "", s); print s}}' \
+        "$XH_CAPTURE" | sort -u
+    )
+    test "${#XH_SOURCES[@]}" -eq 1
+    FRONT_EGRESS_IP="${XH_SOURCES[0]}"
+    python3 -c 'import ipaddress,sys; v=ipaddress.ip_address(sys.argv[1]); (v.version == 4 and v.is_global) or sys.exit("FRONT_EGRESS_IP не публичный IPv4")' \
+      "$FRONT_EGRESS_IP"
+    printf 'FRONT_EGRESS_IP=%s\n' "$FRONT_EGRESS_IP"
+  )
+
+Пока capture работает, с Linux/WSL выполнить:
+
+  for XH_N in $(seq 1 12); do
+    curl --insecure --silent --show-error --noproxy '*' \
+      --connect-timeout 5 --max-time 10 \
+      --resolve "$FRONT_DOMAIN:443:$CLIENT_CONNECT_IP" \
+      "https://$FRONT_DOMAIN/$XH_PROBE_TOKEN" \
+      --output /dev/null || true
+    sleep 5
+  done
+
+Записать напечатанный FRONT_EGRESS_IP. Если первая проверка остановилась, получено
+меньше 12 SYN. Если остановилась вторая, SYN пришли от нескольких IPv4 и текущая
+версия xhttp-setup с одним /32 для этого хостинга не подходит.
+
+Если tcpdump не увидел пакетов:
+
+  1. Проверить, что FRONT_DOMAIN/path ответил не nginx 404.
+  2. Проверить PHP -> FastCGI (Apache).
+  3. Если у VPS есть внешний cloud firewall, временно разрешить TCP 18083,
+     повторить capture, удалить это правило и проверить, что порт снова
+     закрыт в cloud firewall. Сервис на 18083 не запускать.
+
+После измерения удалить временный .htaccess в ISPmanager. В разделе 6 команда
+`ls -la` должна подтвердить, что файла больше нет. Не переходить к установке,
+пока probe-правило остаётся в DOCROOT.
 
 
-6. Запуск xhttp-setup
-====================
+6. Проверить SFTP REG.RU
+========================
 
-Для новой пары серверов сначала один раз выполняется режим «Только выход» на
-зарубежном VPS. Это устанавливает bare Xray и создаёт защищённый handoff.json.
-TLS pin к этому шагу отношения не имеет.
+SFTP_HOST — hosting-node из адреса ISPmanager, например
+vipNNN.hosting.reg.ru. Не использовать CLIENT_CONNECT_IP или FTP IP.
+SFTP_PORT — 22.
 
-Если exit уже настроен и есть его актуальный handoff.json, повторно запускать
-установку exit только ради TLS нельзя. Использовать существующий handoff.
+На российском bridge установить инструменты:
 
-Frontend-шаг запускать с российской Linux-машины/моста, с которого разрешён
-SFTP-доступ к хостингу:
+  sudo apt-get update
+  sudo apt-get install -y ca-certificates curl openssl openssh-client python3
 
-  python3 xhttp-setup-0.1.0.pyz wizard
+Получить ожидаемый SFTP_HOSTKEY_SHA256 через панель или поддержку REG.RU. Затем
+ввести данные по запросам и проверить, что hosting-node предъявляет этот ключ:
+
+  set -Eeuo pipefail
+  read -r -p 'SFTP_HOST: ' SFTP_HOST
+  read -r -p 'SFTP_USER: ' SFTP_USER
+  read -r -p 'SFTP_HOSTKEY_SHA256: ' SFTP_HOSTKEY_SHA256
+  SFTP_PORT='22'
+  XH_EXPECTED_FP="${SFTP_HOSTKEY_SHA256%=}"
+  [[ "$XH_EXPECTED_FP" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]
+
+  XH_KEYSCAN="$(mktemp)"
+  XH_ONE_KEY="$(mktemp)"
+  XH_PINNED_KEY="$(mktemp)"
+  trap 'rm -f -- "$XH_KEYSCAN" "$XH_ONE_KEY" "$XH_PINNED_KEY"' EXIT
+  chmod 600 "$XH_KEYSCAN" "$XH_ONE_KEY" "$XH_PINNED_KEY"
+
+  ssh-keyscan -T 10 -p "$SFTP_PORT" -t ed25519,ecdsa,rsa "$SFTP_HOST" \
+    > "$XH_KEYSCAN"
+  test -s "$XH_KEYSCAN"
+  : > "$XH_PINNED_KEY"
+
+  while IFS= read -r XH_KEY_LINE; do
+    printf '%s\n' "$XH_KEY_LINE" > "$XH_ONE_KEY"
+    XH_KEY_FP="$(
+      ssh-keygen -E sha256 -lf "$XH_ONE_KEY" | awk '{print $2}'
+    )"
+    XH_KEY_FP="${XH_KEY_FP%=}"
+    if test "$XH_KEY_FP" = "$XH_EXPECTED_FP"; then
+      printf '%s\n' "$XH_KEY_LINE" >> "$XH_PINNED_KEY"
+    fi
+  done < "$XH_KEYSCAN"
+
+  sort -u "$XH_PINNED_KEY" -o "$XH_PINNED_KEY"
+  test "$(wc -l < "$XH_PINNED_KEY")" -eq 1
+  echo 'SFTP host key: OK'
+
+Если REG.RU не сообщает fingerprint в панели или справке, запросить его у
+поддержки. Не вводить пароль, пока проверенная строка не напечатала
+`SFTP host key: OK`.
+
+Один раз проверить вход через уже выбранный key:
+
+  sftp -F /dev/null -P "$SFTP_PORT" \
+    -o "UserKnownHostsFile=$XH_PINNED_KEY" \
+    -o GlobalKnownHostsFile=/dev/null \
+    -o StrictHostKeyChecking=yes \
+    -o UpdateHostKeys=no \
+    -o VerifyHostKeyDNS=no \
+    -o ConnectTimeout=15 \
+    -o ConnectionAttempts=1 \
+    -o NumberOfPasswordPrompts=1 \
+    -o PreferredAuthentications=password \
+    -o PasswordAuthentication=yes \
+    -o PubkeyAuthentication=no \
+    -o KbdInteractiveAuthentication=no \
+    -o ForwardAgent=no \
+    -o ClearAllForwardings=yes \
+    "$SFTP_USER@$SFTP_HOST"
+
+В приглашении sftp выполнить; вместо DOCROOT вставить точный путь из ISPmanager:
+
+  cd DOCROOT
+  ls -la
+  bye
+
+После выхода удалить временные key-файлы:
+
+  rm -f -- "$XH_KEYSCAN" "$XH_ONE_KEY" "$XH_PINNED_KEY"
+  trap - EXIT
+
+В проверенном аккаунте REG.RU для SFTP подошёл пароль учётной записи панели, а
+не отдельный FTP-пароль. Если в панели указан отдельный SSH/SFTP-пароль,
+использовать его. После одной ошибки проверить выбранный логин и пароль, а не
+перебирать варианты.
+
+Отсутствие .htaccess на новом сайте нормально. Не создавать пустой файл.
+
+
+7. Закрыть BACKEND_PORT на exit
+================================
+
+Этот раздел выполняется до запуска Xray в уже открытой SSH-сессии.
+По запросу ввести измеренный FRONT_EGRESS_IP; BACKEND_PORT оставить 8083:
+
+  read -r -p 'FRONT_EGRESS_IP: ' XH_FRONT_EGRESS_IP
+  read -r -p 'BACKEND_PORT [8083]: ' XH_BACKEND_PORT
+  XH_BACKEND_PORT="${XH_BACKEND_PORT:-8083}"
+
+  (
+    set -Eeuo pipefail
+    test -n "${SSH_CONNECTION:-}" || {
+      echo 'Нужна открытая SSH-сессия'; exit 1;
+    }
+
+    read -r XH_SSH_CLIENT_IP XH_SSH_CLIENT_PORT \
+      XH_SSH_SERVER_IP XH_SSH_LISTEN_PORT <<< "$SSH_CONNECTION"
+
+    python3 -c 'import ipaddress,sys; f=ipaddress.ip_address(sys.argv[1]); p=[int(x) for x in sys.argv[2:]]; (f.version == 4 and f.is_global) or sys.exit("FRONT_EGRESS_IP не публичный IPv4"); all(1 <= x <= 65535 for x in p) or sys.exit("Некорректный порт"); p[0] != p[1] or sys.exit("BACKEND_PORT совпадает с SSH-портом")' \
+      "$XH_FRONT_EGRESS_IP" "$XH_SSH_LISTEN_PORT" "$XH_BACKEND_PORT"
+
+    sudo /usr/sbin/sshd -T \
+      | awk '$1 == "port" { print $2 }' \
+      | grep -Fx -- "$XH_SSH_LISTEN_PORT" >/dev/null
+    sudo ss -H -lntp "sport = :$XH_SSH_LISTEN_PORT" | grep sshd >/dev/null
+
+    sudo apt-get update
+    sudo apt-get install -y ufw
+
+    sudo env LC_ALL=C ufw status verbose
+    XH_UFW_ADDED="$(sudo env LC_ALL=C ufw show added)"
+    printf '%s\n' "$XH_UFW_ADDED"
+    sudo env LC_ALL=C ufw status | grep -Fx 'Status: inactive' >/dev/null
+    if printf '%s\n' "$XH_UFW_ADDED" | grep '^ufw ' >/dev/null; then
+      echo 'UFW уже содержит правила; остановиться'; exit 1
+    fi
+
+    XH_NFT_RULESET=''
+    if command -v nft >/dev/null 2>&1; then
+      XH_NFT_RULESET="$(sudo nft list ruleset)"
+    fi
+    XH_IPT_RULESET="$(sudo iptables-save)"
+    XH_IP6T_RULESET="$(sudo ip6tables-save)"
+    if printf '%s\n' "$XH_NFT_RULESET" \
+      | grep -E 'hook (input|forward|output)' >/dev/null; then
+      printf '%s\n' "$XH_NFT_RULESET"
+      echo 'Есть чужой nftables ruleset; остановиться'; exit 1
+    fi
+    if printf '%s\n' "$XH_IPT_RULESET" "$XH_IP6T_RULESET" \
+      | grep -E '^(-A |:[^[:space:]]+[[:space:]]+(-|DROP|REJECT)[[:space:]])' \
+        >/dev/null; then
+      printf '%s\n' "$XH_IPT_RULESET" "$XH_IP6T_RULESET"
+      echo 'Есть чужие iptables rules; остановиться'; exit 1
+    fi
+    if command -v docker >/dev/null 2>&1 \
+      || sudo systemctl is-active --quiet docker.service; then
+      echo 'На exit есть Docker; этот UFW-блок не применять'; exit 1
+    fi
+
+    sudo ufw default deny incoming
+    sudo ufw default allow outgoing
+    sudo ufw allow "$XH_SSH_LISTEN_PORT/tcp" comment 'ssh current session'
+    sudo ufw insert 1 allow from "$XH_FRONT_EGRESS_IP/32" \
+      to any port "$XH_BACKEND_PORT" proto tcp comment 'xhttp frontend'
+    sudo ufw insert 2 deny to any port "$XH_BACKEND_PORT" proto tcp \
+      comment 'xhttp backend deny'
+    sudo ufw --force enable
+    sudo env LC_ALL=C ufw status verbose
+    sudo env LC_ALL=C ufw status numbered
+  )
+
+В выводе должны быть:
+
+  - allow SSH на фактическом EXIT_SSH_PORT;
+  - allow BACKEND_PORT только от FRONT_EGRESS_IP;
+  - deny BACKEND_PORT для остальных адресов;
+  - allow расположен выше deny;
+  - нет общего ALLOW BACKEND_PORT Anywhere.
+
+Не закрывая текущую сессию, с обычного Linux/WSL войти на exit ещё раз той
+же SSH-командой, которой открывалась первая сессия. Во второй сессии выполнить:
+
+  sudo env LC_ALL=C ufw status numbered
+
+Если второй вход не удался, в первой сессии выполнить `sudo ufw disable`,
+исправить правила и Xray не запускать. Если у VPS есть cloud firewall, оставить в нём
+SSH от адресов управления и BACKEND_PORT только от FRONT_EGRESS_IP/32.
+После успешной проверки вернуться в первую SSH-сессию и выполнять раздел 8
+именно в ней: там сохранены XH_FRONT_EGRESS_IP и XH_BACKEND_PORT.
+
+
+8. Установить bare Xray на exit
+===============================
+
+xhttp-setup уже установлен на exit в разделе 0. Проверить версию и исходящий
+IPv4 exit:
+
+  /usr/local/bin/xhttp-setup --version
+
+  (
+    set -Eeuo pipefail
+    XH_EXIT_EGRESS_IP="$(
+      curl --fail --silent --show-error --ipv4 --noproxy '*' \
+        --connect-timeout 5 --max-time 20 \
+        https://www.cloudflare.com/cdn-cgi/trace \
+      | sed -n 's/^ip=//p'
+    )"
+    python3 -c 'import ipaddress,sys; v=ipaddress.ip_address(sys.argv[1]); (v.version == 4 and v.is_global) or sys.exit("EXIT_EGRESS_IP не публичный IPv4"); print(f"EXIT_EGRESS_IP={v}")' \
+      "$XH_EXIT_EGRESS_IP"
+  )
+
+Записать его как EXIT_EGRESS_IP. Затем:
+
+  sudo /usr/local/bin/xhttp-setup wizard
+
+Выбрать:
+
+  2. Только выход на текущем VPS
+
+Ответить по порядку:
+
+  Публичный IPv4 выхода:
+    EXIT_IP
+
+  Ожидаемый исходящий IPv4 выхода [EXIT_IP]:
+    EXIT_EGRESS_IP; если совпадает с EXIT_IP, нажать Enter
+
+  Фактический исходящий IPv4 shared-hosting (не угадывать по A-записи):
+    FRONT_EGRESS_IP из раздела 5
+
+  Порт Xray [8083]:
+    Enter
+
+  Случайный XHTTP path [/api/...]:
+    Enter
+
+  TLS fingerprint клиента [edge]:
+    Enter
+
+  Название подключения [XHTTP TLS]:
+    ввести название или нажать Enter
+
+Проверить план. Ввести точную строку:
+
+  APPLY EXIT
+
+После завершения выполнить:
+
+  (
+    set -Eeuo pipefail
+    sudo /usr/local/bin/xhttp-setup doctor --scope exit
+    test "$(sudo systemctl is-active xhttp-setup-xray)" = active
+    test "$(sudo systemctl is-enabled xhttp-setup-xray)" = enabled
+    sudo ss -lntp | grep ':8083 ' >/dev/null
+    sudo stat -c '%a %U:%G %n' \
+      /var/lib/xhttp-setup/handoff.json \
+      /var/lib/xhttp-setup/secrets.json \
+      /etc/xhttp-setup/xray.json
+    echo 'exit checks: OK'
+  )
+
+Ожидается:
+
+  doctor без FAIL
+  service active и enabled
+  listener *:8083
+  handoff.json и secrets.json: 600 root:root
+  xray.json: 640 root:xhttp-setup
+
+Сверить план программы с уже применённым firewall:
+
+  (
+    set -Eeuo pipefail
+    : "${XH_FRONT_EGRESS_IP:?выполнять в первой SSH-сессии из раздела 7}"
+    : "${XH_BACKEND_PORT:?выполнять в первой SSH-сессии из раздела 7}"
+    XH_FIREWALL_PLAN='/var/lib/xhttp-setup/firewall-plan.txt'
+    sudo grep -F -- "Expected frontend egress: $XH_FRONT_EGRESS_IP" \
+      "$XH_FIREWALL_PLAN"
+    sudo grep -F -- \
+      "allow from $XH_FRONT_EGRESS_IP to any port $XH_BACKEND_PORT proto tcp" \
+      "$XH_FIREWALL_PLAN"
+    sudo grep -F -- \
+      "deny to any port $XH_BACKEND_PORT proto tcp" \
+      "$XH_FIREWALL_PLAN"
+    sudo ufw status numbered
+    echo 'firewall-plan: OK'
+  )
+
+Файл firewall-plan.txt не запускать через bash, source или eval. Он нужен только
+для сверки: ручные UFW-правила уже применены.
+
+На российском bridge проверить, что прямой доступ к backend закрыт:
+
+  (
+    set -Eeuo pipefail
+    read -r -p 'EXIT_IP: ' EXIT_IP
+    BACKEND_PORT='8083'
+    command -v bash >/dev/null
+    command -v timeout >/dev/null
+    python3 -c 'import ipaddress,sys; v=ipaddress.ip_address(sys.argv[1]); (v.version == 4 and v.is_global) or sys.exit("EXIT_IP не публичный IPv4")' \
+      "$EXIT_IP"
+
+    set +e
+    timeout 5 bash -c \
+      "exec 3<>/dev/tcp/$EXIT_IP/$BACKEND_PORT" 2>/dev/null
+    XH_PROBE_RC=$?
+    set -e
+    case "$XH_PROBE_RC" in
+      0) echo 'ОШИБКА: backend доступен напрямую'; exit 1 ;;
+      1|124) echo 'OK: backend закрыт от bridge' ;;
+      *) echo "Ошибка прямой проверки backend, rc=$XH_PROBE_RC"; exit 1 ;;
+    esac
+  )
+
+Если показана ошибка, не переходить к frontend и не вводить подтверждение
+firewall.
+
+
+9. Перенести handoff.json на российский bridge
+================================================
+
+В веб-консоли каждого VPS выполнить:
+
+  ssh-keygen -E sha256 -lf /etc/ssh/ssh_host_ed25519_key.pub
+
+Записать отдельно EXIT_HOSTKEY_SHA256 и BRIDGE_HOSTKEY_SHA256. Команда ниже
+запускается из Bash на обычном Linux/WSL. Она закрепляет оба ключа, сверяет три
+копии и не печатает JSON. Вводить пароли exit и bridge только в штатные SSH/SCP
+запросы:
+
+  (
+    set -Eeuo pipefail
+    umask 077
+
+    read -r -p 'EXIT_IP: ' EXIT_IP
+    read -r -p 'EXIT_SSH_PORT: ' EXIT_SSH_PORT
+    read -r -p 'EXIT_HOSTKEY_SHA256: ' EXIT_HOSTKEY_SHA256
+    read -r -p 'BRIDGE_IP: ' BRIDGE_IP
+    read -r -p 'BRIDGE_SSH_PORT: ' BRIDGE_SSH_PORT
+    read -r -p 'BRIDGE_HOSTKEY_SHA256: ' BRIDGE_HOSTKEY_SHA256
+
+    XH_STATE="$HOME/.local/state/xhttp-setup"
+    XH_TMP="$(mktemp -d)"
+    trap 'rm -rf -- "$XH_TMP"' EXIT
+
+    if test -e "$XH_STATE" || test -L "$XH_STATE"; then
+      test -d "$XH_STATE" && test ! -L "$XH_STATE"
+      test "$(stat -c '%a %u' "$XH_STATE")" = "700 $(id -u)"
+    else
+      install -d -m 700 "$XH_STATE"
+    fi
+
+    xh_pin_host() {
+      local XH_HOST="$1" XH_PORT="$2" XH_EXPECTED="${3%=}"
+      local XH_OUTPUT="$4" XH_SCAN XH_MATCH XH_LINE XH_FP XH_COUNT
+      XH_SCAN="$(mktemp "$XH_TMP/scan.XXXXXX")"
+      XH_MATCH="$(mktemp "$XH_TMP/match.XXXXXX")"
+      chmod 600 "$XH_SCAN" "$XH_MATCH"
+      [[ "$XH_EXPECTED" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]
+      ssh-keyscan -T 10 -p "$XH_PORT" -t ed25519,ecdsa,rsa \
+        "$XH_HOST" > "$XH_SCAN" 2>/dev/null
+      test -s "$XH_SCAN"
+      : > "$XH_MATCH"
+      XH_COUNT=0
+      while IFS= read -r XH_LINE; do
+        test -n "$XH_LINE" || continue
+        case "$XH_LINE" in \#*) continue ;; esac
+        XH_FP="$(printf '%s\n' "$XH_LINE" \
+          | ssh-keygen -E sha256 -lf - | awk 'NR == 1 {print $2}')"
+        XH_FP="${XH_FP%=}"
+        if test "$XH_FP" = "$XH_EXPECTED"; then
+          printf '%s\n' "$XH_LINE" >> "$XH_MATCH"
+          XH_COUNT=$((XH_COUNT + 1))
+        fi
+      done < "$XH_SCAN"
+      sort -u "$XH_MATCH" -o "$XH_MATCH"
+      XH_COUNT="$(wc -l < "$XH_MATCH")"
+      test "$XH_COUNT" -eq 1
+      if test -e "$XH_OUTPUT" || test -L "$XH_OUTPUT"; then
+        test -f "$XH_OUTPUT" && test ! -L "$XH_OUTPUT"
+        test "$(stat -c '%a %u' "$XH_OUTPUT")" = "600 $(id -u)"
+        cmp -s "$XH_MATCH" "$XH_OUTPUT"
+      else
+        install -m 600 "$XH_MATCH" "$XH_OUTPUT"
+      fi
+    }
+
+    XH_EXIT_KH="$XH_STATE/exit.known_hosts"
+    XH_BRIDGE_KH="$XH_STATE/bridge.known_hosts"
+    xh_pin_host "$EXIT_IP" "$EXIT_SSH_PORT" \
+      "$EXIT_HOSTKEY_SHA256" "$XH_EXIT_KH"
+    xh_pin_host "$BRIDGE_IP" "$BRIDGE_SSH_PORT" \
+      "$BRIDGE_HOSTKEY_SHA256" "$XH_BRIDGE_KH"
+
+    XH_SSH_OPTS=(
+      -F /dev/null
+      -o GlobalKnownHostsFile=/dev/null
+      -o StrictHostKeyChecking=yes
+      -o UpdateHostKeys=no
+      -o VerifyHostKeyDNS=no
+      -o ConnectTimeout=15
+      -o ConnectionAttempts=1
+      -o NumberOfPasswordPrompts=1
+      -o PreferredAuthentications=password
+      -o PasswordAuthentication=yes
+      -o PubkeyAuthentication=no
+      -o KbdInteractiveAuthentication=no
+      -o ForwardAgent=no
+      -o ClearAllForwardings=yes
+      -o RequestTTY=no
+    )
+
+    xh_exit_ssh() {
+      ssh "${XH_SSH_OPTS[@]}" -o "UserKnownHostsFile=$XH_EXIT_KH" \
+        -p "$EXIT_SSH_PORT" "root@$EXIT_IP" "$@"
+    }
+    xh_bridge_ssh() {
+      ssh "${XH_SSH_OPTS[@]}" -o "UserKnownHostsFile=$XH_BRIDGE_KH" \
+        -p "$BRIDGE_SSH_PORT" "root@$BRIDGE_IP" "$@"
+    }
+    xh_exit_hash() {
+      xh_exit_ssh 'set -eu
+        p=/var/lib/xhttp-setup/handoff.json
+        test -f "$p" && test ! -L "$p"
+        test "$(stat -c "%a %u:%g" "$p")" = "600 0:0"
+        sha256sum "$p" | awk "{print \$1}"'
+    }
+    xh_require_hash() {
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+    }
+
+    XH_EXIT_HASH_BEFORE="$(xh_exit_hash)"
+    xh_require_hash "$XH_EXIT_HASH_BEFORE"
+
+    XH_LOCAL="$XH_TMP/handoff.json"
+    scp "${XH_SSH_OPTS[@]}" -o "UserKnownHostsFile=$XH_EXIT_KH" \
+      -P "$EXIT_SSH_PORT" \
+      "root@$EXIT_IP:/var/lib/xhttp-setup/handoff.json" "$XH_LOCAL"
+    chmod 600 "$XH_LOCAL"
+    XH_LOCAL_HASH="$(sha256sum "$XH_LOCAL" | awk '{print $1}')"
+    xh_require_hash "$XH_LOCAL_HASH"
+
+    XH_EXIT_HASH_AFTER="$(xh_exit_hash)"
+    xh_require_hash "$XH_EXIT_HASH_AFTER"
+    test "$XH_EXIT_HASH_BEFORE" = "$XH_EXIT_HASH_AFTER"
+    test "$XH_EXIT_HASH_AFTER" = "$XH_LOCAL_HASH"
+
+    XH_BRIDGE_EXISTING_HASH="$(xh_bridge_ssh 'set -eu
+      d=/root/xhttp-live
+      if test -e "$d" || test -L "$d"; then
+        test -d "$d" && test ! -L "$d"
+        test "$(stat -c "%a %u:%g" "$d")" = "700 0:0"
+      else
+        install -d -o root -g root -m 700 "$d"
+      fi
+      u=$d/handoff.json.upload
+      if test -e "$u" || test -L "$u"; then
+        test -f "$u" && test ! -L "$u"
+        test "$(stat -c "%a %u:%g" "$u")" = "600 0:0"
+        rm -f "$u"
+      fi
+      p=$d/handoff.json
+      if test -e "$p" || test -L "$p"; then
+        test -f "$p" && test ! -L "$p"
+        test "$(stat -c "%a %u:%g" "$p")" = "600 0:0"
+        sha256sum "$p" | awk "{print \$1}"
+      else
+        printf "%s\n" ABSENT
+      fi')"
+
+    if test "$XH_BRIDGE_EXISTING_HASH" = ABSENT; then
+      scp "${XH_SSH_OPTS[@]}" -o "UserKnownHostsFile=$XH_BRIDGE_KH" \
+        -P "$BRIDGE_SSH_PORT" "$XH_LOCAL" \
+        "root@$BRIDGE_IP:/root/xhttp-live/handoff.json.upload"
+
+      XH_BRIDGE_STAGE_HASH="$(xh_bridge_ssh 'set -eu
+        u=/root/xhttp-live/handoff.json.upload
+        test -f "$u" && test ! -L "$u"
+        chown root:root "$u" && chmod 600 "$u"
+        test "$(stat -c "%a %u:%g" "$u")" = "600 0:0"
+        sha256sum "$u" | awk "{print \$1}"')"
+      xh_require_hash "$XH_BRIDGE_STAGE_HASH"
+      test "$XH_BRIDGE_STAGE_HASH" = "$XH_LOCAL_HASH"
+
+      XH_BRIDGE_HASH="$(xh_bridge_ssh "set -eu
+        expected=$XH_LOCAL_HASH
+        d=/root/xhttp-live
+        u=\$d/handoff.json.upload
+        p=\$d/handoff.json
+        test -f \"\$u\" && test ! -L \"\$u\"
+        test \"\$(stat -c '%a %u:%g' \"\$u\")\" = '600 0:0'
+        h_before=\$(sha256sum \"\$u\" | awk '{print \$1}')
+        test \"\$h_before\" = \"\$expected\"
+        test ! -e \"\$p\" && test ! -L \"\$p\"
+        mv -T -n \"\$u\" \"\$p\"
+        test ! -e \"\$u\"
+        test -f \"\$p\" && test ! -L \"\$p\"
+        test \"\$(stat -c '%a %u:%g' \"\$p\")\" = '600 0:0'
+        h_after=\$(sha256sum \"\$p\" | awk '{print \$1}')
+        test \"\$h_after\" = \"\$expected\"
+        printf '%s\n' \"\$h_after\"")"
+    else
+      xh_require_hash "$XH_BRIDGE_EXISTING_HASH"
+      XH_BRIDGE_HASH="$XH_BRIDGE_EXISTING_HASH"
+    fi
+    xh_require_hash "$XH_BRIDGE_HASH"
+    test "$XH_BRIDGE_HASH" = "$XH_LOCAL_HASH"
+
+    echo 'handoff transfer: OK'
+  )
+
+Не открывать и не печатать handoff.json. В нём находятся UUID и VLESS Encryption
+material. Копии на exit и bridge оставить с правами 0600.
+
+
+10. Применить frontend с российского bridge
+=============================================
+
+xhttp-setup уже установлен на bridge в разделе 0. Проверить версию, затем
+запустить мастер:
+
+  /usr/local/bin/xhttp-setup --version
+
+  sudo /usr/local/bin/xhttp-setup wizard
 
 Выбрать:
 
   3. Только frontend по готовому handoff.json
 
-Ввести по запросам:
+Ответить по порядку:
 
-  путь к защищённому handoff.json;
-  frontend FQDN;
-  IPv4 подключения клиента;
-  ожидаемый IPv4 DNS A;
-  на вопрос о закреплении leaf-сертификата ответить «да»;
-  SHA-256 из шага 5;
-  SFTP host, порт 22 и пользователя;
-  точный document root сайта;
-  независимо проверенный SHA-256 host key SFTP;
-  для первого запуска оставить существующий index.html.
+  Путь к handoff.json [/var/lib/xhttp-setup/handoff.json]:
+    /root/xhttp-live/handoff.json
 
-Использовать SFTP, не обычный FTP. Пароль вводится интерактивно и не должен
-попадать в командную строку, историю shell, README или GitHub.
+  FQDN/SNI существующего сайта frontend:
+    FRONT_DOMAIN
 
-Неинтерактивный эквивалент pin-параметров:
+  IPv4 подключения клиента (адрес в VLESS URI):
+    CLIENT_CONNECT_IP
 
-  --tls-mode pinned \
-  --tls-cert-sha256 '<64 hex SHA-256 leaf>'
+  IPv4 в DNS A домена (для сайта и ACME) [CLIENT_CONNECT_IP]:
+    DNS_IPV4; если совпадает с CLIENT_CONNECT_IP, нажать Enter
 
-После применения мастер обязан выполнить E2E-тест. Он выдаёт VLESS URI только
-если запрос реально прошёл через локальный Xray/SOCKS и внешний IP совпал с
-ожидаемым IP exit.
+  Закрепить SHA-256 текущего leaf-сертификата вместо проверки публичным CA? [y/N]
+    да
+
+  SHA-256 текущего leaf-сертификата (64 hex):
+    TLS_PIN из раздела 4
+
+  SFTP hostname/IP:
+    SFTP_HOST
+
+  SFTP port [22]:
+    Enter
+
+  SFTP user:
+    SFTP_USER
+
+  Получить document root read-only запросом к ISPmanager API? [y/N]
+    нет
+
+  Document root из списка сайтов ISPmanager:
+    DOCROOT
+
+  Проверенный SSH host-key fingerprint SHA256:
+    SFTP_HOSTKEY_SHA256
+
+  Заменить index.html на оригинальную нейтральную заглушку со ссылкой на RuFox? [y/N]
+    нет
+
+Мастер проверит DNS и точный TLS_PIN. Проверить показанный план. Ввести строку,
+где вместо FRONT_DOMAIN указан настоящий домен:
+
+  APPLY FRONT_DOMAIN
+
+На вопрос:
+
+  Использовать отдельный SSH-ключ вместо пароля? [Y/n]
+
+ответить:
+
+  нет
+
+Ввести проверенный SFTP-пароль интерактивно. Когда появится запрос firewall,
+ещё раз открыть на exit:
+
+  sudo ufw status numbered
+
+Если правила из раздела 7 на месте, ввести на bridge:
+
+  FIREWALL ПРОВЕРЕН
+
+Программа загрузит managed .htaccess, запустит временный Xray-клиент и выполнит
+запрос через SOCKS. Успешный результат содержит:
+
+  E2E: OK
+  E2E-проверка пройдена. Клиентская ссылка:
+
+Ссылка создаётся только после совпадения внешнего IP с EXIT_EGRESS_IP.
+
+Файл сохраняется здесь:
+
+  /var/lib/xhttp-setup/fronts/FRONT_DOMAIN/client.vless
 
 
-7. Что должно оказаться в клиенте
-=================================
+11. Забрать и проверить client.vless
+====================================
 
-В VLESS URI должны одновременно присутствовать:
+Блок ниже запускать на той же Linux/WSL-машине и от того же пользователя, что и
+раздел 9: он использует сохранённый `bridge.known_hosts`. Файл попадёт в отдельный
+каталог Linux с правами 0700, а не в текущий каталог или `/mnt/c`.
 
-  address=<FRONT_IP>
-  port=443
-  type=xhttp
-  security=tls
-  sni=front.example.org
-  host=front.example.org
-  fp=edge
-  pcs=<64 hex SHA-256 leaf>
-  mode=packet-up
-  path=<случайный path из handoff>
-  encryption=<значение VLESS Encryption из handoff>
+  (
+    set -Eeuo pipefail
+    umask 077
+    read -r -p 'BRIDGE_IP: ' BRIDGE_IP
+    read -r -p 'BRIDGE_SSH_PORT: ' BRIDGE_SSH_PORT
+    read -r -p 'FRONT_DOMAIN: ' FRONT_DOMAIN
+    [[ "$FRONT_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]
+    [[ "$FRONT_DOMAIN" != *..* ]]
+    XH_BRIDGE_KH="$HOME/.local/state/xhttp-setup/bridge.known_hosts"
+    test -f "$XH_BRIDGE_KH" && test ! -L "$XH_BRIDGE_KH"
+    test "$(stat -c '%a %u' "$XH_BRIDGE_KH")" = "600 $(id -u)"
 
-В сгенерированном Xray JSON должно быть:
+    XH_SSH_OPTS=(
+      -F /dev/null
+      -o "UserKnownHostsFile=$XH_BRIDGE_KH"
+      -o GlobalKnownHostsFile=/dev/null
+      -o StrictHostKeyChecking=yes
+      -o UpdateHostKeys=no
+      -o VerifyHostKeyDNS=no
+      -o ConnectTimeout=15
+      -o ConnectionAttempts=1
+      -o NumberOfPasswordPrompts=1
+      -o PreferredAuthentications=password
+      -o PasswordAuthentication=yes
+      -o PubkeyAuthentication=no
+      -o KbdInteractiveAuthentication=no
+      -o ForwardAgent=no
+      -o ClearAllForwardings=yes
+      -o RequestTTY=no
+    )
+    xh_bridge_hash() {
+      ssh "${XH_SSH_OPTS[@]}" -p "$BRIDGE_SSH_PORT" \
+        "root@$BRIDGE_IP" "set -eu
+          p=/var/lib/xhttp-setup/fronts/$FRONT_DOMAIN/client.vless
+          test -f \"\$p\" && test ! -L \"\$p\"
+          test \"\$(stat -c '%a %u:%g' \"\$p\")\" = '600 0:0'
+          test -s \"\$p\"
+          sha256sum \"\$p\" | awk '{print \$1}'"
+    }
+    xh_require_hash() {
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+    }
 
-  streamSettings.security = "tls"
-  tlsSettings.serverName = "front.example.org"
-  tlsSettings.fingerprint = "edge"
-  tlsSettings.pinnedPeerCertSha256 = "<64 hex SHA-256 leaf>"
+    XH_REMOTE_HASH_BEFORE="$(xh_bridge_hash)"
+    xh_require_hash "$XH_REMOTE_HASH_BEFORE"
 
-Параметра allowInsecure быть не должно. SNI и XHTTP Host не заменяются IP.
+    XH_CLIENT_DIR="$HOME/.local/state/xhttp-setup/client-links/$FRONT_DOMAIN"
+    if test -e "$XH_CLIENT_DIR" || test -L "$XH_CLIENT_DIR"; then
+      test -d "$XH_CLIENT_DIR" && test ! -L "$XH_CLIENT_DIR"
+      test "$(stat -c '%a %u' "$XH_CLIENT_DIR")" = "700 $(id -u)"
+    else
+      install -d -m 700 "$XH_CLIENT_DIR"
+    fi
+    XH_CLIENT_FILE="$XH_CLIENT_DIR/client.vless"
 
-Клиент должен поддерживать pcs/pinnedPeerCertSha256 и не выбрасывать этот
-параметр при импорте. С неподходящим или self-signed сертификатом удаление pcs
-обычно завершится ошибкой проверки. Если leaf одновременно валиден для домена
-через публичный CA, возможен незаметный переход к обычной PKI-проверке без pin.
-Поэтому после импорта обязательно проверить итоговый JSON профиля клиента.
+    if test -e "$XH_CLIENT_FILE" || test -L "$XH_CLIENT_FILE"; then
+      test -f "$XH_CLIENT_FILE" && test ! -L "$XH_CLIENT_FILE"
+      test "$(stat -c '%a %u' "$XH_CLIENT_FILE")" = "600 $(id -u)"
+      XH_LOCAL_HASH="$(sha256sum "$XH_CLIENT_FILE" | awk '{print $1}')"
+      xh_require_hash "$XH_LOCAL_HASH"
+      XH_REMOTE_HASH_AFTER="$(xh_bridge_hash)"
+      xh_require_hash "$XH_REMOTE_HASH_AFTER"
+      test "$XH_REMOTE_HASH_BEFORE" = "$XH_REMOTE_HASH_AFTER"
+      test "$XH_REMOTE_HASH_AFTER" = "$XH_LOCAL_HASH"
+    else
+      XH_STAGE="$(mktemp "$XH_CLIENT_DIR/.client.vless.upload.XXXXXX")"
+      trap 'rm -f -- "$XH_STAGE"' EXIT
+      chmod 600 "$XH_STAGE"
+      scp "${XH_SSH_OPTS[@]}" -P "$BRIDGE_SSH_PORT" \
+        "root@$BRIDGE_IP:/var/lib/xhttp-setup/fronts/$FRONT_DOMAIN/client.vless" \
+        "$XH_STAGE"
+      chmod 600 "$XH_STAGE"
+      test -f "$XH_STAGE" && test ! -L "$XH_STAGE" && test -s "$XH_STAGE"
+      test "$(stat -c '%a %u' "$XH_STAGE")" = "600 $(id -u)"
+      XH_LOCAL_HASH="$(sha256sum "$XH_STAGE" | awk '{print $1}')"
+      xh_require_hash "$XH_LOCAL_HASH"
+      XH_REMOTE_HASH_AFTER="$(xh_bridge_hash)"
+      xh_require_hash "$XH_REMOTE_HASH_AFTER"
+      test "$XH_REMOTE_HASH_BEFORE" = "$XH_REMOTE_HASH_AFTER"
+      test "$XH_REMOTE_HASH_AFTER" = "$XH_LOCAL_HASH"
+      test ! -e "$XH_CLIENT_FILE" && test ! -L "$XH_CLIENT_FILE"
+      mv -T -n "$XH_STAGE" "$XH_CLIENT_FILE"
+      test ! -e "$XH_STAGE"
+      trap - EXIT
+      test -f "$XH_CLIENT_FILE" && test ! -L "$XH_CLIENT_FILE"
+      test "$(stat -c '%a %u' "$XH_CLIENT_FILE")" = "600 $(id -u)"
+      test "$(sha256sum "$XH_CLIENT_FILE" | awk '{print $1}')" = "$XH_LOCAL_HASH"
+    fi
+    printf 'client.vless: OK: %s\n' "$XH_CLIENT_FILE"
+  )
+
+Не публиковать ссылку и не добавлять файл в GitHub.
+
+После импорта профиль должен содержать:
+
+  address       CLIENT_CONNECT_IP
+  port          443
+  type          xhttp
+  security      tls
+  sni           FRONT_DOMAIN
+  host          FRONT_DOMAIN
+  fp            edge
+  pcs           TLS_PIN
+  mode          packet-up
+  path          случайный /api/... из handoff
+  extra         scMaxEachPostBytes=1000000
+  extra         scMinPostsIntervalMs=30
+  encryption    не none
+  allowInsecure отсутствует
+
+Если в итоговом JSON клиента после импорта нет `pcs`, VLESS Encryption или обоих
+параметров `extra`, этот импортёр для ссылки не подходит. Поля в окне профиля не заменяют
+проверку JSON.
+
+Включить профиль и открыть:
+
+  https://www.cloudflare.com/cdn-cgi/trace
+
+Строка ip= должна содержать EXIT_EGRESS_IP. Затем проверить соединение с той
+SIM-карты и сети, для которой настраивалась схема. Технический E2E через REG.RU
+не проверяет правила конкретного мобильного оператора на TCP 443.
 
 
-8. Смена сертификата и финальные проверки
-==========================================
+12. Проверка после перезапуска
+==============================
 
-Pin привязан к одному leaf-сертификату. При его замене/перевыпуске старые
-клиенты перестанут подключаться. Правильный порядок восстановления:
+На exit:
 
-  1. Убедиться, что 443 всё ещё ведёт на нужный vhost.
-  2. Независимо проверить новый сертификат.
-  3. Снять новый SHA-256.
-  4. Повторно выпустить клиентскую ссылку.
-  5. Заменить профиль у клиентов.
+  (
+    set -Eeuo pipefail
+    sudo systemctl restart xhttp-setup-xray
+    sleep 2
+    test "$(sudo systemctl is-active xhttp-setup-xray)" = active
+    sudo /usr/local/bin/xhttp-setup doctor --scope exit
+    sudo env LC_ALL=C ufw status | grep -Fx 'Status: active' >/dev/null
+    sudo ufw status numbered
+    echo 'restart: OK'
+  )
 
-Нельзя лечить несовпадение включением allowInsecure.
+После этого снова подключить клиент и проверить ip=EXIT_EGRESS_IP. Прямой тест
+BACKEND_PORT с bridge должен по-прежнему показывать, что порт закрыт.
 
-После успешного E2E отдельно проверить подключение с той SIM/сети, ради которой
-создаётся схема. Доступность сайта на 80 не доказывает, что конкретный белый
-список пропускает TCP 443.
 
-Backend-порт exit должен быть закрыт от всех адресов, кроме фактического
-исходящего IP Apache. Этот IP определяется на exit по реальному запросу; его
-нельзя брать из DNS A или FTP-письма без проверки.
+13. Если front завершился ошибкой
+==================================
+
+При первом запуске, когда `client.vless` до старта отсутствовал, ошибка не должна
+оставить новый файл. На bridge проверить это так:
+
+  (
+    set -Eeuo pipefail
+    read -r -p 'FRONT_DOMAIN: ' FRONT_DOMAIN
+    [[ "$FRONT_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]
+    [[ "$FRONT_DOMAIN" != *..* ]]
+    XH_FRONT_STATE="/var/lib/xhttp-setup/fronts/$FRONT_DOMAIN"
+    if sudo test -e "$XH_FRONT_STATE/client.vless" \
+      || sudo test -L "$XH_FRONT_STATE/client.vless"; then
+      echo 'ОШИБКА: осталась непроверенная ссылка'; exit 1
+    fi
+    echo 'Непроверенной ссылки нет'
+    if sudo test -f "$XH_FRONT_STATE/last-failure.log"; then
+      sudo sed -n '1,160p' "$XH_FRONT_STATE/last-failure.log"
+    else
+      echo 'last-failure.log не создан: ошибка возникла до managed state'
+    fi
+  )
+
+Дальше действовать по этапу ошибки:
+
+  - SFTP/SSH-аутентификация: проверить SFTP_HOST, SFTP_USER, fingerprint и
+    пароль; не перебирать пароли.
+  - Несовпадение SHA-256 leaf: повторить раздел 4 с тем же CLIENT_CONNECT_IP
+    и SNI; не включать allowInsecure.
+  - Ошибка E2E: проверить service/Doctor/UFW на exit и DNS/TLS на frontend.
+    Managed-файлы этого запуска откатываются.
+  - `rollback неполон`: не повторять запуск и не удалять .xhttp-backup-*,
+    quarantine или локальный backups, перечисленные в ошибке.
+
+Отсутствующая .htaccess до первого запуска не является ошибкой. Программа сама
+создаёт managed-файл и удаляет его при полном rollback.
+
+
+14. Граница проверки
+======================
+
+Сквозной bare-Xray E2E через REG.RU, exact /32 UFW, restart Xray и
+отрицательные проверки pin/UUID выполнены. Импорт в конкретный GUI-клиент,
+доступ с целевой SIM и длительная нагрузка остаются проверками владельца.
+Полный факт-лист: docs/reference-audit-2026-08-19.md.
