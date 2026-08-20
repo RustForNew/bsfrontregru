@@ -1,0 +1,66 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Compile
+        run: python -m compileall -q xhttp_setup
+      - name: Download pinned Xray for integration tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir .ci-xray
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --retry 3 \
+            -o .ci-xray/Xray-linux-64.zip \
+            https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
+          echo '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae  .ci-xray/Xray-linux-64.zip' \
+            | sha256sum -c -
+          unzip -q .ci-xray/Xray-linux-64.zip -d .ci-xray/unpacked
+      - name: Unit tests
+        env:
+          XRAY_TEST_BINARY: ${{ github.workspace }}/.ci-xray/unpacked/xray
+        run: python -m unittest discover -s tests -v
+      - name: Build Linux and Windows-WSL artifacts twice
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="$(python -c 'from xhttp_setup import __version__; print(__version__)')"
+          linux_asset="dist/xhttp-setup-$version.pyz"
+          windows_asset="dist/xhttp-setup-$version-windows-wsl.zip"
+          rm -rf dist
+          python scripts/build.py
+          python scripts/build_windows_bundle.py
+          python "$linux_asset" --version
+          python "$linux_asset" --help >/dev/null
+          unzip -tq "$windows_asset"
+          first_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
+          first_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
+          test "$first_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
+          test "$first_windows" = "$(tr -d '\r\n' < "$windows_asset.sha256")"
+          rm -rf dist
+          python scripts/build.py
+          python scripts/build_windows_bundle.py
+          second_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
+          second_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
+          test "$first_linux" = "$second_linux"
+          test "$first_windows" = "$second_windows"
+          test "$second_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
+          test "$second_windows" = "$(tr -d '\r\n' < "$windows_asset.sha256")"

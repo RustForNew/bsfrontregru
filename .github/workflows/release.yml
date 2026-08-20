@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      linux_asset: ${{ steps.meta.outputs.linux_asset }}
+      windows_asset: ${{ steps.meta.outputs.windows_asset }}
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Validate tag
+        id: meta
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag="$GITHUB_REF_NAME"
+          [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || exit 1
+          version="${tag#v}"
+          python - "$version" <<'PY'
+          import sys
+
+          version = tuple(int(part) for part in sys.argv[1].split("."))
+          if version < (0, 3, 0):
+              raise SystemExit("Releases older than v0.3.0 are not supported")
+          PY
+          code_version="$(python -c 'from xhttp_setup import __version__; print(__version__)')"
+          test "$version" = "$code_version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "linux_asset=xhttp-setup-$version.pyz" >> "$GITHUB_OUTPUT"
+          echo "windows_asset=xhttp-setup-$version-windows-wsl.zip" >> "$GITHUB_OUTPUT"
+      - name: Test and build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m compileall -q xhttp_setup
+          mkdir .ci-xray
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --retry 3 \
+            -o .ci-xray/Xray-linux-64.zip \
+            https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
+          echo '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae  .ci-xray/Xray-linux-64.zip' \
+            | sha256sum -c -
+          unzip -q .ci-xray/Xray-linux-64.zip -d .ci-xray/unpacked
+          XRAY_TEST_BINARY="$GITHUB_WORKSPACE/.ci-xray/unpacked/xray" \
+            python -m unittest discover -s tests -v
+          rm -rf dist
+          python scripts/build.py
+          python scripts/build_windows_bundle.py
+          linux_asset="dist/${{ steps.meta.outputs.linux_asset }}"
+          windows_asset="dist/${{ steps.meta.outputs.windows_asset }}"
+          python "$linux_asset" --version
+          unzip -tq "$windows_asset"
+          for asset in "$linux_asset" "$windows_asset"; do
+            expected="$(tr -d '\r\n' < "$asset.sha256")"
+            actual="$(sha256sum "$asset" | awk '{print $1}')"
+            test "$expected" = "$actual"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          done
+      - name: Upload tested release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ steps.meta.outputs.version }}
+          path: |
+            dist/${{ steps.meta.outputs.linux_asset }}
+            dist/${{ steps.meta.outputs.linux_asset }}.sha256
+            dist/${{ steps.meta.outputs.windows_asset }}
+            dist/${{ steps.meta.outputs.windows_asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download tested files
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-${{ needs.build.outputs.version }}
+          path: dist
+      - name: Verify downloaded checksums
+        env:
+          LINUX_ASSET: ${{ needs.build.outputs.linux_asset }}
+          WINDOWS_ASSET: ${{ needs.build.outputs.windows_asset }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for name in "$LINUX_ASSET" "$WINDOWS_ASSET"; do
+            expected="$(tr -d '\r\n' < "dist/$name.sha256")"
+            actual="$(sha256sum "dist/$name" | awk '{print $1}')"
+            test "$expected" = "$actual"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          done
+      - name: Attest release provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/${{ needs.build.outputs.linux_asset }}
+            dist/${{ needs.build.outputs.windows_asset }}
+      - name: Verify release attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+          LINUX_ASSET: ${{ needs.build.outputs.linux_asset }}
+          WINDOWS_ASSET: ${{ needs.build.outputs.windows_asset }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          signer="$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          gh attestation verify "dist/$LINUX_ASSET" \
+            --bundle "$BUNDLE_PATH" \
+            --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \
+            --source-ref "$GITHUB_REF"
+          gh attestation verify "dist/$WINDOWS_ASSET" \
+            --bundle "$BUNDLE_PATH" \
+            --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \
+            --source-ref "$GITHUB_REF"
+      - name: Create draft, upload every asset, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          LINUX_ASSET: ${{ needs.build.outputs.linux_asset }}
+          WINDOWS_ASSET: ${{ needs.build.outputs.windows_asset }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              echo "Release $TAG is already published; refusing to modify it" >&2
+              exit 1
+            fi
+            while IFS= read -r old_asset; do
+              case "$old_asset" in
+                "$LINUX_ASSET"|"$LINUX_ASSET.sha256"|\
+                "$WINDOWS_ASSET"|"$WINDOWS_ASSET.sha256") ;;
+                *) gh release delete-asset "$TAG" "$old_asset" \
+                     --repo "$GITHUB_REPOSITORY" --yes ;;
+              esac
+            done < <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name')
+            gh release upload "$TAG" \
+              "dist/$LINUX_ASSET" "dist/$LINUX_ASSET.sha256" \
+              "dist/$WINDOWS_ASSET" "dist/$WINDOWS_ASSET.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" \
+              "dist/$LINUX_ASSET" "dist/$LINUX_ASSET.sha256" \
+              "dist/$WINDOWS_ASSET" "dist/$WINDOWS_ASSET.sha256" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --generate-notes --title "$TAG"
+          fi
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false

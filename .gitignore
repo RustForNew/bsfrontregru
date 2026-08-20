@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.ci-xray/
+dist/
+.venv/
+*.vless
+handoff.json
+secrets.json
