@@ -66,6 +66,12 @@ Authentication: ML-KEM
             atomic_write_text(path, "secret", 0o600)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_atomic_write_is_portable_for_generated_local_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.json"
+            atomic_write_text(path, '{"schema_version":1}\n', 0o600)
+            self.assertEqual(path.read_text("utf-8"), '{"schema_version":1}\n')
+
     def test_atomic_write_preserves_existing_parent_mode(self):
         if os.name != "posix":
             self.skipTest("POSIX permissions")

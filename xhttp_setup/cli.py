@@ -95,7 +95,9 @@ _PC_PHASES = frozenset(
 PROVIDER_WARNING = """ВАЖНО: правила REG.RU прямо относят proxy-сервисы на виртуальном
 хостинге к запрещённым. Техническая аккуратность не делает использование
 разрешённым и не гарантирует отсутствие блокировки. Получите письменное
-разрешение провайдера либо выберите хостинг, где такой трафик разрешён.
+разрешение провайдера. Минимальный PC-мастер поддерживает только REG.RU;
+разрешённый другой хостинг требует отдельного adapter/advanced workflow и не
+может быть просто подставлен вместо URL REG.RU.
 """
 
 
@@ -117,10 +119,18 @@ def _validated_prompt(
 
 def _yes_no(label: str, *, default: bool = False) -> bool:
     marker = "Y/n" if default else "y/N"
-    value = input(f"{label} [{marker}]: ").strip().lower()
-    if not value:
-        return default
-    return value in {"y", "yes", "д", "да"}
+    while True:
+        value = input(f"{label} [{marker}]: ").strip().lower()
+        if not value:
+            return default
+        if value in {"y", "yes", "д", "да", "у"}:
+            return True
+        if value in {"n", "no", "н", "нет"}:
+            return False
+        print(
+            "Ошибка: ответьте y/yes/да или n/no/нет.",
+            file=sys.stderr,
+        )
 
 
 def _default_state(domain: str) -> Path:
@@ -758,6 +768,7 @@ def _apply_front_and_issue(
     firewall_plan_path: Path | None = None,
     firewall_supplied: bool | None = None,
     bridge_access: PcBridgeAccess | None = None,
+    trusted_known_hosts: Path | None = None,
 ) -> FrontResult:
     stage = "frontend apply"
     link_withholding_started = False
@@ -844,6 +855,7 @@ def _apply_front_and_issue(
         pre_apply=prepare_transaction,
         post_apply=finish_transaction,
         on_failure=record_failure,
+        trusted_known_hosts=trusted_known_hosts,
         **apply_kwargs,
     )
 
@@ -955,6 +967,7 @@ def _run_pc_install(
     prepared = None
     bridge_session = None
     bridge_access = None
+    body_error: BaseException | None = None
     try:
         if inputs.bridge is not None:
             bridge_session, bridge_access = open_pc_bridge(
@@ -989,6 +1002,7 @@ def _run_pc_install(
             in {"exit_applying", "exit_ready", "complete"},
             **prepare_kwargs,
         )
+        _confirm_pc_provider_firewall(prepared.desired_exit)
         inputs = None
         if prepared.existing_handoff is None:
             print("\n→ Настраиваю защищённый выход")
@@ -1004,6 +1018,7 @@ def _run_pc_install(
                 target=prepared.exit_target,
                 auth=prepared.exit_auth,
                 output_dir=output_dir,
+                trusted_known_hosts=prepared.exit_known_hosts,
             )
             handoff = Handoff.from_dict(load_json(exit_result.remote.handoff_path))
         else:
@@ -1028,6 +1043,7 @@ def _run_pc_install(
                 state_dir=front_state,
                 handoff=client_handoff,
                 layout=Layout(root=front_state / "probe-runtime"),
+                trusted_known_hosts=prepared.sftp_known_hosts,
                 **front_kwargs,
             )
         except BaseException as exc:
@@ -1043,14 +1059,40 @@ def _run_pc_install(
             raise
         _write_pc_phase(output_dir, "complete")
         print("\nГотово: установка и сквозная E2E-проверка завершены.")
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
         if bridge_session is not None:
-            bridge_session.close()
+            try:
+                bridge_session.close()
+            except BaseException:
+                if body_error is None:
+                    raise
+                if hasattr(body_error, "add_note"):
+                    body_error.add_note(
+                        "Дополнительно не завершился teardown SSH-моста"
+                    )
         bridge_access = None
         bridge_session = None
         inputs = None
         prepared = None
     return 0
+
+
+def _confirm_pc_provider_firewall(desired: ExitDesired) -> None:
+    desired = desired.validate()
+    print("\n→ Проверьте внешний cloud firewall/security group VPS")
+    print(
+        "  Если такой панели нет, ничего менять не нужно. Если она есть, "
+        "закройте ранее напечатанные временные probe-порты и разрешите "
+        f"входящий TCP/{desired.listen_port} только от "
+        f"{desired.front_egress_ip}/32."
+    )
+    input(
+        "После настройки (или если отдельного cloud firewall нет) "
+        "нажмите Enter: "
+    )
 
 
 def wizard_pc() -> int:

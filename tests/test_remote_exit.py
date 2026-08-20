@@ -4,6 +4,7 @@ import shlex
 import stat
 import subprocess
 import tempfile
+import traceback
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,9 +16,12 @@ from xhttp_setup.models import ExitDesired, Handoff
 from xhttp_setup.remote_exit import (
     RemoteExitError,
     RemoteExitTarget,
+    _TeardownCapture,
+    _capture_context_teardown,
+    _persist_local_artifacts,
     apply_remote_exit,
 )
-from xhttp_setup.ssh_transport import SSHAuth
+from xhttp_setup.ssh_transport import SSHAuth, SSHTransportError
 
 
 UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
@@ -59,11 +63,18 @@ class RemoteState:
         self.files: dict[str, bytes] = {}
         self.modes: dict[str, str] = {}
         self.commands: list[list[str]] = []
+        self.ssh_session_events: list[str] = []
+        self.ssh_session_count = 0
+        self.teardown_error_sessions: set[int] = set()
+        self.broken_session = False
+        self.transport_fail_stat_once = False
+        self.sftp_session_events: list[str] = []
         self.remote_temp = "/tmp/xhttp-exit.A1b2C3d4E5"
         self.corrupt_roundtrip = False
         self.bad_firewall = False
         self.fail_download = False
         self.fail_cleanup = False
+        self.transport_fail_cleanup_once = False
         self.apply_returncode = 0
         self.apply_raises = False
 
@@ -93,9 +104,27 @@ class FakeSSH:
     def __init__(self, state: RemoteState):
         self.state = state
 
-    def command(self, argv, *, check=True, timeout=300):
+    @contextmanager
+    def session(self):
+        self.state.ssh_session_count += 1
+        session_number = self.state.ssh_session_count
+        self.state.broken_session = False
+        self.state.ssh_session_events.append("open")
+        try:
+            yield self
+        finally:
+            self.state.ssh_session_events.append("close")
+            if session_number in self.state.teardown_error_sessions:
+                raise InstallerError("simulated SSH session teardown failure")
+
+    def command(
+        self, argv, *, check=True, timeout=300, input_text=None
+    ):
+        del check, timeout, input_text
         command = list(argv)
         self.state.commands.append(command)
+        if self.state.broken_session:
+            raise SSHTransportError("simulated broken SSH session")
         inner = command[3:] if command[:3] == ["sudo", "-n", "--"] else command
         if inner == ["id", "-u"]:
             return subprocess.CompletedProcess(command, 0, f"{self.state.uid}\n", "")
@@ -108,13 +137,18 @@ class FakeSSH:
         if inner[:2] == ["chmod", "700"]:
             return subprocess.CompletedProcess(command, 0, "", "")
         if inner[:4] == ["stat", "-c", "%a", "--"]:
+            if self.state.transport_fail_stat_once:
+                self.state.transport_fail_stat_once = False
+                self.state.broken_session = True
+                raise SSHTransportError("simulated SSH loss during stat")
             mode = self.state.modes.get(inner[4], "")
             return subprocess.CompletedProcess(
                 command, 0 if mode else 1, mode + ("\n" if mode else ""), ""
             )
         if inner and inner[0] == "python3" and "--apply" in inner:
             if self.state.apply_raises:
-                raise InstallerError("simulated SSH loss with secret " + UUID)
+                self.state.broken_session = True
+                raise SSHTransportError("simulated SSH loss with secret " + UUID)
             if self.state.apply_returncode != 0:
                 return subprocess.CompletedProcess(
                     command,
@@ -133,6 +167,10 @@ class FakeSSH:
             self.state.modes[destination] = "600"
             return subprocess.CompletedProcess(command, 0, "", "")
         if inner[:3] == ["rm", "-f", "--"]:
+            if self.state.transport_fail_cleanup_once:
+                self.state.transport_fail_cleanup_once = False
+                self.state.broken_session = True
+                raise SSHTransportError("simulated cleanup transport loss")
             if self.state.fail_cleanup:
                 return subprocess.CompletedProcess(command, 1, "", "cleanup failed")
             for remote_path in inner[3:]:
@@ -145,10 +183,28 @@ class FakeSSH:
             return subprocess.CompletedProcess(command, 1 if has_files else 0, "", "")
         raise AssertionError(f"unexpected SSH command: {command!r}")
 
+    def fresh_command(
+        self, argv, *, check=True, timeout=300, input_text=None
+    ):
+        return self.command(
+            argv,
+            check=check,
+            timeout=timeout,
+            input_text=input_text,
+        )
+
 
 class FakeSFTP:
     def __init__(self, state: RemoteState):
         self.state = state
+
+    @contextmanager
+    def session(self):
+        self.state.sftp_session_events.append("open")
+        try:
+            yield self
+        finally:
+            self.state.sftp_session_events.append("close")
 
     def batch(self, commands, *, check=True):
         for raw in commands:
@@ -264,6 +320,14 @@ class RemoteExitTests(unittest.TestCase):
         self.assertFalse(
             any(path.startswith(state.remote_temp + "/") for path in state.files)
         )
+        self.assertEqual(
+            state.ssh_session_events,
+            ["open", "close"],
+        )
+        self.assertEqual(
+            state.sftp_session_events,
+            ["open", "close", "open", "close"],
+        )
         cleanup_command = next(
             command for command in state.commands if command[:3] == ["rm", "-f", "--"]
         )
@@ -277,6 +341,33 @@ class RemoteExitTests(unittest.TestCase):
                 state.remote_temp + "/firewall-plan.txt",
             },
         )
+
+    def test_injected_runner_reuses_caller_session_without_opening_another(self):
+        state = RemoteState(self.desired)
+        runner = FakeSSH(state)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installer = root / "xhttp-setup.pyz"
+            installer.write_bytes(b"PYZ")
+            with (
+                fake_transport(state),
+                patch(
+                    "xhttp_setup.remote_exit.SSHClient",
+                    side_effect=AssertionError("must reuse injected runner"),
+                ) as client,
+            ):
+                result = apply_remote_exit(
+                    installer_pyz=installer,
+                    desired=self.desired,
+                    target=self.target,
+                    auth=self.auth,
+                    output_dir=root / "result",
+                    ssh_runner=runner,
+                )
+
+        self.assertEqual(result.remote_status, "succeeded")
+        client.assert_not_called()
+        self.assertEqual(state.ssh_session_events, [])
 
     def test_non_root_uses_noninteractive_sudo_for_apply_and_artifact_stage(self):
         state = RemoteState(self.desired, uid=1001, gid=1002)
@@ -305,6 +396,104 @@ class RemoteExitTests(unittest.TestCase):
         self.assertEqual(error.remote_status, "not_started")
         self.assertEqual(error.cleanup_status, "succeeded")
         self.assertFalse(any("--apply" in command for command in state.commands))
+
+    def test_preapply_transport_loss_recovers_temp_in_one_new_session(self):
+        state = RemoteState(self.desired)
+        state.transport_fail_stat_once = True
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteExitError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "upload_verify")
+        self.assertEqual(error.remote_status, "not_started")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertEqual(error.remote_temp, state.remote_temp)
+        self.assertTrue(error.recovery_completed)
+        self.assertFalse(error.recovery_failed)
+        self.assertEqual(
+            state.ssh_session_events,
+            ["open", "close", "open", "close"],
+        )
+        self.assertFalse(any("--apply" in command for command in state.commands))
+
+    def test_body_failure_stage_survives_session_teardown_failure(self):
+        state = RemoteState(self.desired)
+        state.corrupt_roundtrip = True
+        state.teardown_error_sessions.add(1)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteExitError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "upload_verify")
+        self.assertEqual(error.remote_status, "not_started")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.session_cleanup_failed)
+        self.assertFalse(error.recovery_completed)
+        self.assertEqual(state.ssh_session_count, 1)
+
+    def test_teardown_capture_preserves_body_and_control_baseexceptions(self):
+        @contextmanager
+        def fails_during_teardown(error):
+            try:
+                yield object()
+            finally:
+                raise error
+
+        ordinary_body = RuntimeError("body failure")
+        capture = _TeardownCapture()
+        with self.assertRaises(RuntimeError) as raised:
+            with _capture_context_teardown(
+                fails_during_teardown(InstallerError("teardown failure")),
+                capture,
+            ):
+                raise ordinary_body
+        self.assertIs(raised.exception, ordinary_body)
+        self.assertIsNone(capture.error)
+
+        interrupted_body = KeyboardInterrupt("body interrupted")
+        capture = _TeardownCapture()
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            with _capture_context_teardown(
+                fails_during_teardown(InstallerError("teardown failure")),
+                capture,
+            ):
+                raise interrupted_body
+        self.assertIs(raised.exception, interrupted_body)
+        self.assertIsNone(capture.error)
+
+        capture = _TeardownCapture()
+        with self.assertRaises(KeyboardInterrupt):
+            with _capture_context_teardown(
+                fails_during_teardown(KeyboardInterrupt("teardown interrupted")),
+                capture,
+            ):
+                pass
+        self.assertIsNone(capture.error)
+
+        teardown_error = InstallerError("ordinary teardown failure")
+        capture = _TeardownCapture()
+        with _capture_context_teardown(
+            fails_during_teardown(teardown_error), capture
+        ):
+            pass
+        self.assertIs(capture.error, teardown_error)
+
+    def test_successful_apply_teardown_failure_is_typed_cleanup_error(self):
+        state = RemoteState(self.desired)
+        state.teardown_error_sessions.add(1)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteExitError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "cleanup")
+        self.assertEqual(error.remote_status, "succeeded")
+        self.assertEqual(error.artifact_status, "saved")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.session_cleanup_failed)
+        self.assertEqual(state.ssh_session_count, 1)
 
     def test_unexpected_mktemp_path_is_never_used_for_cleanup(self):
         state = RemoteState(self.desired)
@@ -341,9 +530,44 @@ class RemoteExitTests(unittest.TestCase):
             with self.assertRaises(RemoteExitError) as raised:
                 self.run_install(state, Path(temp))
 
-        self.assertEqual(raised.exception.remote_status, "unknown")
-        self.assertIsNone(raised.exception.remote_applied)
-        self.assertNotIn(UUID, str(raised.exception))
+        error = raised.exception
+        self.assertEqual(error.remote_status, "unknown")
+        self.assertIsNone(error.remote_applied)
+        self.assertNotIn(UUID, str(error))
+        self.assertNotIn(UUID, repr(error))
+        self.assertNotIn(UUID, "".join(traceback.format_exception(error)))
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertEqual(
+            sum("--apply" in command for command in state.commands),
+            1,
+        )
+        self.assertEqual(state.ssh_session_events, ["open", "close"])
+        self.assertEqual(error.cleanup_status, "failed")
+        self.assertFalse(error.recovery_completed)
+        self.assertFalse(error.recovery_failed)
+
+    def test_known_failed_apply_cleanup_transport_uses_one_recovery_session(self):
+        state = RemoteState(self.desired)
+        state.apply_returncode = 17
+        state.transport_fail_cleanup_once = True
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteExitError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "remote_apply")
+        self.assertEqual(error.remote_status, "failed")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.recovery_completed)
+        self.assertEqual(
+            state.ssh_session_events,
+            ["open", "close", "open", "close"],
+        )
+        self.assertEqual(
+            sum("--apply" in command for command in state.commands),
+            1,
+        )
 
     def test_openssh_255_reports_unknown_remote_state(self):
         state = RemoteState(self.desired)
@@ -431,6 +655,46 @@ class RemoteExitTests(unittest.TestCase):
             self.assertEqual((output / "firewall-plan.txt").read_bytes(), old_firewall)
             self.assertEqual(raised.exception.artifact_status, "not_saved")
             self.assertEqual(raised.exception.remote_status, "succeeded")
+
+    def test_local_artifact_transaction_rolls_back_control_baseexceptions(self):
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception_type=exception_type.__name__):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    output = root / "result"
+                    output.mkdir()
+                    handoff_target = output / "handoff.json"
+                    firewall_target = output / "firewall-plan.txt"
+                    handoff_target.write_bytes(b"old-handoff")
+                    firewall_target.write_bytes(b"old-firewall")
+                    handoff_source = root / "handoff.download"
+                    firewall_source = root / "firewall.download"
+                    handoff_source.write_bytes(b"new-handoff")
+                    firewall_source.write_bytes(b"new-firewall")
+                    calls = 0
+
+                    def interrupt_second_write(path, data, mode=0o600):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            raise exception_type("interrupted local transaction")
+                        portable_atomic_write(path, data, mode)
+
+                    with (
+                        patch(
+                            "xhttp_setup.remote_exit.atomic_write",
+                            side_effect=interrupt_second_write,
+                        ),
+                        self.assertRaises(exception_type),
+                    ):
+                        _persist_local_artifacts(
+                            handoff_source=handoff_source,
+                            firewall_source=firewall_source,
+                            output_dir=output,
+                        )
+
+                    self.assertEqual(handoff_target.read_bytes(), b"old-handoff")
+                    self.assertEqual(firewall_target.read_bytes(), b"old-firewall")
 
     def test_target_validation_happens_before_any_network_call(self):
         bad_target = RemoteExitTarget(

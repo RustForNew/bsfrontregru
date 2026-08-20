@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
 from .errors import InstallerError, ValidationError, VerificationError
 from .exit_network import ExitNetworkProfile
-from .ssh_transport import SSHClient
+from .remote_prepare import (
+    _expected_ssh_rule,
+    _ssh_rule_comment,
+    _ufw_added_commands,
+    _validate_iptables_save as _validate_prepared_iptables_save,
+)
+from .remote_prepare import _validate_nft_ruleset as _validate_prepared_nft_ruleset
+from .ssh_transport import SSHCommand, SSHTransportError
+from .validate import validate_port
 
 
 _READ_TIMEOUT = 20
@@ -22,13 +31,13 @@ _MUTATION_TIMEOUT = 30
 _MANAGED_ALLOW_PREFIX = "xhttp-setup-allow-"
 _MANAGED_DENY_PREFIX = "xhttp-setup-deny-"
 _NUMBERED_UFW_LINE = re.compile(r"^\s*\[\s*(\d+)\]\s+(.*)$")
-_NFT_TABLE = re.compile(r"^table\s+(\S+)\s+(\S+)\s*\{$")
-_NFT_CHAIN = re.compile(r"^chain\s+(\S+)\s*\{$")
-_CONTAINER_MARKER = re.compile(
-    r"(?:^|[^a-z0-9])(docker|containerd|podman|cni|kube)(?:[^a-z0-9]|$)",
-    re.IGNORECASE,
+_NFTABLES_MISSING_UNIT_DIAGNOSTICS = frozenset(
+    {
+        "Failed to get unit file state for nftables.service: "
+        "No such file or directory",
+        "Unit file nftables.service does not exist.",
+    }
 )
-_BASE_FILTER_CHAINS = frozenset({"INPUT", "OUTPUT", "FORWARD"})
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,7 @@ class RemoteExitNetworkState:
 @dataclass(frozen=True)
 class RemoteExitNetworkApplyResult:
     profile: ExitNetworkProfile
+    ssh_port: int
     allow_comment: str
     deny_comment: str
     ufw_allow_added: bool
@@ -54,8 +64,36 @@ class RemoteExitNetworkRollbackResult:
 
 
 @dataclass(frozen=True)
+class RemoteExitNetworkRecovery:
+    """Exact owned comments whose mutation outcome needs reconciliation."""
+
+    profile: ExitNetworkProfile
+    ssh_port: int
+    attempted_comments: tuple[tuple[str, str], ...]
+
+
+class RemoteExitNetworkError(InstallerError):
+    """Transport-only mutation failure carrying a bounded reconciliation journal."""
+
+    def __init__(
+        self,
+        *,
+        recovery: RemoteExitNetworkRecovery,
+        recovery_completed: bool = False,
+    ) -> None:
+        state = "succeeded" if recovery_completed else "required"
+        super().__init__(
+            "Remote UFW mutation transport failed; "
+            f"exact_reconciliation={state}"
+        )
+        self.recovery = recovery
+        self.recovery_completed = recovery_completed
+
+
+@dataclass(frozen=True)
 class _UfwState:
     active: bool
+    guard_indices: tuple[int, ...]
     allow_indices: tuple[int, ...]
     deny_indices: tuple[int, ...]
 
@@ -68,21 +106,34 @@ def _deny_comment(profile: ExitNetworkProfile) -> str:
     return f"{_MANAGED_DENY_PREFIX}{profile.backend_port}"
 
 
+def _validated_network_target(
+    profile: ExitNetworkProfile,
+    ssh_port: int,
+) -> tuple[ExitNetworkProfile, int]:
+    profile = profile.validate()
+    ssh_port = validate_port(ssh_port)
+    if profile.backend_port == ssh_port:
+        raise ValidationError("Backend-порт совпадает с SSH-портом выхода")
+    return profile, ssh_port
+
+
 def _invoke(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     argv: Sequence[str],
     *,
     timeout: int = _READ_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return ssh.command(list(argv), check=False, timeout=timeout)
+    except InstallerError:
+        # Preserve the transport layer's bounded, redacted diagnostic.
+        raise
     except Exception as exc:
-        # Do not propagate transport text: it can contain provider-side details.
         raise InstallerError("Удалённая SSH-команда не завершилась") from exc
 
 
 def _must(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     argv: Sequence[str],
     *,
     operation: str,
@@ -94,17 +145,25 @@ def _must(
     return result
 
 
-def _require_remote_root(ssh: SSHClient) -> None:
-    result = _must(
-        ssh,
-        ["id", "-u"],
-        operation="Не удалось проверить UID удалённого пользователя",
-    )
+def _require_remote_root(ssh: SSHCommand, *, fresh: bool = False) -> None:
+    if fresh:
+        result = ssh.fresh_command(["id", "-u"], check=False, timeout=_READ_TIMEOUT)
+        if result.returncode != 0:
+            raise InstallerError(
+                f"Не удалось проверить UID через новое SSH-соединение: "
+                f"код {result.returncode}"
+            )
+    else:
+        result = _must(
+            ssh,
+            ["id", "-u"],
+            operation="Не удалось проверить UID удалённого пользователя",
+        )
     if result.stdout.strip() != "0":
         raise InstallerError("Удалённый сетевой apply требует прямой SSH-вход root")
 
 
-def _read_os_id(ssh: SSHClient) -> str:
+def _read_os_id(ssh: SSHCommand) -> str:
     result = _must(
         ssh,
         ["cat", "/etc/os-release"],
@@ -125,26 +184,36 @@ def _read_os_id(ssh: SSHClient) -> str:
     return os_id
 
 
-def _reject_docker_units(ssh: SSHClient) -> None:
-    units = _must(
+def _reject_docker_units(ssh: SSHCommand) -> None:
+    units = _invoke(
         ssh,
         [
             "systemctl",
             "list-unit-files",
+            "--no-legend",
+            "--no-pager",
             "docker.service",
             "docker.socket",
             "containerd.service",
-            "--no-legend",
-            "--no-pager",
         ],
-        operation="Не удалось проверить Docker unit-файлы",
     )
-    found: list[str] = []
+    if units.returncode == 1 and not units.stdout.strip() and not units.stderr.strip():
+        return
+    if units.returncode != 0:
+        raise InstallerError(
+            f"Не удалось проверить Docker unit-файлы: код {units.returncode}"
+        )
+    if units.stderr.strip():
+        raise VerificationError(
+            "systemctl вернул неоднозначную диагностику Docker/containerd"
+        )
     expected = {"docker.service", "docker.socket", "containerd.service"}
-    for line in units.stdout.splitlines():
-        fields = line.split()
-        if fields and fields[0] in expected:
-            found.append(fields[0])
+    lines = [line.split() for line in units.stdout.splitlines() if line.strip()]
+    if not lines or any(len(fields) < 2 or fields[0] not in expected for fields in lines):
+        raise VerificationError(
+            "systemctl вернул неоднозначный список Docker/containerd unit-файлов"
+        )
+    found = [fields[0] for fields in lines]
     if found:
         raise InstallerError(
             "Обнаружены Docker/containerd unit-файлы; remote UFW apply отказался"
@@ -152,38 +221,52 @@ def _reject_docker_units(ssh: SSHClient) -> None:
 
 
 def _systemd_state(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     operation: str,
-) -> tuple[int, str]:
+) -> tuple[int, str, str]:
     result = _invoke(
         ssh,
-        ["systemctl", operation, "nftables.service"],
+        [
+            "env",
+            "LC_ALL=C",
+            "LANG=C",
+            "systemctl",
+            operation,
+            "nftables.service",
+        ],
     )
     state = result.stdout.strip().lower()
-    if "\n" in state or "\r" in state:
+    diagnostic = result.stderr.strip()
+    if any(char in state or char in diagnostic for char in "\r\n"):
         raise VerificationError("systemctl вернул неоднозначное состояние nftables")
-    return result.returncode, state
+    return result.returncode, state, diagnostic
 
 
-def _reject_nftables_service(ssh: SSHClient) -> None:
-    active_code, active = _systemd_state(ssh, "is-active")
+def _reject_nftables_service(ssh: SSHCommand) -> None:
+    active_code, active, active_diagnostic = _systemd_state(ssh, "is-active")
     if active_code == 0 or active == "active":
         raise InstallerError("Обнаружен активный nftables.service")
-    if active_code not in {1, 3, 4} or active not in {
+    if active_diagnostic or active_code not in {1, 3, 4} or active not in {
         "inactive",
         "unknown",
         "not-found",
     }:
         raise InstallerError("Не удалось однозначно проверить nftables.service")
 
-    enabled_code, enabled = _systemd_state(ssh, "is-enabled")
+    enabled_code, enabled, enabled_diagnostic = _systemd_state(ssh, "is-enabled")
     if enabled_code == 0 or enabled in {"enabled", "enabled-runtime", "static"}:
         raise InstallerError("Обнаружен enabled nftables.service")
-    if enabled_code not in {1, 4} or enabled not in {
-        "disabled",
-        "masked",
-        "not-found",
-    }:
+    disabled = (
+        enabled_code in {1, 4}
+        and enabled in {"disabled", "masked", "not-found"}
+        and not enabled_diagnostic
+    )
+    missing = (
+        enabled_code == 1
+        and not enabled
+        and enabled_diagnostic in _NFTABLES_MISSING_UNIT_DIAGNOSTICS
+    )
+    if not (disabled or missing):
         raise InstallerError(
             "Не удалось однозначно проверить nftables.service enablement"
         )
@@ -191,127 +274,178 @@ def _reject_nftables_service(ssh: SSHClient) -> None:
 
 def _validate_nft_ruleset(output: str) -> None:
     """Allow only an empty ruleset or the normal iptables-nft UFW filter shape."""
-
-    current_table: tuple[str, str] | None = None
-    current_chain: str | None = None
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if _CONTAINER_MARKER.search(line):
-            raise InstallerError("Обнаружены container-managed nftables rules")
-        if line.startswith("#"):
-            continue
-
-        table_match = _NFT_TABLE.fullmatch(line)
-        if table_match:
-            if current_table is not None or current_chain is not None:
-                raise InstallerError("Неоднозначная вложенность nftables ruleset")
-            family, name = table_match.groups()
-            if family not in {"ip", "ip6"} or name != "filter":
-                raise InstallerError("Обнаружена custom nftables table")
-            current_table = (family, name)
-            continue
-
-        chain_match = _NFT_CHAIN.fullmatch(line)
-        if chain_match:
-            if current_table is None or current_chain is not None:
-                raise InstallerError("Неоднозначная nftables chain")
-            current_chain = chain_match.group(1)
-            if (
-                current_chain not in _BASE_FILTER_CHAINS
-                and not current_chain.startswith("ufw-")
-            ):
-                raise InstallerError("Обнаружена custom nftables chain")
-            continue
-
-        if line == "}":
-            if current_chain is not None:
-                current_chain = None
-            elif current_table is not None:
-                current_table = None
-            else:
-                raise InstallerError("Лишняя закрывающая скобка nftables ruleset")
-            continue
-
-        if current_chain is None:
-            raise InstallerError("Обнаружена custom nftables конструкция")
-        if current_chain in _BASE_FILTER_CHAINS:
-            is_base_declaration = line.startswith("type filter hook ")
-            is_ufw_dispatch = bool(
-                re.search(r"\b(?:jump|goto)\s+ufw-[A-Za-z0-9_-]+\b", line)
-            )
-            if not (is_base_declaration or is_ufw_dispatch):
-                raise InstallerError("Обнаружена custom rule в base nftables chain")
-
-    if current_chain is not None or current_table is not None:
-        raise InstallerError("Незавершённый nftables ruleset")
+    _validate_prepared_nft_ruleset(output, allow_ufw=True)
 
 
-def _reject_custom_nftables(ssh: SSHClient) -> None:
+def _reject_custom_nftables(ssh: SSHCommand) -> None:
     _reject_nftables_service(ssh)
     ruleset = _must(
         ssh,
         ["nft", "list", "ruleset"],
         operation="Не удалось прочитать nftables ruleset",
     )
+    if ruleset.stderr.strip():
+        raise VerificationError("nft вернул неоднозначную диагностику")
     _validate_nft_ruleset(ruleset.stdout)
+    iptables = _must(
+        ssh,
+        ["iptables-save"],
+        operation="Не удалось прочитать IPv4 iptables ruleset",
+    )
+    ip6tables = _must(
+        ssh,
+        ["ip6tables-save"],
+        operation="Не удалось прочитать IPv6 iptables ruleset",
+    )
+    if iptables.stderr.strip() or ip6tables.stderr.strip():
+        raise VerificationError("xtables inspector вернул предупреждение")
+    _validate_prepared_iptables_save(
+        iptables.stdout,
+        allow_ufw=True,
+        ufw_prefix="ufw-",
+    )
+    _validate_prepared_iptables_save(
+        ip6tables.stdout,
+        allow_ufw=True,
+        ufw_prefix="ufw6-",
+    )
 
 
 def _ufw_command(*argv: str) -> list[str]:
     return ["env", "LC_ALL=C", "LANG=C", "ufw", *argv]
 
 
-def _numbered_rule_lines(output: str, comment: str) -> list[tuple[int, str]]:
-    found: list[tuple[int, str]] = []
-    for line in output.splitlines():
-        head, separator, tail = line.rpartition("#")
-        if not separator or tail.strip() != comment:
+def _numbered_rules(output: str) -> list[tuple[int, str, str]]:
+    found: list[tuple[int, str, str]] = []
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
             continue
-        match = _NUMBERED_UFW_LINE.match(head)
-        if not match:
-            raise InstallerError("Некорректная managed UFW rule")
-        found.append((int(match.group(1)), match.group(2).strip()))
+        match = _NUMBERED_UFW_LINE.match(raw_line)
+        if match is None:
+            fields = tuple(stripped.split())
+            if fields in {
+                ("Status:", "active"),
+                ("To", "Action", "From"),
+                ("--", "------", "----"),
+            }:
+                continue
+            raise VerificationError("Некорректный вывод ufw status numbered")
+        body = match.group(2).strip()
+        rule, separator, comment = body.rpartition("#")
+        if not separator or not comment.strip():
+            raise InstallerError("UFW содержит rule без managed comment")
+        found.append((int(match.group(1)), rule.strip(), comment.strip()))
+    indices = tuple(index for index, _rule, _comment in found)
+    if indices != tuple(range(1, len(found) + 1)):
+        raise VerificationError("UFW вернул неоднозначную нумерацию rules")
     return found
 
 
-def _inspect_ufw(ssh: SSHClient, profile: ExitNetworkProfile) -> _UfwState:
+def _added_rule_comment(command: list[str]) -> str:
+    if command.count("comment") != 1:
+        raise InstallerError("UFW show added содержит rule без exact comment")
+    marker = command.index("comment")
+    if marker + 2 != len(command) or not command[marker + 1]:
+        raise InstallerError("UFW show added содержит неоднозначный comment")
+    return command[marker + 1]
+
+
+def _inspect_ufw(
+    ssh: SSHCommand,
+    profile: ExitNetworkProfile,
+    *,
+    ssh_port: int,
+) -> _UfwState:
     result = _must(
         ssh,
         _ufw_command("status", "numbered"),
         operation="Не удалось прочитать состояние UFW",
     )
+    if result.stderr.strip():
+        raise VerificationError("ufw status numbered вернул предупреждение")
     status_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     active = bool(status_lines) and status_lines[0] == "Status: active"
     if not active:
-        return _UfwState(False, (), ())
+        return _UfwState(False, (), (), ())
 
+    guard_comment = _ssh_rule_comment(ssh_port)
     allow_comment = _allow_comment(profile)
     deny_comment = _deny_comment(profile)
-    allow_lines = _numbered_rule_lines(result.stdout, allow_comment)
-    deny_lines = _numbered_rule_lines(result.stdout, deny_comment)
+    numbered = _numbered_rules(result.stdout)
+    allowed_comments = {guard_comment, allow_comment, deny_comment}
+    foreign_comments = sorted(
+        {comment for _index, _rule, comment in numbered if comment not in allowed_comments}
+    )
+    if foreign_comments:
+        raise InstallerError("UFW содержит foreign rules")
+
+    guard_lines = [
+        (index, rule)
+        for index, rule, comment in numbered
+        if comment == guard_comment
+    ]
+    allow_lines = [
+        (index, rule)
+        for index, rule, comment in numbered
+        if comment == allow_comment
+    ]
+    deny_lines = [
+        (index, rule)
+        for index, rule, comment in numbered
+        if comment == deny_comment
+    ]
 
     allow_namespace = f"{_MANAGED_ALLOW_PREFIX}{profile.backend_port}-"
-    for line in result.stdout.splitlines():
-        _, separator, tail = line.rpartition("#")
-        comment = tail.strip() if separator else ""
+    for _index, _rule, comment in numbered:
         if comment.startswith(allow_namespace) and comment != allow_comment:
             raise InstallerError(
                 "Обнаружена managed UFW allow rule для другого frontend IPv4"
             )
+
+    escaped_ssh_port = re.escape(str(ssh_port))
+    ipv4_guard = tuple(
+        index
+        for index, rule in guard_lines
+        if re.fullmatch(
+            rf"{escaped_ssh_port}/tcp\s+ALLOW IN\s+Anywhere",
+            rule,
+        )
+    )
+    ipv6_guard = tuple(
+        index
+        for index, rule in guard_lines
+        if re.fullmatch(
+            rf"{escaped_ssh_port}/tcp\s+\(v6\)\s+ALLOW IN\s+Anywhere\s+\(v6\)",
+            rule,
+        )
+    )
+    if (
+        len(ipv4_guard) != 1
+        or len(ipv6_guard) > 1
+        or len(guard_lines) != len(ipv4_guard) + len(ipv6_guard)
+    ):
+        raise InstallerError(
+            "UFW не содержит exact managed SSH guard текущего порта"
+        )
 
     if len(allow_lines) > 1:
         raise InstallerError("Обнаружены дубли managed UFW allow rule")
     expected_port = re.escape(str(profile.backend_port))
     expected_ip = re.escape(profile.frontend_ipv4)
     for _, rule in allow_lines:
-        if not re.search(rf"(?<!\d){expected_port}/tcp\b", rule) or not re.search(
-            rf"\bALLOW IN\s+{expected_ip}(?:/32)?\s*$", rule
+        if not re.fullmatch(
+            rf"{expected_port}/tcp\s+ALLOW IN\s+{expected_ip}(?:/32)?",
+            rule,
         ):
             raise InstallerError("Managed UFW allow comment занят другой rule")
     for _, rule in deny_lines:
-        if not re.search(rf"(?<!\d){expected_port}/tcp\b", rule) or not re.search(
-            r"\bDENY IN\s+Anywhere(?:\s+\(v6\))?\s*$", rule
+        if not re.fullmatch(
+            rf"{expected_port}/tcp\s+DENY IN\s+Anywhere",
+            rule,
+        ) and not re.fullmatch(
+            rf"{expected_port}/tcp\s+\(v6\)\s+DENY IN\s+Anywhere\s+\(v6\)",
+            rule,
         ):
             raise InstallerError("Managed UFW deny comment занят другой rule")
 
@@ -330,29 +464,52 @@ def _inspect_ufw(ssh: SSHClient, profile: ExitNetworkProfile) -> _UfwState:
             raise InstallerError(
                 "Managed UFW backend deny rule не стоит сразу после frontend allow"
             )
+
+    added_commands = _ufw_added_commands(ssh)
+    added_comments = [_added_rule_comment(command) for command in added_commands]
+    expected_comments = [guard_comment]
+    if allow_indices:
+        expected_comments.append(allow_comment)
+    if ipv4_deny:
+        expected_comments.append(deny_comment)
+    if Counter(added_comments) != Counter(expected_comments):
+        raise InstallerError("UFW show added не совпадает с exact managed rules")
+    guard_commands = [
+        command
+        for command, comment in zip(added_commands, added_comments, strict=True)
+        if comment == guard_comment
+    ]
+    if guard_commands != [_expected_ssh_rule(ssh_port)]:
+        raise InstallerError("UFW SSH guard не совпадает с exact managed rule")
+
     return _UfwState(
         True,
+        tuple(index for index, _rule in guard_lines),
         allow_indices,
         tuple(index for index, _ in deny_lines),
     )
 
 
 def preflight_remote_exit_network(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     profile: ExitNetworkProfile,
+    *,
+    ssh_port: int,
 ) -> RemoteExitNetworkState:
     """Read and validate remote network state without making mutations."""
 
-    profile = profile.validate()
+    profile, ssh_port = _validated_network_target(profile, ssh_port)
     _require_remote_root(ssh)
     os_id = _read_os_id(ssh)
     _reject_docker_units(ssh)
     _reject_custom_nftables(ssh)
-    ufw = _inspect_ufw(ssh, profile)
+    ufw = _inspect_ufw(ssh, profile, ssh_port=ssh_port)
     if not ufw.active:
         raise InstallerError(
             "UFW inactive/unknown: remote apply отказался включать или перенастраивать его"
         )
+    if bool(ufw.allow_indices) != bool(ufw.deny_indices):
+        raise InstallerError("UFW содержит неполную managed backend пару")
     return RemoteExitNetworkState(
         os_id=os_id,
         ufw_allow_indices=ufw.allow_indices,
@@ -361,11 +518,13 @@ def preflight_remote_exit_network(
 
 
 def _delete_comment(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     profile: ExitNetworkProfile,
     comment: str,
+    *,
+    ssh_port: int,
 ) -> bool:
-    state = _inspect_ufw(ssh, profile)
+    state = _inspect_ufw(ssh, profile, ssh_port=ssh_port)
     if not state.active:
         raise InstallerError("UFW стал inactive/unknown во время rollback")
     if comment == _allow_comment(profile):
@@ -376,14 +535,43 @@ def _delete_comment(
         raise ValidationError("Неизвестный managed UFW comment")
     if not indices:
         return False
-    for index in sorted(indices, reverse=True):
-        _must(
-            ssh,
-            _ufw_command("--force", "delete", str(index)),
-            operation=f"Не удалось удалить managed UFW rule {comment}",
-            timeout=_MUTATION_TIMEOUT,
+    if comment == _allow_comment(profile):
+        delete = _ufw_command(
+            "--force",
+            "delete",
+            "allow",
+            "from",
+            f"{profile.frontend_ipv4}/32",
+            "to",
+            "any",
+            "port",
+            str(profile.backend_port),
+            "proto",
+            "tcp",
+            "comment",
+            comment,
         )
-    after = _inspect_ufw(ssh, profile)
+    else:
+        delete = _ufw_command(
+            "--force",
+            "delete",
+            "deny",
+            "to",
+            "any",
+            "port",
+            str(profile.backend_port),
+            "proto",
+            "tcp",
+            "comment",
+            comment,
+        )
+    _must(
+        ssh,
+        delete,
+        operation=f"Не удалось удалить managed UFW rule {comment}",
+        timeout=_MUTATION_TIMEOUT,
+    )
+    after = _inspect_ufw(ssh, profile, ssh_port=ssh_port)
     remaining = (
         after.allow_indices
         if comment == _allow_comment(profile)
@@ -395,40 +583,138 @@ def _delete_comment(
 
 
 def _rollback_actions(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     profile: ExitNetworkProfile,
     comments: Sequence[tuple[str, str]],
+    *,
+    ssh_port: int,
 ) -> tuple[bool, bool]:
     allow_removed = False
     deny_removed = False
-    errors: list[str] = []
+    errors: list[tuple[str, Exception]] = []
     for name, comment in reversed(comments):
         try:
-            removed = _delete_comment(ssh, profile, comment)
+            removed = _delete_comment(
+                ssh,
+                profile,
+                comment,
+                ssh_port=ssh_port,
+            )
             if comment == _allow_comment(profile):
                 allow_removed = allow_removed or removed
             else:
                 deny_removed = deny_removed or removed
-        except Exception:
-            errors.append(name)
+        except Exception as exc:
+            errors.append((name, exc))
     if errors:
-        raise InstallerError("rollback неполон: " + ", ".join(errors))
+        names = ", ".join(name for name, _ in errors)
+        if all(isinstance(exc, SSHTransportError) for _, exc in errors):
+            raise SSHTransportError(
+                "SSH transport оборвался во время exact UFW rollback: " + names
+            ) from errors[0][1]
+        raise InstallerError("rollback неполон: " + names)
     return allow_removed, deny_removed
 
 
-def apply_remote_exit_network(
-    ssh: SSHClient,
+def _require_pair_state(
+    ssh: SSHCommand,
     profile: ExitNetworkProfile,
+    *,
+    ssh_port: int,
+    pair_present: bool,
+) -> None:
+    state = _inspect_ufw(ssh, profile, ssh_port=ssh_port)
+    if not state.active:
+        raise VerificationError("UFW стал inactive во время managed transaction")
+    actual_pair = bool(state.allow_indices) and bool(state.deny_indices)
+    partial_pair = bool(state.allow_indices) != bool(state.deny_indices)
+    if partial_pair or actual_pair != pair_present:
+        expected = "guard+pair" if pair_present else "guard-only"
+        raise VerificationError(f"UFW не вернул exact {expected} state")
+
+
+def _validated_recovery(
+    recovery: RemoteExitNetworkRecovery,
+) -> RemoteExitNetworkRecovery:
+    profile, ssh_port = _validated_network_target(
+        recovery.profile,
+        recovery.ssh_port,
+    )
+    expected = (
+        ("UFW frontend allow", _allow_comment(profile)),
+        ("UFW backend deny", _deny_comment(profile)),
+    )
+    comments = tuple(recovery.attempted_comments)
+    if comments != expected[: len(comments)] or len(comments) > len(expected):
+        raise ValidationError("Remote network recovery journal не является exact prefix")
+    return RemoteExitNetworkRecovery(profile, ssh_port, comments)
+
+
+def recovery_for_remote_exit_network(
+    result: RemoteExitNetworkApplyResult,
+) -> RemoteExitNetworkRecovery:
+    """Build an exact rollback journal from one successful owned apply result."""
+
+    profile, ssh_port = _validated_network_target(result.profile, result.ssh_port)
+    if result.allow_comment != _allow_comment(
+        profile
+    ) or result.deny_comment != _deny_comment(profile):
+        raise ValidationError("Remote network result содержит чужие managed comments")
+    if result.ufw_allow_added != result.ufw_deny_added:
+        raise ValidationError("Remote network result содержит partial managed pair")
+    comments: list[tuple[str, str]] = []
+    if result.ufw_allow_added:
+        comments.append(("UFW frontend allow", result.allow_comment))
+    if result.ufw_deny_added:
+        comments.append(("UFW backend deny", result.deny_comment))
+    return _validated_recovery(
+        RemoteExitNetworkRecovery(profile, ssh_port, tuple(comments))
+    )
+
+
+def reconcile_remote_exit_network(
+    ssh: SSHCommand,
+    recovery: RemoteExitNetworkRecovery,
+) -> RemoteExitNetworkRollbackResult:
+    """Reconcile exact attempted comments through one caller-owned fresh session."""
+
+    recovery = _validated_recovery(recovery)
+    _require_remote_root(ssh)
+    allow_removed, deny_removed = _rollback_actions(
+        ssh,
+        recovery.profile,
+        recovery.attempted_comments,
+        ssh_port=recovery.ssh_port,
+    )
+    _require_pair_state(
+        ssh,
+        recovery.profile,
+        ssh_port=recovery.ssh_port,
+        pair_present=False,
+    )
+    return RemoteExitNetworkRollbackResult(
+        ufw_allow_removed=allow_removed,
+        ufw_deny_removed=deny_removed,
+    )
+
+
+def apply_remote_exit_network(
+    ssh: SSHCommand,
+    profile: ExitNetworkProfile,
+    *,
+    ssh_port: int,
 ) -> RemoteExitNetworkApplyResult:
     """Insert only the exact managed UFW allow/deny pair and verify SSH survives."""
 
-    profile = profile.validate()
-    before = preflight_remote_exit_network(ssh, profile)
+    profile, ssh_port = _validated_network_target(profile, ssh_port)
+    before = preflight_remote_exit_network(ssh, profile, ssh_port=ssh_port)
+    baseline_pair_present = bool(before.ufw_allow_indices)
     allow_comment = _allow_comment(profile)
     deny_comment = _deny_comment(profile)
     attempted: list[tuple[str, str]] = []
     allow_added = False
     deny_added = False
+    fresh_proof = False
     try:
         if not before.ufw_allow_indices:
             attempted.append(("UFW frontend allow", allow_comment))
@@ -454,7 +740,7 @@ def apply_remote_exit_network(
             )
             allow_added = True
 
-        after_allow = _inspect_ufw(ssh, profile)
+        after_allow = _inspect_ufw(ssh, profile, ssh_port=ssh_port)
         if not after_allow.allow_indices:
             raise VerificationError("UFW не подтвердил managed frontend allow rule")
         if not after_allow.deny_indices:
@@ -480,23 +766,93 @@ def apply_remote_exit_network(
             )
             deny_added = True
 
-        verified = _inspect_ufw(ssh, profile)
+        verified = _inspect_ufw(ssh, profile, ssh_port=ssh_port)
         if not verified.allow_indices or not verified.deny_indices:
             raise VerificationError("UFW не подтвердил обе managed rules")
         if allow_added or deny_added:
-            # This is intentionally a new SSH command after the firewall mutation.
-            _require_remote_root(ssh)
-    except Exception as original:
+            # The main mux remains available for rollback, while this proof must
+            # use a genuinely new TCP/SSH connection through the changed rules.
+            fresh_proof = True
+            _require_remote_root(ssh, fresh=True)
+            fresh_proof = False
+    except BaseException as original:
+        recovery = _validated_recovery(
+            RemoteExitNetworkRecovery(profile, ssh_port, tuple(attempted))
+        )
+        if not attempted:
+            # The validated baseline pair was already present and this call did
+            # not issue a mutation.  A broken scoped session cannot prove that
+            # baseline again, but opening a recovery session would be wrong:
+            # an empty journal reconciles to guard-only and would reject the
+            # pre-existing pair that this call deliberately did not own.
+            raise
+        if fresh_proof:
+            try:
+                _rollback_actions(
+                    ssh,
+                    profile,
+                    attempted,
+                    ssh_port=ssh_port,
+                )
+                _require_pair_state(
+                    ssh,
+                    profile,
+                    ssh_port=ssh_port,
+                    pair_present=baseline_pair_present,
+                )
+            except SSHTransportError as rollback_error:
+                if not isinstance(original, Exception):
+                    original.add_note(
+                        "Remote UFW rollback после прерывания не подтверждён"
+                    )
+                    raise original from None
+                raise RemoteExitNetworkError(recovery=recovery) from rollback_error
+            except Exception as rollback_error:
+                if not isinstance(original, Exception):
+                    original.add_note(
+                        "Remote UFW rollback после прерывания не подтверждён"
+                    )
+                    raise original from None
+                raise InstallerError(
+                    "Remote UFW fresh proof не удался, rollback неполон"
+                ) from rollback_error
+            raise
+        if attempted and isinstance(original, SSHTransportError):
+            raise RemoteExitNetworkError(recovery=recovery) from original
         try:
-            _rollback_actions(ssh, profile, attempted)
+            _rollback_actions(
+                ssh,
+                profile,
+                attempted,
+                ssh_port=ssh_port,
+            )
+            _require_pair_state(
+                ssh,
+                profile,
+                ssh_port=ssh_port,
+                pair_present=baseline_pair_present,
+            )
+        except SSHTransportError:
+            if not isinstance(original, Exception):
+                original.add_note(
+                    "Remote UFW rollback после прерывания не подтверждён"
+                )
+                raise original from None
+            raise RemoteExitNetworkError(recovery=recovery) from original
         except Exception as rollback_error:
+            if not isinstance(original, Exception):
+                original.add_note(
+                    "Remote UFW rollback после прерывания не подтверждён"
+                )
+                raise original from None
             raise InstallerError(
                 "Remote UFW apply не удался, rollback неполон"
             ) from rollback_error
-        raise original
+        raise
 
     return RemoteExitNetworkApplyResult(
         profile=profile,
+        ssh_port=ssh_port,
         allow_comment=allow_comment,
         deny_comment=deny_comment,
         ufw_allow_added=allow_added,
@@ -505,25 +861,27 @@ def apply_remote_exit_network(
 
 
 def rollback_remote_exit_network(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     result: RemoteExitNetworkApplyResult,
 ) -> RemoteExitNetworkRollbackResult:
     """Remove only rules that the successful ``apply`` call reported as added."""
 
-    profile = result.profile.validate()
-    if result.allow_comment != _allow_comment(
-        profile
-    ) or result.deny_comment != _deny_comment(profile):
-        raise ValidationError("Remote network result содержит чужие managed comments")
+    recovery = recovery_for_remote_exit_network(result)
     _require_remote_root(ssh)
-    comments: list[tuple[str, str]] = []
-    if result.ufw_allow_added:
-        comments.append(("UFW frontend allow", result.allow_comment))
-    if result.ufw_deny_added:
-        comments.append(("UFW backend deny", result.deny_comment))
-    allow_removed, deny_removed = _rollback_actions(ssh, profile, comments)
-    if comments:
-        _require_remote_root(ssh)
+    allow_removed, deny_removed = _rollback_actions(
+        ssh,
+        recovery.profile,
+        recovery.attempted_comments,
+        ssh_port=recovery.ssh_port,
+    )
+    _require_pair_state(
+        ssh,
+        recovery.profile,
+        ssh_port=recovery.ssh_port,
+        pair_present=not result.ufw_allow_added,
+    )
+    if recovery.attempted_comments:
+        _require_remote_root(ssh, fresh=True)
     return RemoteExitNetworkRollbackResult(
         ufw_allow_removed=allow_removed,
         ufw_deny_removed=deny_removed,

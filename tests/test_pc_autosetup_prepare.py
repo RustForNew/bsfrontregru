@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -11,7 +13,7 @@ from xhttp_setup.front_discovery import FrontTLSDiscovery
 from xhttp_setup.ispmanager import ISPmanagerAuthenticationError, SiteInfo
 from xhttp_setup.models import ExitDesired, Handoff, TLS_MODE_PUBLIC
 from xhttp_setup.pc_autosetup import PcExitResume, PcUserInputs, prepare_pc_install
-from xhttp_setup.ssh_transport import SSHAuthenticationError
+from xhttp_setup.ssh_transport import SFTPTransportError, SSHAuthenticationError
 
 
 EXIT_PASSWORD = "exit-secret-for-test"
@@ -21,8 +23,20 @@ FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
 def completed(argv, returncode=0, stdout="", stderr=""):
-    return subprocess.CompletedProcess(
-        argv, returncode, stdout=stdout, stderr=stderr
+    return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+
+
+def successful_docroot_probe(commands, *, start="/home/u1234567"):
+    if len(commands) != 3 or commands[0] != "pwd" or commands[2] != "pwd":
+        raise AssertionError(commands)
+    operation, target = shlex.split(commands[1])
+    if operation != "cd":
+        raise AssertionError(commands)
+    return completed(
+        commands,
+        stdout=(
+            f"Remote working directory: {start}\nRemote working directory: {target}\n"
+        ),
     )
 
 
@@ -41,6 +55,19 @@ def inputs() -> PcUserInputs:
 
 
 class FakeExitSSH:
+    def __init__(self, events=None):
+        self.events = events
+
+    @contextlib.contextmanager
+    def session(self):
+        if self.events is not None:
+            self.events.append("exit-session-open")
+        try:
+            yield self
+        finally:
+            if self.events is not None:
+                self.events.append("exit-session-close")
+
     def command(self, argv, *, check=True, timeout=300):
         del check, timeout
         if argv == ["id", "-u"]:
@@ -58,7 +85,7 @@ class SuccessfulSFTP:
     def batch(self, commands, *, check=True):
         del check
         self.events.append("sftp")
-        return completed(commands)
+        return successful_docroot_probe(commands)
 
 
 class PcPrepareTests(unittest.TestCase):
@@ -83,7 +110,16 @@ class PcPrepareTests(unittest.TestCase):
         sftp_factory = sftp_factory or (
             lambda **kwargs: SuccessfulSFTP(events=events, **kwargs)
         )
-        exit_ssh_factory = exit_ssh_factory or (lambda **_kwargs: FakeExitSSH())
+
+        def scoped_sftp_factory(**kwargs):
+            client = sftp_factory(**kwargs)
+            if not hasattr(client, "session"):
+                client.session = lambda: contextlib.nullcontext(client)
+            return client
+
+        exit_ssh_factory = exit_ssh_factory or (
+            lambda **_kwargs: FakeExitSSH(events=events)
+        )
 
         def inspect(**_kwargs):
             events.append("site")
@@ -132,10 +168,11 @@ class PcPrepareTests(unittest.TestCase):
                     (root / "front.known_hosts", FINGERPRINT),
                 ),
             ),
+            patch("xhttp_setup.pc_autosetup.SSHClient", side_effect=exit_ssh_factory),
             patch(
-                "xhttp_setup.pc_autosetup.SSHClient", side_effect=exit_ssh_factory
+                "xhttp_setup.pc_autosetup.SFTPClient",
+                side_effect=scoped_sftp_factory,
             ),
-            patch("xhttp_setup.pc_autosetup.SFTPClient", side_effect=sftp_factory),
             patch("xhttp_setup.pc_autosetup.inspect_site", side_effect=inspect),
             patch("xhttp_setup.front_discovery.resolve_front_dns", side_effect=dns),
             patch(
@@ -177,6 +214,20 @@ class PcPrepareTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             result, events, _ = self._run(Path(temp))
 
+        self.assertEqual(
+            [event for event in events if event.startswith("exit-session-")],
+            [
+                "exit-session-open",
+                "exit-session-close",
+                "exit-session-open",
+                "exit-session-close",
+            ],
+        )
+        first_close = events.index("exit-session-close")
+        second_open = events.index("exit-session-open", first_close + 1)
+        for frontend_preflight in ("site", "dns", "sftp", "tls"):
+            self.assertGreater(events.index(frontend_preflight), first_close)
+            self.assertLess(events.index(frontend_preflight), second_open)
         mutation = events.index("prepare-exit")
         for read_only in ("site", "dns", "sftp", "tls"):
             self.assertLess(events.index(read_only), mutation)
@@ -219,15 +270,20 @@ class PcPrepareTests(unittest.TestCase):
 
         class ConditionalSFTP:
             def __init__(self, *, auth, **_kwargs):
+                self.auth = auth
                 auths.append(auth)
+
+            @contextlib.contextmanager
+            def session(self):
+                if self.auth.password == PANEL_PASSWORD:
+                    raise SSHAuthenticationError(
+                        "operator@sftp.example: Permission denied (password)."
+                    )
+                yield self
 
             def batch(self, commands, *, check=True):
                 del check
-                if len(auths) == 1:
-                    raise SSHAuthenticationError(
-                        "SFTP SSH-аутентификация не удалась: Permission denied"
-                    )
-                return completed(commands)
+                return successful_docroot_probe(commands)
 
         prompt = Mock(return_value=SFTP_PASSWORD)
         with tempfile.TemporaryDirectory() as temp:
@@ -256,7 +312,7 @@ class PcPrepareTests(unittest.TestCase):
 
         prompt = Mock(return_value=SFTP_PASSWORD)
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(InstallerError, "доступ к сайту"):
+            with self.assertRaisesRegex(InstallerError, "doc(?:ument )?root"):
                 self._run(
                     Path(temp),
                     sftp_factory=DeniedDirectorySFTP,
@@ -264,18 +320,289 @@ class PcPrepareTests(unittest.TestCase):
                 )
         prompt.assert_not_called()
 
+    def test_user_rooted_ispmanager_docroot_resolves_against_sftp_start_dir(self):
+        calls = []
+        session_events = []
+        api_docroot = "/front.example.org"
+        sftp_home = "/var/www/u1234567/data"
+        resolved_docroot = f"{sftp_home}{api_docroot}"
+
+        class UserRootedSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            @contextlib.contextmanager
+            def session(self):
+                session_events.append("open")
+                try:
+                    yield self
+                finally:
+                    session_events.append("close")
+
+            def batch(self, commands, *, check=True):
+                del check
+                calls.append(commands)
+                if commands == ["pwd", f'cd "{api_docroot}"', "pwd"]:
+                    return completed(
+                        commands,
+                        returncode=1,
+                        stdout=f"Remote working directory: {sftp_home}\n",
+                        stderr="stat remote: No such file or directory\n",
+                    )
+                if commands == [f'cd "{resolved_docroot}"', "pwd"]:
+                    return completed(
+                        commands,
+                        stdout=f"Remote working directory: {resolved_docroot}\n",
+                    )
+                raise AssertionError(commands)
+
+        site = SiteInfo(name="front.example.org", docroot=api_docroot, ipaddr=None)
+        with tempfile.TemporaryDirectory() as temp:
+            result, _, _ = self._run(
+                Path(temp),
+                sftp_factory=UserRootedSFTP,
+                inspect_sequence=(site,),
+            )
+
+        self.assertEqual(result.desired_front.document_root, resolved_docroot)
+        self.assertEqual(session_events, ["open", "close"])
+        self.assertEqual(
+            calls,
+            [
+                ["pwd", f'cd "{api_docroot}"', "pwd"],
+                [f'cd "{resolved_docroot}"', "pwd"],
+            ],
+        )
+
+    def test_exact_docroot_uses_canonical_pwd_returned_by_sftp(self):
+        api_docroot = "/var/www/sites/front.example.org-link"
+        canonical_docroot = "/srv/hosting/front.example.org"
+
+        class CanonicalSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                del check
+                return completed(
+                    commands,
+                    stdout=(
+                        "Remote working directory: /home/u1234567\n"
+                        f"Remote working directory: {canonical_docroot}\n"
+                    ),
+                )
+
+        site = SiteInfo(name="front.example.org", docroot=api_docroot, ipaddr=None)
+        with tempfile.TemporaryDirectory() as temp:
+            result, _, _ = self._run(
+                Path(temp),
+                sftp_factory=CanonicalSFTP,
+                inspect_sequence=(site,),
+            )
+
+        self.assertEqual(result.desired_front.document_root, canonical_docroot)
+
+    def test_user_rooted_docroot_requires_one_safe_sftp_pwd(self):
+        class AmbiguousPwdSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                del check
+                return completed(
+                    commands,
+                    returncode=1,
+                    stdout=(
+                        "Remote working directory: /var/www/one\n"
+                        "Remote working directory: /var/www/two\n"
+                    ),
+                    stderr="stat remote: No such file or directory\n",
+                )
+
+        site = SiteInfo(
+            name="front.example.org",
+            docroot="/sites/front.example.org",
+            ipaddr=None,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(VerificationError, "однознач"):
+                self._run(
+                    Path(temp),
+                    sftp_factory=AmbiguousPwdSFTP,
+                    inspect_sequence=(site,),
+                )
+
+    def test_user_rooted_docroot_rejects_target_outside_sftp_start_dir(self):
+        calls = 0
+
+        class EscapingSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                nonlocal calls
+                del check
+                calls += 1
+                if calls == 1:
+                    return completed(
+                        commands,
+                        returncode=1,
+                        stdout="Remote working directory: /var/www/u/data\n",
+                        stderr="stat remote: No such file or directory\n",
+                    )
+                return completed(
+                    commands,
+                    stdout="Remote working directory: /srv/other-site\n",
+                )
+
+        site = SiteInfo("front.example.org", "/front.example.org", None)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(VerificationError, "вышел"):
+                self._run(
+                    Path(temp),
+                    sftp_factory=EscapingSFTP,
+                    inspect_sequence=(site,),
+                )
+        self.assertEqual(calls, 2)
+
+    def test_chroot_root_pwd_is_valid_but_gives_no_second_interpretation(self):
+        calls = 0
+
+        class RootedSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                nonlocal calls
+                del check
+                calls += 1
+                return completed(
+                    commands,
+                    returncode=1,
+                    stdout="Remote working directory: /\n",
+                    stderr="stat remote: No such file or directory\n",
+                )
+
+        site = SiteInfo("front.example.org", "/front.example.org", None)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(VerificationError, "сопоставить"):
+                self._run(
+                    Path(temp),
+                    sftp_factory=RootedSFTP,
+                    inspect_sequence=(site,),
+                )
+        self.assertEqual(calls, 1)
+
+    def test_mixed_missing_path_diagnostic_does_not_authorize_fallback(self):
+        calls = []
+
+        class MixedFailureSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                del check
+                calls.append(commands)
+                return completed(
+                    commands,
+                    returncode=1,
+                    stdout="Remote working directory: /var/www/u/data\n",
+                    stderr=(
+                        "stat remote: No such file or directory\nPermission denied\n"
+                    ),
+                )
+
+        site = SiteInfo("front.example.org", "/front.example.org", None)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(VerificationError, "недоступен"):
+                self._run(
+                    Path(temp),
+                    sftp_factory=MixedFailureSFTP,
+                    inspect_sequence=(site,),
+                )
+        self.assertEqual(len(calls), 1)
+
+    def test_post_auth_fallback_failure_never_reprompts_password(self):
+        calls = 0
+
+        class ChangedTransportSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                nonlocal calls
+                del check
+                calls += 1
+                if calls == 1:
+                    return completed(
+                        commands,
+                        returncode=1,
+                        stdout="Remote working directory: /var/www/u/data\n",
+                        stderr="stat remote: No such file or directory\n",
+                    )
+                raise SFTPTransportError("accepted session transport changed")
+
+        prompt = Mock(return_value=SFTP_PASSWORD)
+        site = SiteInfo("front.example.org", "/front.example.org", None)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(
+                SFTPTransportError, "accepted session transport changed"
+            ):
+                self._run(
+                    Path(temp),
+                    sftp_factory=ChangedTransportSFTP,
+                    inspect_sequence=(site,),
+                    password_prompt=prompt,
+                )
+        prompt.assert_not_called()
+        self.assertEqual(calls, 2)
+
+    def test_session_cleanup_failure_after_auth_never_reprompts_password(self):
+        class CleanupFailureSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            @contextlib.contextmanager
+            def session(self):
+                yield self
+                raise InstallerError("authenticated SFTP cleanup failed")
+
+            def batch(self, commands, *, check=True):
+                del check
+                return successful_docroot_probe(commands)
+
+        prompt = Mock(return_value=SFTP_PASSWORD)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(
+                InstallerError, "authenticated SFTP cleanup failed"
+            ):
+                self._run(
+                    Path(temp),
+                    sftp_factory=CleanupFailureSFTP,
+                    password_prompt=prompt,
+                )
+
+        prompt.assert_not_called()
+
     def test_mistyped_separate_sftp_password_gets_one_bounded_retry(self):
         auths = []
 
         class RetrySFTP:
             def __init__(self, *, auth, **_kwargs):
+                self.auth = auth
                 auths.append(auth)
+
+            @contextlib.contextmanager
+            def session(self):
+                if self.auth.password != SFTP_PASSWORD:
+                    raise SSHAuthenticationError(
+                        "operator@sftp.example: Permission denied (password)."
+                    )
+                yield self
 
             def batch(self, commands, *, check=True):
                 del check
-                if auths[-1].password != SFTP_PASSWORD:
-                    raise SSHAuthenticationError("Permission denied")
-                return completed(commands)
+                return successful_docroot_probe(commands)
 
         prompt = Mock(side_effect=("mistyped-sftp-password", SFTP_PASSWORD))
         with tempfile.TemporaryDirectory() as temp:
@@ -329,6 +656,7 @@ class PcPrepareTests(unittest.TestCase):
 
         class AuthAwareExitSSH(FakeExitSSH):
             def __init__(self, auth):
+                super().__init__()
                 self.auth = auth
 
             def command(self, argv, *, check=True, timeout=300):
@@ -355,6 +683,34 @@ class PcPrepareTests(unittest.TestCase):
         )
         self.assertEqual(result.exit_auth.password, "corrected-exit-password")
 
+    def test_main_session_auth_failure_never_reprompts_exit_password(self):
+        class MainSessionAuthFailure(FakeExitSSH):
+            def __init__(self):
+                super().__init__()
+                self.session_calls = 0
+
+            @contextlib.contextmanager
+            def session(self):
+                self.session_calls += 1
+                if self.session_calls == 2:
+                    raise SSHAuthenticationError("main SSH transport unavailable")
+                yield self
+
+        prompt = Mock(return_value="unused-corrected-exit-password")
+        exit_client = MainSessionAuthFailure()
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(
+                SSHAuthenticationError, "main SSH transport unavailable"
+            ):
+                self._run(
+                    Path(temp),
+                    exit_password_prompt=prompt,
+                    exit_ssh_factory=lambda **_kwargs: exit_client,
+                )
+
+        self.assertEqual(exit_client.session_calls, 2)
+        prompt.assert_not_called()
+
     def test_wrong_panel_password_reprompts_without_repeating_other_fields(self):
         site = SiteInfo(
             name="front.example.org",
@@ -369,7 +725,7 @@ class PcPrepareTests(unittest.TestCase):
 
             def batch(self, commands, *, check=True):
                 del check
-                return completed(commands)
+                return successful_docroot_probe(commands)
 
         prompt = Mock(return_value="corrected-panel-password")
         with tempfile.TemporaryDirectory() as temp:
@@ -411,9 +767,7 @@ class PcPrepareTests(unittest.TestCase):
             expected_egress_ip="8.8.8.8",
         ).validate()
         with tempfile.TemporaryDirectory() as temp:
-            result, events, prepare = self._run(
-                Path(temp), pending_desired=desired
-            )
+            result, events, prepare = self._run(Path(temp), pending_desired=desired)
 
         self.assertTrue(result.pending_exit_recovery)
         self.assertIsNone(result.existing_handoff)

@@ -84,11 +84,15 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             os.fsync(stream.fileno())
         os.chmod(temp_path, mode)
         os.replace(temp_path, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Directory handles cannot be opened through ``os.open`` on Windows.
+        # The installer mutates remote state only on POSIX/WSL, where the
+        # directory fsync remains part of the crash-consistency contract.
+        if os.name == "posix":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temp_path.unlink(missing_ok=True)
 

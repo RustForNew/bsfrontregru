@@ -63,6 +63,15 @@ class MemorySFTP:
         self.files = dict(files or {})
         self.after_command = after_command
         self.commands = []
+        self.session_events = []
+
+    @contextlib.contextmanager
+    def session(self):
+        self.session_events.append("open")
+        try:
+            yield self
+        finally:
+            self.session_events.append("close")
 
     def batch(self, commands, check=True):
         self.commands.extend(commands)
@@ -246,7 +255,7 @@ class FrontPostApplyTests(unittest.TestCase):
             with (
                 patch("xhttp_setup.front.check_front_dns"),
                 patch("xhttp_setup.front.check_public_tls"),
-                patch("xhttp_setup.front.pin_host_key"),
+                patch("xhttp_setup.front.pin_host_key") as pin,
                 patch("xhttp_setup.front.https_status", side_effect=(200, 200, 404)),
                 patch("xhttp_setup.front.SFTPClient", return_value=client),
                 patch(
@@ -259,12 +268,18 @@ class FrontPostApplyTests(unittest.TestCase):
                         desired_front(),
                         auth=SSHAuth("password", password="not-logged"),
                         state_dir=state_dir,
+                        trusted_known_hosts=state_dir / "persistent-sftp.known_hosts",
                         post_apply=lambda _: (_ for _ in ()).throw(
                             VerificationError("profile failed")
                         ),
                     )
 
         self.assertEqual(client.files, {})
+        self.assertEqual(client.session_events, ["open", "close"])
+        self.assertEqual(
+            pin.call_args.kwargs["trusted_known_hosts"],
+            Path(temp) / "persistent-sftp.known_hosts",
+        )
 
     def test_post_apply_failure_restores_exact_index_and_htaccess(self):
         original = {

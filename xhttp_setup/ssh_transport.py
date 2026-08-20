@@ -7,18 +7,21 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 from .errors import InstallerError, VerificationError
-from .osutil import atomic_write_text, ensure_dir, run
+from .osutil import ensure_dir, run
 from .validate import (
     validate_fingerprint,
     validate_host,
@@ -29,6 +32,8 @@ from .validate import (
 
 _MAX_SSH_INPUT_BYTES = 4096
 _MAX_KNOWN_HOSTS_BYTES = 16 * 1024
+_HOST_KEY_SCAN_ATTEMPTS = 3
+_HOST_KEY_SCAN_RETRY_SECONDS = 0.5
 _HOST_KEY_PREFERENCE = (
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",
@@ -37,12 +42,41 @@ _HOST_KEY_PREFERENCE = (
     "ssh-rsa",
 )
 _SSH_PERMISSION_DENIED = re.compile(
-    r"(?:^|:\s)Permission denied(?:\s+\([^()\r\n]+\))?\.?$"
+    r"^[A-Za-z0-9._-]+@[^ \r\n]+: "
+    r"Permission denied(?:\s+\([^()\r\n]+\))?\.?$"
+)
+_SSH_SAFE_TRANSPORT_DIAGNOSTIC = re.compile(
+    r"^(?:"
+    r"ssh: connect to host [A-Za-z0-9._:%\[\]-]+ port \d+: "
+    r"(?:Connection refused|Connection timed out|No route to host|"
+    r"Network is unreachable|Operation timed out)"
+    r"|Connection to [A-Za-z0-9._:%\[\]-]+ port \d+ timed out"
+    r"|Connection (?:closed|reset) by [A-Za-z0-9._:%\[\]-]+ port \d+"
+    r"|Control socket connect\([^\r\n)]{1,300}\): "
+    r"(?:Connection refused|No such file or directory|Permission denied)"
+    r"|Control socket connect failed: "
+    r"(?:Connection refused|No such file or directory|Permission denied)"
+    r"|mux_client_[a-z_]+: (?:master is dead|read from master failed: Broken pipe|"
+    r"write packet: Broken pipe)"
+    r"|client_loop: send disconnect: Broken pipe"
+    r"|Host key verification failed\."
+    r"|kex_exchange_identification: Connection closed by remote host"
+    r"|channel \d+: open failed: connect failed: "
+    r"(?:Connection refused|Connection timed out|No route to host)"
+    r")$"
 )
 
 
 class SSHAuthenticationError(InstallerError):
     """The remote endpoint was reached but rejected the supplied credential."""
+
+
+class SFTPTransportError(InstallerError):
+    """The pinned SFTP SSH transport failed independently of file commands."""
+
+
+class SSHTransportError(InstallerError):
+    """The pinned command SSH transport failed independently of a command."""
 
 
 @dataclass(frozen=True)
@@ -167,6 +201,176 @@ def _last_process_line(
     lines = (result.stderr or result.stdout).strip().splitlines()
     detail = lines[-1] if lines else f"код {result.returncode}"
     return _redact_input_text(detail, input_text)
+
+
+def _bounded_process_tail(
+    value: str,
+    *,
+    secret: str | None = None,
+    secrets: tuple[str | None, ...] = (),
+) -> str:
+    """Return a small redacted diagnostic tail without losing the route error."""
+
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    detail = " | ".join(lines[-4:]) if lines else "диагностика отсутствует"
+    detail = detail[-800:]
+    for value_to_redact in (secret, *secrets):
+        detail = _redact_input_text(detail, value_to_redact)
+    return detail
+
+
+def _permission_denied_detail(value: str) -> str | None:
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return next(
+        (line for line in reversed(lines) if _SSH_PERMISSION_DENIED.search(line)),
+        None,
+    )
+
+
+def _safe_ssh_transport_tail(
+    value: str, *, secrets: tuple[str | None, ...] = ()
+) -> str:
+    """Keep only known OpenSSH transport lines from ambiguous rc=255 stderr."""
+
+    safe_categories: list[str] = []
+    category_markers = (
+        ("Connection refused", "OpenSSH: Connection refused"),
+        ("No such file or directory", "OpenSSH: control socket отсутствует"),
+        ("Permission denied", "OpenSSH: control socket недоступен"),
+        ("No route to host", "OpenSSH: No route to host"),
+        ("Network is unreachable", "OpenSSH: Network is unreachable"),
+        ("Connection timed out", "OpenSSH: Connection timed out"),
+        ("Operation timed out", "OpenSSH: Operation timed out"),
+        (" timed out", "OpenSSH: Connection timed out"),
+        ("Connection reset", "OpenSSH: Connection reset"),
+        ("Connection closed", "OpenSSH: Connection closed"),
+        ("Broken pipe", "OpenSSH: Broken pipe"),
+        ("master is dead", "OpenSSH: master is dead"),
+        ("Host key verification failed", "OpenSSH: Host key verification failed"),
+    )
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not _SSH_SAFE_TRANSPORT_DIAGNOSTIC.fullmatch(line):
+            continue
+        category = next(
+            (label for marker, label in category_markers if marker in line),
+            "OpenSSH: безопасная transport-ошибка",
+        )
+        if category not in safe_categories:
+            safe_categories.append(category)
+    if not safe_categories:
+        return "OpenSSH вернул код 255 без безопасной transport-диагностики"
+    return _bounded_process_tail("\n".join(safe_categories), secrets=secrets)
+
+
+def _wait_for_control_master(
+    *,
+    master: subprocess.Popen[str],
+    control_path: Path,
+    control_check_argv: list[str],
+    auth: SSHAuth,
+    transport_error: type[InstallerError],
+    authentication_message: str,
+    transport_message: str,
+) -> None:
+    """Wait for one private OpenSSH master and validate its Unix socket."""
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        returncode = master.poll()
+        if returncode is not None:
+            stderr = master.stderr.read() if master.stderr is not None else ""
+            auth_detail = _permission_denied_detail(stderr)
+            if auth_detail is not None:
+                auth_detail = _redact_input_text(auth_detail, auth.password)
+                raise SSHAuthenticationError(
+                    f"{authentication_message}: {auth_detail}"
+                )
+            detail = _bounded_process_tail(stderr or f"код {returncode}", secret=auth.password)
+            raise transport_error(f"{transport_message}: {detail}")
+        try:
+            check = subprocess.run(
+                control_check_argv,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_without_askpass_env(),
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            detail = _bounded_process_tail(str(exc), secret=auth.password)
+            raise transport_error(
+                f"Не удалось проверить временный SSH transport: {detail}"
+            ) from exc
+        if check.returncode == 0:
+            try:
+                metadata = control_path.lstat()
+            except OSError as exc:
+                raise transport_error(
+                    f"SSH сообщил готовность, но control socket недоступен: {exc}"
+                ) from exc
+            if not stat.S_ISSOCK(metadata.st_mode):
+                raise transport_error("SSH ControlPath не является Unix socket")
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                raise transport_error(
+                    "Небезопасные владелец или права SSH ControlPath"
+                )
+            return
+        time.sleep(0.05)
+    raise transport_error(f"{transport_message} за 20 секунд")
+
+
+def _stop_control_master(
+    master: subprocess.Popen[str], control_exit_argv: list[str]
+) -> None:
+    """Stop one process group; raise rather than unlink an unkillable socket."""
+
+    if master.poll() is None:
+        try:
+            subprocess.run(
+                control_exit_argv,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_without_askpass_env(),
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        master.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(master.pid, signal.SIGTERM)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        try:
+            master.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        master.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(master.pid, signal.SIGKILL)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        try:
+            master.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        master.wait(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise InstallerError(
+            f"Не удалось завершить временный SSH master pid={master.pid}"
+        ) from exc
 
 
 def _validate_input_text(input_text: str | None) -> str | None:
@@ -382,54 +586,62 @@ def _scan_host_keys(
     normalized_route = route.validate() if route is not None else None
     scan_host = normalized_route.scan.connect_host if normalized_route else host
     scan_port = normalized_route.scan.connect_port if normalized_route else port
-    scan = run(
-        [
-            "ssh-keyscan",
-            "-T",
-            "10",
-            "-p",
-            str(scan_port),
-            "-t",
-            "ed25519,ecdsa,rsa",
-            scan_host,
-        ],
-        check=False,
-        timeout=20,
-    )
-    by_type: dict[str, set[str]] = {}
-    for raw_line in scan.stdout.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        observed = _parse_host_key_fields(
-            line, host=scan_host, port=scan_port, source="ssh-keyscan"
+    for attempt in range(_HOST_KEY_SCAN_ATTEMPTS):
+        scan = run(
+            [
+                "ssh-keyscan",
+                "-T",
+                "10",
+                "-p",
+                str(scan_port),
+                "-t",
+                "ed25519,ecdsa,rsa",
+                scan_host,
+            ],
+            check=False,
+            timeout=20,
         )
-        by_type.setdefault(observed.key_type, set()).add(observed.key_blob)
-    if not by_type:
-        raise VerificationError(
-            f"ssh-keyscan не получил SSH host key от {host}:{port}"
+        by_type: dict[str, set[str]] = {}
+        for raw_line in scan.stdout.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            observed = _parse_host_key_fields(
+                line, host=scan_host, port=scan_port, source="ssh-keyscan"
+            )
+            by_type.setdefault(observed.key_type, set()).add(observed.key_blob)
+        if not by_type:
+            if attempt + 1 < _HOST_KEY_SCAN_ATTEMPTS:
+                time.sleep(_HOST_KEY_SCAN_RETRY_SECONDS)
+                continue
+            raise VerificationError(
+                f"ssh-keyscan не получил SSH host key от {host}:{port} "
+                f"после {_HOST_KEY_SCAN_ATTEMPTS} попыток"
+            )
+        ambiguous = sorted(
+            key_type for key_type, keys in by_type.items() if len(keys) != 1
         )
-    ambiguous = sorted(key_type for key_type, keys in by_type.items() if len(keys) != 1)
-    if ambiguous:
-        raise VerificationError(
-            "ssh-keyscan получил несколько разных ключей одного типа: "
-            + ", ".join(ambiguous)
-        )
+        if ambiguous:
+            raise VerificationError(
+                "ssh-keyscan получил несколько разных ключей одного типа: "
+                + ", ".join(ambiguous)
+            )
 
-    canonical: dict[str, str] = {}
-    for key_type in _HOST_KEY_PREFERENCE:
-        keys = by_type.get(key_type)
-        if not keys:
-            continue
-        observed = _ObservedHostKey(key_type=key_type, key_blob=next(iter(keys)))
-        canonical[key_type] = _canonical_host_key_line(
-            host=host, port=port, observed=observed
-        )
-    if not canonical:
-        raise VerificationError(
-            f"ssh-keyscan не получил поддерживаемый SSH host key от {host}:{port}"
-        )
-    return canonical
+        canonical: dict[str, str] = {}
+        for key_type in _HOST_KEY_PREFERENCE:
+            keys = by_type.get(key_type)
+            if not keys:
+                continue
+            observed = _ObservedHostKey(key_type=key_type, key_blob=next(iter(keys)))
+            canonical[key_type] = _canonical_host_key_line(
+                host=host, port=port, observed=observed
+            )
+        if not canonical:
+            raise VerificationError(
+                f"ssh-keyscan не получил поддерживаемый SSH host key от {host}:{port}"
+            )
+        return canonical
+    raise AssertionError("unreachable host-key scan loop")
 
 
 def _atomic_create_trust(path: Path, content: str) -> None:
@@ -467,11 +679,14 @@ def _atomic_create_trust(path: Path, content: str) -> None:
 def trust_host_key_tofu(
     *, host: str, port: int, trust_dir: Path, route: SSHRoute | None = None
 ) -> tuple[Path, str]:
-    """Trust the first network-observed key, then reject every key change.
+    """Trust the first network-observed key and reuse that endpoint decision.
 
     This is endpoint-scoped TOFU, not independent host authentication: the first
-    key is obtained from the network before SSH authentication.  Later calls scan
-    again and require an exact match with the private, persistent trust file.
+    key is obtained from the network before SSH authentication.  Later calls
+    return the private, persistent trust decision without relying on another
+    unauthenticated keyscan.  Every caller must immediately make a real
+    StrictHostKeyChecking connection with the returned file; that authenticated
+    transport is what rejects a later network key change.
     """
     normalized_host = validate_host(host)
     normalized_port = validate_port(port)
@@ -483,18 +698,13 @@ def trust_host_key_tofu(
     existing = _read_existing_trust(
         known_hosts, host=normalized_host, port=normalized_port
     )
+    if existing is not None:
+        _, existing_fingerprint = existing
+        return known_hosts, existing_fingerprint
+
     observed = _scan_host_keys(
         host=normalized_host, port=normalized_port, route=route
     )
-    if existing is not None:
-        existing_line, existing_fingerprint = existing
-        if existing_line not in observed.values():
-            raise VerificationError(
-                f"SSH host key {normalized_host}:{normalized_port} изменился; "
-                f"trust-файл {known_hosts} оставлен без изменений"
-            )
-        return known_hosts, existing_fingerprint
-
     observed_line = next(
         observed[key_type]
         for key_type in _HOST_KEY_PREFERENCE
@@ -514,11 +724,57 @@ def pin_host_key(
     expected_sha256: str,
     known_hosts: Path,
     route: SSHRoute | None = None,
+    trusted_known_hosts: Path | None = None,
 ) -> None:
-    """Fetch keys, retain only the line matching an independently supplied fingerprint."""
+    """Create one exact endpoint pin from trusted state or a first-use scan.
+
+    Existing private trust is preferred over a redundant unauthenticated
+    ``ssh-keyscan``.  The caller must immediately use the resulting file with
+    ``StrictHostKeyChecking=yes`` so the real SSH handshake proves that the
+    endpoint still presents the pinned key.
+    """
+    normalized_host = validate_host(host)
+    normalized_port = validate_port(port)
+    expected = validate_fingerprint(expected_sha256)
     ensure_dir(known_hosts.parent, 0o700)
+
+    existing = _read_existing_trust(
+        known_hosts, host=normalized_host, port=normalized_port
+    )
+    if existing is not None:
+        _, existing_fingerprint = existing
+        if existing_fingerprint != expected:
+            raise VerificationError(
+                f"Закреплённый SSH fingerprint {normalized_host}:{normalized_port} "
+                f"не совпал с ожидаемым; файл {known_hosts} оставлен без изменений"
+            )
+        return
+
+    if trusted_known_hosts is not None:
+        source = _read_existing_trust(
+            Path(trusted_known_hosts),
+            host=normalized_host,
+            port=normalized_port,
+        )
+        if source is None:
+            raise VerificationError(
+                f"Доверенный SSH trust-файл отсутствует: {trusted_known_hosts}"
+            )
+        trusted_line, trusted_fingerprint = source
+        if trusted_fingerprint != expected:
+            raise VerificationError(
+                f"Доверенный SSH fingerprint {normalized_host}:{normalized_port} "
+                "не совпал с ожидаемым"
+            )
+        _atomic_create_trust(known_hosts, trusted_line + "\n")
+        return
+
     candidates = list(
-        _scan_host_keys(host=host, port=port, route=route).values()
+        _scan_host_keys(
+            host=normalized_host,
+            port=normalized_port,
+            route=route,
+        ).values()
     )
     matches: list[str] = []
     observed: list[str] = []
@@ -529,22 +785,60 @@ def pin_host_key(
         parts = fingerprint.split()
         if len(parts) >= 2:
             observed.append(parts[1].rstrip("="))
-            if parts[1].rstrip("=") == expected_sha256.rstrip("="):
+            if parts[1].rstrip("=") == expected.rstrip("="):
                 matches.append(line)
     if not matches:
         detail = ", ".join(observed) if observed else "ключи не получены"
         raise VerificationError(
-            f"SSH fingerprint не совпал. Ожидался {expected_sha256}; получено: {detail}"
+            f"SSH fingerprint не совпал. Ожидался {expected}; получено: {detail}"
+        )
+    if len(matches) != 1:
+        raise VerificationError(
+            f"ssh-keyscan неоднозначно подтвердил fingerprint {normalized_host}:"
+            f"{normalized_port}"
         )
     content = "\n".join(matches) + "\n"
-    if known_hosts.exists():
-        existing = known_hosts.read_text("utf-8")
-        if content == existing:
-            return
-        raise VerificationError(
-            f"Закреплённый ключ {host}:{port} изменился; файл {known_hosts} оставлен без изменений"
+    _atomic_create_trust(known_hosts, content)
+
+
+class SFTPBatch(Protocol):
+    """Minimal batch executor shared by clients and authenticated sessions."""
+
+    def batch(
+        self, commands: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
+class SFTPSession:
+    """One explicitly scoped SFTP transport over one authenticated SSH master."""
+
+    __slots__ = ("_active", "_client", "_control_path")
+
+    def __init__(self, client: SFTPClient, control_path: Path) -> None:
+        self._client = client
+        self._control_path = control_path
+        self._active = True
+
+    def __repr__(self) -> str:
+        return (
+            f"SFTPSession(host={self._client.host!r}, port={self._client.port!r}, "
+            f"user={self._client.user!r}, active={self._active!r})"
         )
-    atomic_write_text(known_hosts, content, 0o600)
+
+    def batch(
+        self, commands: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        if not self._active:
+            raise InstallerError("SFTP session уже закрыта")
+        batch_text = "\n".join(commands) + "\n"
+        return self._client._batch_via_control(
+            batch_text,
+            control_path=self._control_path,
+            check=check,
+        )
+
+    def _close(self) -> None:
+        self._active = False
 
 
 class SFTPClient:
@@ -596,19 +890,7 @@ class SFTPClient:
             "-o",
             "NumberOfPasswordPrompts=1",
         ]
-        if self.auth.method == "key":
-            argv.extend(
-                [
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "IdentitiesOnly=yes",
-                    "-i",
-                    str(self.auth.private_key),
-                ]
-            )
-            argv.extend(self._route_argv())
-        elif control_path is not None:
+        if control_path is not None:
             argv.extend(
                 [
                     "-o",
@@ -631,6 +913,18 @@ class SFTPClient:
                     "GSSAPIAuthentication=no",
                 ]
             )
+        elif self.auth.method == "key":
+            argv.extend(
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-i",
+                    str(self.auth.private_key),
+                ]
+            )
+            argv.extend(self._route_argv())
         else:
             raise InstallerError(
                 "Password-auth SFTP требует предварительно аутентифицированный SSH transport"
@@ -639,7 +933,7 @@ class SFTPClient:
         return argv
 
     def _master_argv(self, control_path: Path) -> list[str]:
-        return [
+        argv = [
             "ssh",
             "-F",
             "/dev/null",
@@ -661,19 +955,44 @@ class SFTPClient:
             "ConnectTimeout=15",
             "-o",
             "NumberOfPasswordPrompts=1",
-            "-o",
-            "BatchMode=no",
-            "-o",
-            "PreferredAuthentications=password",
-            "-o",
-            "PubkeyAuthentication=no",
-            "-o",
-            "KbdInteractiveAuthentication=no",
-            "-o",
-            "ControlPersist=no",
-            *self._route_argv(),
-            self._destination(),
         ]
+        if self.auth.method == "key":
+            argv.extend(
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-i",
+                    str(self.auth.private_key),
+                ]
+            )
+        else:
+            argv.extend(
+                [
+                    "-o",
+                    "BatchMode=no",
+                    "-o",
+                    "PreferredAuthentications=password",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                ]
+            )
+        argv.extend(["-o", "ControlPersist=no", *self._route_argv()])
+        argv.append(self._destination())
+        return argv
 
     def _control_argv(self, control_path: Path, operation: str) -> list[str]:
         return [
@@ -694,96 +1013,18 @@ class SFTPClient:
     def _wait_for_master(
         self, master: subprocess.Popen[str], control_path: Path
     ) -> None:
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            returncode = master.poll()
-            if returncode is not None:
-                stderr = master.stderr.read() if master.stderr is not None else ""
-                lines = stderr.strip().splitlines()
-                detail = lines[-1] if lines else f"код {returncode}"
-                detail = _redact_input_text(detail, self.auth.password)
-                if _SSH_PERMISSION_DENIED.search(detail):
-                    raise SSHAuthenticationError(
-                        f"SFTP SSH-аутентификация не удалась: {detail}"
-                    )
-                raise InstallerError(f"SFTP SSH-аутентификация не удалась: {detail}")
-            try:
-                check = subprocess.run(
-                    self._control_argv(control_path, "check"),
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=_without_askpass_env(),
-                    timeout=2,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise InstallerError(
-                    f"Не удалось проверить временный SSH transport: {exc}"
-                ) from exc
-            if check.returncode == 0:
-                try:
-                    metadata = control_path.lstat()
-                except OSError as exc:
-                    raise InstallerError(
-                        f"SSH сообщил готовность, но control socket недоступен: {exc}"
-                    ) from exc
-                if not stat.S_ISSOCK(metadata.st_mode):
-                    raise InstallerError("SSH ControlPath не является Unix socket")
-                if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-                    raise InstallerError(
-                        "Небезопасные владелец или права SSH ControlPath"
-                    )
-                return
-            time.sleep(0.05)
-        raise InstallerError("SSH transport не стал готов за 20 секунд")
+        _wait_for_control_master(
+            master=master,
+            control_path=control_path,
+            control_check_argv=self._control_argv(control_path, "check"),
+            auth=self.auth,
+            transport_error=SFTPTransportError,
+            authentication_message="SFTP SSH-аутентификация не удалась",
+            transport_message="SFTP SSH-транспорт не установился",
+        )
 
     def _stop_master(self, master: subprocess.Popen[str], control_path: Path) -> None:
-        if master.poll() is None:
-            try:
-                subprocess.run(
-                    self._control_argv(control_path, "exit"),
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=_without_askpass_env(),
-                    timeout=5,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        try:
-            master.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(master.pid, signal.SIGTERM)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            try:
-                master.terminate()
-            except ProcessLookupError:
-                pass
-        try:
-            master.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(master.pid, signal.SIGKILL)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            try:
-                master.kill()
-            except ProcessLookupError:
-                pass
-        try:
-            master.wait(timeout=5)
-        except subprocess.TimeoutExpired as exc:
-            raise InstallerError(
-                f"Не удалось завершить временный SSH master pid={master.pid}"
-            ) from exc
+        _stop_control_master(master, self._control_argv(control_path, "exit"))
 
     def batch(
         self, commands: list[str], *, check: bool = True
@@ -793,47 +1034,217 @@ class SFTPClient:
             return run(self._argv(), input_text=batch_text, check=check, timeout=90)
         return self._batch_password(batch_text, check=check)
 
-    def _batch_password(
-        self, batch_text: str, *, check: bool
-    ) -> subprocess.CompletedProcess[str]:
-        with tempfile.TemporaryDirectory(prefix=".xhttp-mux-", dir="/tmp") as temp:
-            temp_dir = Path(temp)
-            os.chmod(temp_dir, 0o700)
-            control_path = temp_dir / "c"
-            master: subprocess.Popen[str] | None = None
+    @contextlib.contextmanager
+    def session(self) -> Iterator[SFTPSession]:
+        """Open one authenticated master for an explicit group of SFTP batches."""
+        temp_dir = Path(tempfile.mkdtemp(prefix=".xhttp-mux-", dir="/tmp"))
+        os.chmod(temp_dir, 0o700)
+        control_path = temp_dir / "c"
+        master: subprocess.Popen[str] | None = None
+        session: SFTPSession | None = None
+        master_stopped = False
+        body_exception: BaseException | None = None
+        try:
             try:
-                with _password_askpass(self.auth.password) as env:
+                if self.auth.method == "password":
+                    with _password_askpass(self.auth.password) as env:
+                        master = subprocess.Popen(
+                            self._master_argv(control_path),
+                            stdin=subprocess.DEVNULL,
+                            text=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            env=env,
+                            start_new_session=True,
+                        )
+                        self._wait_for_master(master, control_path)
+                else:
                     master = subprocess.Popen(
                         self._master_argv(control_path),
                         stdin=subprocess.DEVNULL,
                         text=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
-                        env=env,
+                        env=_without_askpass_env(),
                         start_new_session=True,
                     )
                     self._wait_for_master(master, control_path)
-                result = subprocess.run(
-                    self._argv(control_path=control_path),
-                    input=batch_text,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=_without_askpass_env(),
-                    timeout=90,
-                    check=False,
-                )
-                result = _redact_process_result(result, self.auth.password)
             except (OSError, subprocess.TimeoutExpired) as exc:
-                raise InstallerError(f"SFTP не запустился: {exc}") from exc
-            finally:
+                raise SFTPTransportError(f"SFTP не запустился: {exc}") from exc
+            session = SFTPSession(self, control_path)
+            yield session
+        except BaseException as exc:
+            body_exception = exc
+            raise
+        finally:
+            try:
+                if session is not None:
+                    session._close()
                 if master is not None:
                     self._stop_master(master, control_path)
+                    master_stopped = True
+                else:
+                    master_stopped = True
+                if master_stopped:
+                    shutil.rmtree(temp_dir)
+            except OSError as exc:
+                cleanup_error = InstallerError(
+                    f"Не удалось удалить временный SFTP transport: {exc}"
+                )
+                if body_exception is None:
+                    raise cleanup_error from exc
+                if hasattr(body_exception, "add_note"):
+                    body_exception.add_note(
+                        "Дополнительно не удалён временный SFTP transport"
+                    )
+            except BaseException:
+                if body_exception is None:
+                    raise
+                if hasattr(body_exception, "add_note"):
+                    body_exception.add_note(
+                        "Дополнительно не завершён временный SFTP SSH master"
+                    )
+
+    def _batch_via_control(
+        self,
+        batch_text: str,
+        *,
+        control_path: Path,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                self._argv(control_path=control_path),
+                input=batch_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_without_askpass_env(),
+                timeout=90,
+                check=False,
+            )
+            result = _redact_process_result(result, self.auth.password)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SFTPTransportError(f"SFTP transport не запустился: {exc}") from exc
+        if result.returncode == 255:
+            raise SFTPTransportError(
+                f"SFTP SSH-транспорт оборвался: {_last_process_line(result)}"
+            )
         if check and result.returncode != 0:
             raise InstallerError(
                 f"SFTP завершился с ошибкой: {_last_process_line(result)}"
             )
         return result
+
+    def _batch_password(
+        self, batch_text: str, *, check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        with self.session() as session:
+            return self._batch_via_control(
+                batch_text,
+                control_path=session._control_path,
+                check=check,
+            )
+
+
+class SSHCommand(Protocol):
+    """Command runner supporting both scoped and deliberately fresh transport."""
+
+    def command(
+        self,
+        remote_argv: list[str],
+        *,
+        check: bool = True,
+        timeout: int = 300,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+    def fresh_command(
+        self,
+        remote_argv: list[str],
+        *,
+        check: bool = True,
+        timeout: int = 300,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
+class SSHSession:
+    """One explicitly scoped command transport over a pinned SSH master."""
+
+    __slots__ = ("_active", "_broken", "_client", "_control_path", "_state_lock")
+
+    def __init__(self, client: SSHClient, control_path: Path) -> None:
+        self._client = client
+        self._control_path = control_path
+        self._active = True
+        self._broken = False
+        self._state_lock = threading.Lock()
+
+    def __repr__(self) -> str:
+        with self._state_lock:
+            active = self._active
+            broken = self._broken
+        return (
+            f"SSHSession(host={self._client.host!r}, port={self._client.port!r}, "
+            f"user={self._client.user!r}, active={active!r}, broken={broken!r})"
+        )
+
+    def _require_active(self, *, require_master: bool) -> None:
+        with self._state_lock:
+            if not self._active:
+                raise InstallerError("SSH session уже закрыта")
+            if require_master and self._broken:
+                raise SSHTransportError(
+                    "SSH session transport уже неисправен; автоматический повтор запрещён"
+                )
+
+    def _mark_broken(self) -> None:
+        with self._state_lock:
+            self._broken = True
+
+    def command(
+        self,
+        remote_argv: list[str],
+        *,
+        check: bool = True,
+        timeout: int = 300,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        self._require_active(require_master=True)
+        try:
+            return self._client._command_via_control(
+                remote_argv,
+                control_path=self._control_path,
+                check=check,
+                timeout=timeout,
+                input_text=input_text,
+            )
+        except SSHTransportError:
+            self._mark_broken()
+            raise
+
+    def fresh_command(
+        self,
+        remote_argv: list[str],
+        *,
+        check: bool = True,
+        timeout: int = 300,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Use a new pinned connection without replacing or repairing the master."""
+
+        self._require_active(require_master=False)
+        return self._client.fresh_command(
+            remote_argv,
+            check=check,
+            timeout=timeout,
+            input_text=input_text,
+        )
+
+    def _close(self) -> None:
+        with self._state_lock:
+            self._active = False
 
 
 class SSHClient:
@@ -854,12 +1265,110 @@ class SSHClient:
         self.known_hosts = known_hosts
         self.auth = auth.validate()
 
-    def _argv(self) -> list[str]:
+    def _destination(self) -> str:
+        destination_host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.user}@{destination_host}"
+
+    def _argv(self, *, control_path: Path | None = None) -> list[str]:
         argv = [
             "ssh",
             "-F",
             "/dev/null",
             "-T",
+            "-p",
+            str(self.port),
+            "-o",
+            f"UserKnownHostsFile={self.known_hosts}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "UpdateHostKeys=no",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "NumberOfPasswordPrompts=1",
+        ]
+        if control_path is not None:
+            argv.extend(
+                [
+                    "-o",
+                    "ControlMaster=no",
+                    "-o",
+                    f"ControlPath={control_path}",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ProxyCommand=/bin/false",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-o",
+                    "IdentityAgent=none",
+                ]
+            )
+        elif self.auth.method == "key":
+            argv.extend(
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-o",
+                    "IdentityAgent=none",
+                    "-i",
+                    str(self.auth.private_key),
+                ]
+            )
+        else:
+            argv.extend(
+                [
+                    "-o",
+                    "BatchMode=no",
+                    "-o",
+                    "PreferredAuthentications=password",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-o",
+                    "IdentityAgent=none",
+                ]
+            )
+        argv.append(self._destination())
+        return argv
+
+    def _master_argv(self, control_path: Path) -> list[str]:
+        argv = [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-N",
+            "-M",
+            "-S",
+            str(control_path),
             "-p",
             str(self.port),
             "-o",
@@ -881,7 +1390,19 @@ class SSHClient:
                     "-o",
                     "BatchMode=yes",
                     "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
                     "IdentitiesOnly=yes",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-o",
+                    "IdentityAgent=none",
                     "-i",
                     str(self.auth.private_key),
                 ]
@@ -897,11 +1418,129 @@ class SSHClient:
                     "PubkeyAuthentication=no",
                     "-o",
                     "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-o",
+                    "IdentityAgent=none",
                 ]
             )
-        destination_host = f"[{self.host}]" if ":" in self.host else self.host
-        argv.append(f"{self.user}@{destination_host}")
+        argv.extend(["-o", "ControlPersist=no", self._destination()])
         return argv
+
+    def _control_argv(self, control_path: Path, operation: str) -> list[str]:
+        return [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-S",
+            str(control_path),
+            "-O",
+            operation,
+            "-p",
+            str(self.port),
+            "-o",
+            "BatchMode=yes",
+            self._destination(),
+        ]
+
+    def _wait_for_master(
+        self, master: subprocess.Popen[str], control_path: Path
+    ) -> None:
+        _wait_for_control_master(
+            master=master,
+            control_path=control_path,
+            control_check_argv=self._control_argv(control_path, "check"),
+            auth=self.auth,
+            transport_error=SSHTransportError,
+            authentication_message="SSH-аутентификация не удалась",
+            transport_message="SSH-транспорт не установился",
+        )
+
+    def _stop_master(self, master: subprocess.Popen[str], control_path: Path) -> None:
+        _stop_control_master(master, self._control_argv(control_path, "exit"))
+
+    @staticmethod
+    def _command_text(remote_argv: list[str]) -> str:
+        if not remote_argv:
+            raise InstallerError("Пустая удалённая SSH-команда")
+        if any(
+            "\n" in value or "\r" in value or "\x00" in value for value in remote_argv
+        ):
+            raise InstallerError("Недопустимый перевод строки в SSH-команде")
+        return shlex.join(remote_argv)
+
+    def _run_command_argv(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        allow_auth_failure: bool,
+        check: bool,
+        timeout: int,
+        input_text: str | None,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            if input_text is None:
+                result = subprocess.run(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            else:
+                result = subprocess.run(
+                    argv,
+                    input=input_text,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                    timeout=timeout,
+                    check=False,
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                stderr = exc.stderr or ""
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
+                safe_tail = _safe_ssh_transport_tail(
+                    stderr,
+                    secrets=(self.auth.password, input_text),
+                )
+                detail = f"тайм-аут {timeout} секунд; {safe_tail}"
+            else:
+                detail = _bounded_process_tail(
+                    f"{type(exc).__name__}: {exc}",
+                    secrets=(self.auth.password, input_text),
+                )
+            raise SSHTransportError(f"SSH transport не запустился: {detail}") from None
+
+        result = _redact_process_result(result, self.auth.password, input_text)
+        if result.returncode == 255:
+            diagnostic = result.stderr
+            auth_detail = _permission_denied_detail(diagnostic)
+            if allow_auth_failure and auth_detail is not None:
+                raise SSHAuthenticationError(
+                    f"SSH-аутентификация не удалась: {auth_detail}"
+                )
+            raise SSHTransportError(
+                "SSH-транспорт оборвался: "
+                f"{_safe_ssh_transport_tail(diagnostic, secrets=(self.auth.password, input_text))}"
+            )
+        if check and result.returncode != 0:
+            raise InstallerError(
+                "SSH завершился с ошибкой: "
+                f"{_last_process_line(result, input_text=input_text)}"
+            )
+        return result
 
     def command(
         self,
@@ -911,98 +1550,135 @@ class SSHClient:
         timeout: int = 300,
         input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if not remote_argv:
-            raise InstallerError("Пустая удалённая SSH-команда")
-        if any(
-            "\n" in value or "\r" in value or "\x00" in value for value in remote_argv
-        ):
-            raise InstallerError("Недопустимый перевод строки в SSH-команде")
-        input_text = _validate_input_text(input_text)
-        command_text = shlex.join(remote_argv)
-        argv = self._argv() + [command_text]
-        if self.auth.method == "key":
-            if input_text is None:
-                return run(argv, check=check, timeout=timeout)
-            try:
-                result = run(
-                    argv,
-                    input_text=input_text,
-                    check=False,
-                    timeout=timeout,
-                )
-                result = _redact_process_result(result, input_text)
-            except InstallerError as exc:
-                detail = _redact_input_text(str(exc), input_text)
-                raise InstallerError(detail) from None
-            if check and result.returncode != 0:
-                raise InstallerError(
-                    "SSH завершился с ошибкой: "
-                    f"{_last_process_line(result, input_text=input_text)}"
-                )
-            return result
-        return self._command_password(
-            argv,
+        """Run one legacy, fresh pinned SSH connection."""
+
+        return self.fresh_command(
+            remote_argv,
             check=check,
             timeout=timeout,
             input_text=input_text,
         )
 
-    def _command_password(
+    def fresh_command(
         self,
-        argv: list[str],
+        remote_argv: list[str],
         *,
+        check: bool = True,
+        timeout: int = 300,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command_text = self._command_text(remote_argv)
+        input_text = _validate_input_text(input_text)
+        argv = self._argv() + [command_text]
+        if self.auth.method == "password":
+            with _password_askpass(self.auth.password) as env:
+                return self._run_command_argv(
+                    argv,
+                    env=env,
+                    allow_auth_failure=True,
+                    check=check,
+                    timeout=timeout,
+                    input_text=input_text,
+                )
+        return self._run_command_argv(
+            argv,
+            env=_without_askpass_env(),
+            allow_auth_failure=True,
+            check=check,
+            timeout=timeout,
+            input_text=input_text,
+        )
+
+    def _command_via_control(
+        self,
+        remote_argv: list[str],
+        *,
+        control_path: Path,
         check: bool,
         timeout: int,
         input_text: str | None,
     ) -> subprocess.CompletedProcess[str]:
-        with _password_askpass(self.auth.password) as env:
+        command_text = self._command_text(remote_argv)
+        input_text = _validate_input_text(input_text)
+        return self._run_command_argv(
+            self._argv(control_path=control_path) + [command_text],
+            env=_without_askpass_env(),
+            allow_auth_failure=False,
+            check=check,
+            timeout=timeout,
+            input_text=input_text,
+        )
+
+    @contextlib.contextmanager
+    def session(self) -> Iterator[SSHSession]:
+        """Open one authenticated master for an explicit group of commands."""
+
+        temp_dir = Path(tempfile.mkdtemp(prefix=".xhttp-ssh-mux-", dir="/tmp"))
+        os.chmod(temp_dir, 0o700)
+        control_path = temp_dir / "c"
+        master: subprocess.Popen[str] | None = None
+        session: SSHSession | None = None
+        master_stopped = False
+        body_exception: BaseException | None = None
+        try:
             try:
-                if input_text is None:
-                    result = subprocess.run(
-                        argv,
+                if self.auth.method == "password":
+                    with _password_askpass(self.auth.password) as env:
+                        master = subprocess.Popen(
+                            self._master_argv(control_path),
+                            stdin=subprocess.DEVNULL,
+                            text=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            env=env,
+                            start_new_session=True,
+                        )
+                        self._wait_for_master(master, control_path)
+                else:
+                    master = subprocess.Popen(
+                        self._master_argv(control_path),
                         stdin=subprocess.DEVNULL,
                         text=True,
-                        stdout=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
-                        env=env,
+                        env=_without_askpass_env(),
                         start_new_session=True,
-                        timeout=timeout,
-                        check=False,
                     )
-                else:
-                    result = subprocess.run(
-                        argv,
-                        input=input_text,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        env=env,
-                        start_new_session=True,
-                        timeout=timeout,
-                        check=False,
-                    )
-                result = _redact_process_result(
-                    result, self.auth.password, input_text
-                )
+                    self._wait_for_master(master, control_path)
             except (OSError, subprocess.TimeoutExpired) as exc:
-                detail = _redact_input_text(str(exc), input_text)
-                detail = _redact_input_text(detail, self.auth.password)
-                error = InstallerError(f"SSH не запустился: {detail}")
-                if input_text is None:
-                    raise error from exc
-                raise error from None
-        if result.returncode != 0:
-            detail = _last_process_line(result, input_text=input_text)
-            if _SSH_PERMISSION_DENIED.search(detail):
-                raise SSHAuthenticationError(
-                    f"SSH-аутентификация не удалась: {detail}"
+                detail = _bounded_process_tail(str(exc), secret=self.auth.password)
+                raise SSHTransportError(f"SSH master не запустился: {detail}") from exc
+            session = SSHSession(self, control_path)
+            yield session
+        except BaseException as exc:
+            body_exception = exc
+            raise
+        finally:
+            try:
+                if session is not None:
+                    session._close()
+                if master is not None:
+                    self._stop_master(master, control_path)
+                    master_stopped = True
+                else:
+                    master_stopped = True
+                if master_stopped:
+                    shutil.rmtree(temp_dir)
+            except OSError as exc:
+                cleanup_error = InstallerError(
+                    f"Не удалось удалить временный SSH command transport: {exc}"
                 )
-        if check and result.returncode != 0:
-            raise InstallerError(
-                "SSH завершился с ошибкой: "
-                f"{_last_process_line(result, input_text=input_text)}"
-            )
-        return result
+                if body_exception is None:
+                    raise cleanup_error from exc
+                if hasattr(body_exception, "add_note"):
+                    body_exception.add_note(str(cleanup_error))
+            except BaseException as cleanup_error:
+                if body_exception is None:
+                    raise
+                if hasattr(body_exception, "add_note"):
+                    body_exception.add_note(
+                        f"Дополнительно не завершился SSH master: {cleanup_error}"
+                    )
 
 
 def _free_loopback_port() -> int:
@@ -1049,7 +1725,7 @@ class SSHBridgeSession:
         if not normalized:
             raise InstallerError("Для bridge не заданы TCP-forward endpoints")
         self._forwards = normalized
-        self._temporary: tempfile.TemporaryDirectory[str] | None = None
+        self._temporary: Path | None = None
         self._master: subprocess.Popen[str] | None = None
         self._control_path: Path | None = None
         self._routes: dict[str, TCPRoute] = {}
@@ -1203,71 +1879,70 @@ class SSHBridgeSession:
     def open(self) -> "SSHBridgeSession":
         if self._master is not None or self._temporary is not None:
             raise InstallerError("SSH-мост уже открыт")
-        temporary = tempfile.TemporaryDirectory(prefix=".xhttp-bridge-", dir="/tmp")
-        self._temporary = temporary
-        temp_dir = Path(temporary.name)
-        os.chmod(temp_dir, 0o700)
-        self._control_path = temp_dir / "c"
-        local_routes: dict[str, TCPRoute] = {}
-        used_ports: set[int] = set()
-        for name in sorted(self._forwards):
-            local_port = _free_loopback_port()
-            while local_port in used_ports:
-                local_port = _free_loopback_port()
-            used_ports.add(local_port)
-            local_routes[name] = TCPRoute("127.0.0.1", local_port).validate()
-
-        argv = [
-            "ssh",
-            "-F",
-            "/dev/null",
-            "-N",
-            "-M",
-            "-S",
-            str(self._control_path),
-            "-p",
-            str(self.port),
-            "-o",
-            f"UserKnownHostsFile={self.known_hosts}",
-            "-o",
-            "GlobalKnownHostsFile=/dev/null",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "UpdateHostKeys=no",
-            "-o",
-            "ConnectTimeout=15",
-            "-o",
-            "NumberOfPasswordPrompts=1",
-            "-o",
-            "BatchMode=no",
-            "-o",
-            "PreferredAuthentications=password",
-            "-o",
-            "PubkeyAuthentication=no",
-            "-o",
-            "KbdInteractiveAuthentication=no",
-            "-o",
-            "ControlPersist=no",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "GatewayPorts=no",
-            "-o",
-            "LogLevel=ERROR",
-        ]
-        for name in sorted(self._forwards):
-            remote_host, remote_port = self._forwards[name]
-            remote_token = f"[{remote_host}]" if ":" in remote_host else remote_host
-            argv.extend(
-                [
-                    "-L",
-                    f"127.0.0.1:{local_routes[name].connect_port}:"
-                    f"{remote_token}:{remote_port}",
-                ]
-            )
-        argv.append(self._destination())
+        temp_dir = Path(tempfile.mkdtemp(prefix=".xhttp-bridge-", dir="/tmp"))
+        self._temporary = temp_dir
         try:
+            os.chmod(temp_dir, 0o700)
+            self._control_path = temp_dir / "c"
+            local_routes: dict[str, TCPRoute] = {}
+            used_ports: set[int] = set()
+            for name in sorted(self._forwards):
+                local_port = _free_loopback_port()
+                while local_port in used_ports:
+                    local_port = _free_loopback_port()
+                used_ports.add(local_port)
+                local_routes[name] = TCPRoute("127.0.0.1", local_port).validate()
+
+            argv = [
+                "ssh",
+                "-F",
+                "/dev/null",
+                "-N",
+                "-M",
+                "-S",
+                str(self._control_path),
+                "-p",
+                str(self.port),
+                "-o",
+                f"UserKnownHostsFile={self.known_hosts}",
+                "-o",
+                "GlobalKnownHostsFile=/dev/null",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "UpdateHostKeys=no",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "BatchMode=no",
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "GatewayPorts=no",
+                "-o",
+                "LogLevel=ERROR",
+            ]
+            for name in sorted(self._forwards):
+                remote_host, remote_port = self._forwards[name]
+                remote_token = f"[{remote_host}]" if ":" in remote_host else remote_host
+                argv.extend(
+                    [
+                        "-L",
+                        f"127.0.0.1:{local_routes[name].connect_port}:"
+                        f"{remote_token}:{remote_port}",
+                    ]
+                )
+            argv.append(self._destination())
             with _password_askpass(self._auth.password) as env:
                 self._master = subprocess.Popen(
                     argv,
@@ -1284,8 +1959,15 @@ class SSHBridgeSession:
                 raise InstallerError("Для SSH-моста нужен успешный вход с UID 0")
             self._routes = local_routes
             return self
-        except BaseException:
-            self.close()
+        except BaseException as body_error:
+            try:
+                self.close()
+            except BaseException:
+                if hasattr(body_error, "add_note"):
+                    body_error.add_note(
+                        "Дополнительно не завершился teardown SSH-моста"
+                    )
+                raise body_error.with_traceback(body_error.__traceback__) from None
             raise
 
     def tcp_route(self, name: str) -> TCPRoute:
@@ -1321,59 +2003,32 @@ class SSHBridgeSession:
     def close(self) -> None:
         master = self._master
         control_path = self._control_path
-        self._master = None
         self._routes = {}
-        try:
-            if master is not None and control_path is not None:
-                if master.poll() is None:
-                    try:
-                        subprocess.run(
-                            self._control_argv("exit"),
-                            stdin=subprocess.DEVNULL,
-                            text=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            env=_without_askpass_env(),
-                            timeout=5,
-                            check=False,
-                        )
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
-                try:
-                    master.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(master.pid, signal.SIGTERM)
-                    except (AttributeError, ProcessLookupError, PermissionError):
-                        try:
-                            master.terminate()
-                        except ProcessLookupError:
-                            pass
-                    try:
-                        master.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            os.killpg(master.pid, signal.SIGKILL)
-                        except (AttributeError, ProcessLookupError, PermissionError):
-                            try:
-                                master.kill()
-                            except ProcessLookupError:
-                                pass
-                        master.wait(timeout=5)
-                if master.stderr is not None:
-                    master.stderr.close()
-        finally:
-            self._control_path = None
-            temporary = self._temporary
-            self._temporary = None
-            if temporary is not None:
-                temporary.cleanup()
+        temporary = self._temporary
+        if master is not None:
+            if control_path is None:
+                raise InstallerError("SSH bridge потерял путь к control socket")
+            _stop_control_master(master, self._control_argv("exit"))
+            if master.stderr is not None:
+                master.stderr.close()
+        if temporary is not None:
+            shutil.rmtree(temporary)
+        self._master = None
+        self._control_path = None
+        self._temporary = None
 
     def __enter__(self) -> "SSHBridgeSession":
         return self.open()
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
-        self.close()
+        try:
+            self.close()
+        except BaseException:
+            if exc is None:
+                raise
+            if hasattr(exc, "add_note"):
+                exc.add_note("Дополнительно не завершился teardown SSH-моста")
+            raise exc.with_traceback(traceback) from None
         return False
 
 

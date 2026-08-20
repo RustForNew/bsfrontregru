@@ -8,6 +8,7 @@ logs remote output or returns secret material.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -24,6 +25,9 @@ from .render import render_vless_uri
 from .ssh_transport import (
     SSHAuth,
     SSHClient,
+    SSHCommand,
+    SSHTransportError,
+    SFTPBatch,
     SFTPClient,
     pin_host_key,
     sftp_quote,
@@ -99,6 +103,10 @@ class RemoteFrontError(InstallerError):
         artifact_status: ArtifactStatus,
         cleanup_status: CleanupStatus,
         remote_temp: str | None = None,
+        transport_failure: bool = False,
+        session_cleanup_failed: bool = False,
+        recovery_completed: bool = False,
+        recovery_failed: bool = False,
     ) -> None:
         detail = _STAGE_MESSAGES.get(stage, "удалённая настройка frontend не завершена")
         message = (
@@ -107,12 +115,22 @@ class RemoteFrontError(InstallerError):
         )
         if cleanup_status in {"failed", "unknown"} and remote_temp is not None:
             message += f"; проверить вручную: {remote_temp}"
+        if session_cleanup_failed:
+            message += "; ssh_session_cleanup=failed"
+        if recovery_completed:
+            message += "; exact_recovery=succeeded"
+        if recovery_failed:
+            message += "; exact_recovery=failed"
         super().__init__(message)
         self.stage = stage
         self.remote_status = remote_status
         self.artifact_status = artifact_status
         self.cleanup_status = cleanup_status
         self.remote_temp = remote_temp
+        self.transport_failure = transport_failure
+        self.session_cleanup_failed = session_cleanup_failed
+        self.recovery_completed = recovery_completed
+        self.recovery_failed = recovery_failed
 
     @property
     def remote_applied(self) -> bool | None:
@@ -121,6 +139,13 @@ class RemoteFrontError(InstallerError):
         if self.remote_status == "not_started":
             return False
         return None
+
+    @property
+    def recovery_allowed(self) -> bool:
+        return (
+            self.remote_status in {"not_started", "failed"}
+            and self.transport_failure
+        )
 
 
 @dataclass(frozen=True)
@@ -152,6 +177,56 @@ class _LocalPersistError(InstallerError):
     def __init__(self, *, partial: bool) -> None:
         super().__init__("local client artifact transaction failed")
         self.partial = partial
+
+
+@dataclass
+class _TeardownCapture:
+    error: BaseException | None = None
+
+
+@contextlib.contextmanager
+def _capture_context_teardown(scope, capture: _TeardownCapture):
+    entered = False
+    body_error: BaseException | None = None
+    try:
+        with scope as value:
+            entered = True
+            try:
+                yield value
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except BaseException as exc:
+        if not entered:
+            raise
+        if body_error is not None:
+            if exc is body_error:
+                raise
+            if hasattr(body_error, "add_note"):
+                body_error.add_note(
+                    "Дополнительно не завершился SSH session teardown"
+                )
+            raise body_error.with_traceback(body_error.__traceback__) from None
+        if not isinstance(exc, Exception):
+            raise
+        capture.error = exc
+
+
+@dataclass(frozen=True)
+class _RemoteTempCleanup:
+    succeeded: bool
+    transport_failure: bool = False
+
+
+def _caused_by_ssh_transport(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SSHTransportError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _validated_local_file(
@@ -242,13 +317,13 @@ def _parse_remote_id(value: str) -> int:
     return identifier
 
 
-def _checked_remote(ssh: SSHClient, argv: list[str], *, timeout: int = 60) -> None:
+def _checked_remote(ssh: SSHCommand, argv: list[str], *, timeout: int = 60) -> None:
     result = ssh.command(argv, check=False, timeout=timeout)
     if result.returncode != 0:
         raise InstallerError("Удалённая команда вернула ошибку")
 
 
-def _create_remote_temp(ssh: SSHClient) -> str:
+def _create_remote_temp(ssh: SSHCommand) -> str:
     result = ssh.command(
         ["mktemp", "-d", "-p", "/tmp", "xhttp-front.XXXXXXXXXX"],
         check=False,
@@ -262,7 +337,7 @@ def _create_remote_temp(ssh: SSHClient) -> str:
     return lines[0].strip()
 
 
-def _remote_metadata(ssh: SSHClient, path: str) -> _RemoteMetadata:
+def _remote_metadata(ssh: SSHCommand, path: str) -> _RemoteMetadata:
     result = ssh.command(
         ["stat", "-c", "%f %a %u %g %s", "--", path],
         check=False,
@@ -291,7 +366,7 @@ def _remote_metadata(ssh: SSHClient, path: str) -> _RemoteMetadata:
 
 
 def _require_remote_path(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     path: str,
     *,
     kind: Literal["file", "directory"],
@@ -314,7 +389,7 @@ def _require_remote_path(
     return metadata
 
 
-def _remote_hash(ssh: SSHClient, path: str) -> str:
+def _remote_hash(ssh: SSHCommand, path: str) -> str:
     result = ssh.command(["sha256sum", "--", path], check=False, timeout=30)
     if result.returncode != 0:
         raise InstallerError("Не удалось вычислить SHA-256 удалённого файла")
@@ -328,8 +403,8 @@ def _remote_hash(ssh: SSHClient, path: str) -> str:
 
 
 def _upload_and_verify(
-    sftp: SFTPClient,
-    ssh: SSHClient,
+    sftp: SFTPBatch,
+    ssh: SSHCommand,
     *,
     installer: Path,
     handoff: Path,
@@ -430,7 +505,7 @@ def _remote_apply_argv(
 
 
 def _snapshot_remote_client(
-    ssh: SSHClient, remote_client: str
+    ssh: SSHCommand, remote_client: str
 ) -> _RemoteArtifactSnapshot:
     metadata = _require_remote_path(
         ssh,
@@ -443,7 +518,7 @@ def _snapshot_remote_client(
 
 
 def _download_client(
-    sftp: SFTPClient,
+    sftp: SFTPBatch,
     *,
     remote_client: str,
     local_dir: Path,
@@ -455,7 +530,7 @@ def _download_client(
 
 
 def _validate_downloaded_client(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     *,
     remote_client: str,
     before: _RemoteArtifactSnapshot,
@@ -495,21 +570,32 @@ def _persist_local_client(source: Path, output_dir: Path) -> Path:
     try:
         atomic_write(target, source.read_bytes(), 0o600)
         _assert_local_client(target)
-    except Exception as original:
+    except BaseException as original:
+        rollback_error: Exception | None = None
         try:
             if snapshot is None:
                 target.unlink(missing_ok=True)
             else:
                 atomic_write(target, snapshot.data, snapshot.mode)
-        except Exception:
-            raise _LocalPersistError(partial=True) from original
-        raise _LocalPersistError(partial=False) from original
+        except Exception as exc:
+            rollback_error = exc
+        if not isinstance(original, Exception):
+            if rollback_error is not None and hasattr(original, "add_note"):
+                original.add_note(
+                    "Не удалось полностью откатить локальный client.vless"
+                )
+            raise
+        if rollback_error is not None:
+            raise _LocalPersistError(partial=True) from None
+        raise _LocalPersistError(partial=False) from None
     return target
 
 
-def _cleanup_remote_temp(ssh: SSHClient, remote_temp: str) -> bool:
+def _cleanup_remote_temp(
+    ssh: SSHCommand, remote_temp: str
+) -> _RemoteTempCleanup:
     if not _REMOTE_TEMP.fullmatch(remote_temp):
-        return False
+        return _RemoteTempCleanup(False)
     exact_files = [
         f"{remote_temp}/installer.pyz",
         f"{remote_temp}/handoff.json",
@@ -517,11 +603,13 @@ def _cleanup_remote_temp(ssh: SSHClient, remote_temp: str) -> bool:
     try:
         removed = ssh.command(["rm", "-f", "--", *exact_files], check=False, timeout=30)
         if removed.returncode != 0:
-            return False
+            return _RemoteTempCleanup(False)
         directory = ssh.command(["rmdir", "--", remote_temp], check=False, timeout=30)
-        return directory.returncode == 0
+        return _RemoteTempCleanup(directory.returncode == 0)
+    except SSHTransportError:
+        return _RemoteTempCleanup(False, transport_failure=True)
     except Exception:
-        return False
+        return _RemoteTempCleanup(False)
 
 
 def apply_remote_front(
@@ -541,8 +629,8 @@ def apply_remote_front(
     password is sent once through SSH stdin; it is never placed in argv, a
     remote file, a result object, or an error message.
 
-    This function relies on ``SSHClient.command(..., input_text=...)`` and on
-    the ``front`` CLI accepting ``--auth-method password-stdin``.
+    This function uses one scoped SSH command session and relies on the
+    ``front`` CLI accepting ``--auth-method password-stdin``.
     """
 
     if firewall_verified is not True:
@@ -588,7 +676,7 @@ def apply_remote_front(
                 "Pinned known_hosts должен быть обычным файлом 0600"
             )
 
-    ssh = SSHClient(
+    command_client = SSHClient(
         host=target.host,
         port=target.port,
         user=target.user,
@@ -609,9 +697,16 @@ def apply_remote_front(
     stage = "remote_identity"
     remote_temp: str | None = None
     failure: Exception | None = None
+    failure_transport = False
+    cleanup_transport = False
     client_target: Path | None = None
 
-    with tempfile.TemporaryDirectory(prefix=".remote-front-", dir=output) as temp:
+    teardown = _TeardownCapture()
+    with _capture_context_teardown(
+        command_client.session(), teardown
+    ) as ssh, tempfile.TemporaryDirectory(
+        prefix=".remote-front-", dir=output
+    ) as temp:
         local_temp = Path(temp)
         try:
             uid_result = ssh.command(["id", "-u"], check=False, timeout=30)
@@ -633,15 +728,16 @@ def apply_remote_front(
 
             stage = "upload"
             try:
-                _upload_and_verify(
-                    sftp,
-                    ssh,
-                    installer=installer,
-                    handoff=handoff_file,
-                    remote_installer=remote_installer,
-                    remote_handoff=remote_handoff,
-                    local_roundtrip_dir=local_temp,
-                )
+                with sftp.session() as upload_session:
+                    _upload_and_verify(
+                        upload_session,
+                        ssh,
+                        installer=installer,
+                        handoff=handoff_file,
+                        remote_installer=remote_installer,
+                        remote_handoff=remote_handoff,
+                        local_roundtrip_dir=local_temp,
+                    )
             except _UploadVerificationError:
                 stage = "upload_verify"
                 raise
@@ -669,11 +765,12 @@ def apply_remote_front(
             stage = "artifact_validation"
             remote_client_before = _snapshot_remote_client(ssh, remote_client)
             stage = "artifact_download"
-            downloaded = _download_client(
-                sftp,
-                remote_client=remote_client,
-                local_dir=local_temp,
-            )
+            with sftp.session() as download_session:
+                downloaded = _download_client(
+                    download_session,
+                    remote_client=remote_client,
+                    local_dir=local_temp,
+                )
             stage = "artifact_validation"
             _validate_downloaded_client(
                 ssh,
@@ -692,20 +789,66 @@ def apply_remote_front(
             artifact_status = "saved"
         except Exception as exc:
             failure = exc
+            failure_transport = _caused_by_ssh_transport(exc)
         finally:
             if remote_temp is not None:
-                cleanup_status = (
-                    "succeeded" if _cleanup_remote_temp(ssh, remote_temp) else "failed"
-                )
+                cleanup = _cleanup_remote_temp(ssh, remote_temp)
+                cleanup_status = "succeeded" if cleanup.succeeded else "failed"
+                cleanup_transport = cleanup.transport_failure
 
-    if failure is not None:
-        raise RemoteFrontError(
-            stage=stage,
+    session_cleanup_failed = teardown.error is not None
+    if failure is not None or teardown.error is not None:
+        original = failure if failure is not None else teardown.error
+        assert original is not None
+        error = RemoteFrontError(
+            stage=stage if failure is not None else "cleanup",
             remote_status=remote_status,
             artifact_status=artifact_status,
             cleanup_status=cleanup_status,
             remote_temp=remote_temp,
-        ) from failure
+            transport_failure=(
+                failure_transport
+                or cleanup_transport
+                or _caused_by_ssh_transport(original)
+            ),
+            session_cleanup_failed=session_cleanup_failed,
+        )
+        if (
+            error.recovery_allowed
+            and cleanup_status != "succeeded"
+            and remote_temp is not None
+        ):
+            recovered = False
+            try:
+                with command_client.session() as recovery_ssh:
+                    recovered = _cleanup_remote_temp(
+                        recovery_ssh, remote_temp
+                    ).succeeded
+            except Exception:
+                recovered = False
+            if recovered:
+                error = RemoteFrontError(
+                    stage=error.stage,
+                    remote_status=remote_status,
+                    artifact_status=artifact_status,
+                    cleanup_status="succeeded",
+                    remote_temp=remote_temp,
+                    transport_failure=True,
+                    session_cleanup_failed=session_cleanup_failed,
+                    recovery_completed=True,
+                )
+            else:
+                error = RemoteFrontError(
+                    stage=error.stage,
+                    remote_status=remote_status,
+                    artifact_status=artifact_status,
+                    cleanup_status=cleanup_status,
+                    remote_temp=remote_temp,
+                    transport_failure=True,
+                    session_cleanup_failed=session_cleanup_failed,
+                    recovery_failed=True,
+                )
+        raise error from None
     if cleanup_status != "succeeded":
         raise RemoteFrontError(
             stage="cleanup",
@@ -713,6 +856,7 @@ def apply_remote_front(
             artifact_status=artifact_status,
             cleanup_status=cleanup_status,
             remote_temp=remote_temp,
+            transport_failure=cleanup_transport,
         )
     if client_target is None:
         raise RemoteFrontError(

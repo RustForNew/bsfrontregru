@@ -3,7 +3,13 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import (
+    ExitStack,
+    contextmanager,
+    nullcontext,
+    redirect_stderr,
+    redirect_stdout,
+)
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -40,8 +46,7 @@ FINGERPRINT = "SHA256:" + ("C" * 43)
 CLIENT_ID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
 XHTTP_PATH = "/api/0123456789abcdef0123456789abcdef"
 ENCRYPTION = (
-    "mlkem768x25519plus.native.0rtt."
-    "clientmaterialxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    "mlkem768x25519plus.native.0rtt.clientmaterialxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 )
 
 
@@ -130,18 +135,23 @@ def prepared_install(*, existing=True) -> PcPreparedInstall:
         desired_exit=desired_exit,
         desired_front=desired_front,
         front_auth=SSHAuth("password", password=SFTP_PASSWORD).validate(),
+        exit_known_hosts=Path("/private/exit.known_hosts"),
+        sftp_known_hosts=Path("/private/sftp.known_hosts"),
         existing_handoff=(handoff() if existing else None),
     )
 
 
 class FakeBridgeSession:
-    def __init__(self, events):
+    def __init__(self, events, *, close_error=None):
         self.events = events
         self.close_calls = 0
+        self.close_error = close_error
 
     def close(self):
         self.close_calls += 1
         self.events.append("close")
+        if self.close_error is not None:
+            raise self.close_error
 
     def __repr__(self):
         return "FakeBridgeSession(open=True)"
@@ -167,7 +177,11 @@ class PcBridgeOpenTests(unittest.TestCase):
                 return self
 
             def tcp_route(self, name):
-                return bridge_access().panel_route if name == "panel" else bridge_access().front_route
+                return (
+                    bridge_access().panel_route
+                    if name == "panel"
+                    else bridge_access().front_route
+                )
 
             def ssh_route(self, name):
                 self.assert_sftp_name = name
@@ -199,6 +213,42 @@ class PcBridgeOpenTests(unittest.TestCase):
         self.assertNotIn(BRIDGE_PASSWORD, rendered)
         self.assertNotIn(replacement, rendered)
 
+    def test_access_failure_remains_primary_when_bridge_close_fails(self):
+        inputs = user_inputs(bridge=True)
+        body_error = InstallerError("primary bridge access failure")
+        cleanup_secret = "bridge-close-secret-must-not-leak"
+        sessions = []
+
+        class Session:
+            def __init__(self, **_kwargs):
+                self.close_calls = 0
+                sessions.append(self)
+
+            def open(self):
+                return self
+
+            def tcp_route(self, _name):
+                raise body_error
+
+            def close(self):
+                self.close_calls += 1
+                raise InstallerError(cleanup_secret)
+
+        with (
+            mock.patch(
+                "xhttp_setup.ssh_transport.trust_host_key_tofu",
+                return_value=(Path("/private/bridge.known_hosts"), FINGERPRINT),
+            ),
+            mock.patch("xhttp_setup.pc_autosetup.SSHBridgeSession", Session),
+            self.assertRaises(InstallerError) as raised,
+        ):
+            open_pc_bridge(inputs)
+
+        self.assertIs(raised.exception, body_error)
+        self.assertEqual(sessions[0].close_calls, 1)
+        self.assertIn("teardown SSH-моста", repr(body_error.__notes__))
+        self.assertNotIn(cleanup_secret, repr(body_error.__notes__))
+
 
 class PcBridgeOrchestrationTests(unittest.TestCase):
     def _common_stack(self, stack: ExitStack):
@@ -208,6 +258,9 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
         stack.enter_context(mock.patch("xhttp_setup.cli._write_pc_phase"))
         stack.enter_context(mock.patch("xhttp_setup.cli.clear_pending_pc_exit"))
         stack.enter_context(mock.patch("xhttp_setup.cli.write_pending_pc_exit"))
+        stack.enter_context(
+            mock.patch("xhttp_setup.cli._confirm_pc_provider_firewall")
+        )
         return stack.enter_context(mock.patch("xhttp_setup.cli.apply_pc_exit"))
 
     def test_bridge_opens_before_prepare_routes_final_apply_and_closes_on_success(self):
@@ -235,6 +288,7 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
         def final_apply(**kwargs):
             events.append("final")
             self.assertIs(kwargs["bridge_access"], access)
+            self.assertEqual(kwargs["trusted_known_hosts"], prepared.sftp_known_hosts)
 
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             apply_exit = self._common_stack(stack)
@@ -279,6 +333,7 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
         def final_apply(**kwargs):
             events.append("final")
             self.assertNotIn("bridge_access", kwargs)
+            self.assertEqual(kwargs["trusted_known_hosts"], prepared.sftp_known_hosts)
 
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             apply_exit = self._common_stack(stack)
@@ -332,6 +387,10 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
                 def final_apply(**kwargs):
                     events.append("final")
                     self.assertIs(kwargs["bridge_access"], access)
+                    self.assertEqual(
+                        kwargs["trusted_known_hosts"],
+                        prepared.sftp_known_hosts,
+                    )
                     raise InstallerError(
                         f"final failed for {kwargs['bridge_access']!r}"
                     )
@@ -384,12 +443,90 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
                 ):
                     self.assertNotIn(BRIDGE_PASSWORD, value)
 
+    def test_bridge_close_does_not_mask_pc_body_error(self):
+        inputs = user_inputs(bridge=True)
+        access = bridge_access()
+        events = []
+        body_error = KeyboardInterrupt("primary PC interruption")
+        cleanup_secret = "pc-bridge-close-secret-must-not-leak"
+        session = FakeBridgeSession(
+            events,
+            close_error=InstallerError(cleanup_secret),
+        )
+
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            self._common_stack(stack)
+            stack.enter_context(
+                mock.patch(
+                    "xhttp_setup.cli.open_pc_bridge",
+                    return_value=(session, access),
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "xhttp_setup.cli.prepare_pc_install",
+                    side_effect=body_error,
+                )
+            )
+            stack.enter_context(redirect_stdout(StringIO()))
+            stack.enter_context(redirect_stderr(StringIO()))
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                _run_pc_install(
+                    inputs=inputs,
+                    output_dir=Path(temp) / "pc-output",
+                    installer_pyz=Path(temp) / "installer.pyz",
+                )
+
+        self.assertIs(raised.exception, body_error)
+        self.assertEqual(session.close_calls, 1)
+        self.assertIn("teardown SSH-моста", repr(body_error.__notes__))
+        self.assertNotIn(cleanup_secret, repr(body_error.__notes__))
+
+    def test_bridge_close_only_failure_is_propagated(self):
+        inputs = user_inputs(bridge=True)
+        prepared = prepared_install()
+        access = bridge_access()
+        events = []
+        close_error = InstallerError("bridge teardown failed")
+        session = FakeBridgeSession(events, close_error=close_error)
+
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            apply_exit = self._common_stack(stack)
+            stack.enter_context(
+                mock.patch(
+                    "xhttp_setup.cli.open_pc_bridge",
+                    return_value=(session, access),
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "xhttp_setup.cli.prepare_pc_install",
+                    return_value=prepared,
+                )
+            )
+            stack.enter_context(
+                mock.patch("xhttp_setup.cli._apply_front_and_issue")
+            )
+            stack.enter_context(redirect_stdout(StringIO()))
+            stack.enter_context(redirect_stderr(StringIO()))
+            with self.assertRaises(InstallerError) as raised:
+                _run_pc_install(
+                    inputs=inputs,
+                    output_dir=Path(temp) / "pc-output",
+                    installer_pyz=Path(temp) / "installer.pyz",
+                )
+
+        self.assertIs(raised.exception, close_error)
+        self.assertEqual(session.close_calls, 1)
+        apply_exit.assert_not_called()
+
     def test_e2e_uses_bridge_forward_but_issued_profile_keeps_real_frontend(self):
         access = bridge_access()
-        with tempfile.TemporaryDirectory() as temp, (
-            mock.patch("xhttp_setup.cli.e2e_probe", return_value="ok\n")
-        ) as probe, mock.patch("xhttp_setup.cli._save_verified_link") as save, (
-            redirect_stdout(StringIO())
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch("xhttp_setup.cli.e2e_probe", return_value="ok\n") as probe,
+            mock.patch("xhttp_setup.cli._save_verified_link") as save,
+            redirect_stdout(StringIO()),
         ):
             _run_probe_and_issue(
                 handoff=handoff(),
@@ -405,12 +542,39 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
         self.assertEqual(save.call_args.kwargs["client_connect_ip"], "192.0.2.30")
 
 
+class FakeExitSession:
+    def __init__(self, client):
+        self.client = client
+
+    def command(self, argv, *, check=True, timeout=300, input_text=None):
+        return self.client.command(
+            argv, check=check, timeout=timeout, input_text=input_text
+        )
+
+    def fresh_command(self, argv, *, check=True, timeout=300, input_text=None):
+        return self.client.command(
+            argv, check=check, timeout=timeout, input_text=input_text
+        )
+
+
 class FakeExitSSH:
     def __init__(self):
         self.calls = []
+        self.sessions = []
+        self.session_events = []
 
-    def command(self, argv, *, check=True, timeout=300):
-        self.calls.append((argv, check, timeout))
+    @contextmanager
+    def session(self):
+        session = FakeExitSession(self)
+        self.sessions.append(session)
+        self.session_events.append("open")
+        try:
+            yield session
+        finally:
+            self.session_events.append("close")
+
+    def command(self, argv, *, check=True, timeout=300, input_text=None):
+        self.calls.append((argv, check, timeout, input_text))
         if argv == ["id", "-u"]:
             return completed(argv, stdout="0\n")
         raise AssertionError(f"unexpected direct exit command: {argv!r}")
@@ -454,10 +618,19 @@ class PcBridgePreparationTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 sftp_constructor_calls.append(kwargs)
 
+            def session(self):
+                return nullcontext(self)
+
             def batch(self, commands, *, check=True):
                 del check
                 events.append("sftp")
-                return completed(commands)
+                return completed(
+                    commands,
+                    stdout=(
+                        "Remote working directory: /home/u1234567\n"
+                        f"Remote working directory: /var/www/u/data/www/{DOMAIN}\n"
+                    ),
+                )
 
         def tls(*args, **kwargs):
             events.append("tls")
@@ -487,7 +660,9 @@ class PcBridgePreparationTests(unittest.TestCase):
                 )
             )
             stack.enter_context(
-                mock.patch("xhttp_setup.pc_autosetup.SSHClient", side_effect=ssh_factory)
+                mock.patch(
+                    "xhttp_setup.pc_autosetup.SSHClient", side_effect=ssh_factory
+                )
             )
             stack.enter_context(
                 mock.patch(
@@ -530,8 +705,8 @@ class PcBridgePreparationTests(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch(
-                    "xhttp_setup.pc_autosetup._select_front_probe_port",
-                    return_value=32001,
+                    "xhttp_setup.pc_autosetup._select_front_probe_ports",
+                    return_value=(32001, 32002, 32003),
                 )
             )
             stack.enter_context(
@@ -594,6 +769,10 @@ class PcBridgePreparationTests(unittest.TestCase):
         self.assertEqual(exit_kwargs["host"], "8.8.8.8")
         self.assertNotIn("route", exit_kwargs)
         self.assertEqual(state["exit_ssh"].calls[0][0], ["id", "-u"])
+        self.assertEqual(
+            state["exit_ssh"].session_events,
+            ["open", "close", "open", "close"],
+        )
 
         self.assertEqual(len(state["trust_calls"]), 2)
         exit_trust, sftp_trust = state["trust_calls"]
@@ -601,13 +780,20 @@ class PcBridgePreparationTests(unittest.TestCase):
         self.assertNotIn("route", exit_trust)
         self.assertIs(sftp_trust["route"], access.sftp_route)
         self.assertIs(state["panel_calls"][0]["route"], access.panel_route)
-        self.assertIs(
-            state["sftp_constructor_calls"][0]["route"], access.sftp_route
-        )
+        self.assertIs(state["sftp_constructor_calls"][0]["route"], access.sftp_route)
         self.assertIs(state["tls_calls"][0][1]["route"], access.front_route)
         self.assertIs(state["probe_calls"][0]["sftp_route"], access.sftp_route)
         self.assertIs(state["probe_calls"][0]["https_route"], access.front_route)
-        self.assertIs(state["probe_calls"][0]["ssh"], state["exit_ssh"])
+        self.assertEqual(
+            state["probe_calls"][0]["trusted_known_hosts"],
+            result.sftp_known_hosts,
+        )
+        self.assertEqual(result.exit_known_hosts, Path(temp) / "exit.known_hosts")
+        self.assertEqual(result.sftp_known_hosts, Path(temp) / "sftp.known_hosts")
+        main_session = state["exit_ssh"].sessions[1]
+        self.assertIs(state["probe_calls"][0]["ssh"], main_session)
+        self.assertIs(state["prepare_exit"].call_args.args[0], main_session)
+        self.assertIs(state["measure_exit"].call_args.args[0], main_session)
         self.assertLess(
             state["events"].index("tls"), state["events"].index("prepare-exit")
         )
@@ -629,16 +815,12 @@ class PcBridgePreparationTests(unittest.TestCase):
             state = self._run_prepare(Path(temp), tls_error=failure)
 
         self.assertIs(state["result"], failure)
-        self.assertIs(
-            state["panel_calls"][0]["route"], state["access"].panel_route
-        )
+        self.assertIs(state["panel_calls"][0]["route"], state["access"].panel_route)
         self.assertIs(
             state["sftp_constructor_calls"][0]["route"],
             state["access"].sftp_route,
         )
-        self.assertIs(
-            state["tls_calls"][0][1]["route"], state["access"].front_route
-        )
+        self.assertIs(state["tls_calls"][0][1]["route"], state["access"].front_route)
         state["prepare_exit"].assert_not_called()
         state["measure_exit"].assert_not_called()
         state["front_probe"].assert_not_called()

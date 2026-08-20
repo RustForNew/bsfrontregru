@@ -2,8 +2,9 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from xhttp_setup.errors import InstallerError, VerificationError
 from xhttp_setup.front import (
@@ -11,9 +12,11 @@ from xhttp_setup.front import (
     _RemoteMutation,
     _download_optional,
     _rollback_journal,
+    _rollback_journal_with_recovery,
     _rollback_mutation,
     _upload_verified,
 )
+from xhttp_setup.ssh_transport import SFTPTransportError
 
 
 class FakeSFTP:
@@ -85,6 +88,125 @@ class MemorySFTP:
 
 
 class FrontTransactionTests(unittest.TestCase):
+    def test_transport_only_rollback_failure_gets_one_fresh_reconciliation(self):
+        original = InstallerError("uncertain write")
+        active = object()
+        recovery = object()
+        session_events = []
+
+        class Transport:
+            @contextmanager
+            def session(self):
+                session_events.append("open")
+                try:
+                    yield recovery
+                finally:
+                    session_events.append("close")
+
+        first = FrontRollbackError(
+            "rollback неполон: dead mux",
+            recoverable_transport=True,
+        )
+        with patch(
+            "xhttp_setup.front._rollback_journal",
+            side_effect=(first, None),
+        ) as rollback:
+            _rollback_journal_with_recovery(
+                Transport(),
+                active,
+                remote_dir="/remote",
+                journal=[],
+                original=original,
+            )
+
+        self.assertEqual(rollback.call_count, 2)
+        self.assertIs(rollback.call_args_list[0].args[0], active)
+        self.assertIs(rollback.call_args_list[1].args[0], recovery)
+        self.assertEqual(session_events, ["open", "close"])
+
+    def test_state_conflict_never_opens_recovery_transport(self):
+        original = VerificationError("E2E failed")
+
+        class Transport:
+            def session(self):
+                raise AssertionError("state conflict must not reconnect")
+
+        conflict = FrontRollbackError("rollback неполон: owner edit")
+        with (
+            patch(
+                "xhttp_setup.front._rollback_journal",
+                side_effect=conflict,
+            ) as rollback,
+            self.assertRaises(FrontRollbackError) as raised,
+        ):
+            _rollback_journal_with_recovery(
+                Transport(),
+                object(),
+                remote_dir="/remote",
+                journal=[],
+                original=original,
+            )
+
+        self.assertIs(raised.exception, conflict)
+        self.assertEqual(rollback.call_count, 1)
+
+    def test_recovery_open_failure_remains_incomplete_with_original_cause(self):
+        original = VerificationError("E2E failed")
+        first = FrontRollbackError(
+            "rollback неполон: dead mux",
+            recoverable_transport=True,
+        )
+
+        class Transport:
+            @contextmanager
+            def session(self):
+                raise SFTPTransportError("recovery route unavailable")
+                yield  # pragma: no cover
+
+        with (
+            patch("xhttp_setup.front._rollback_journal", side_effect=first),
+            self.assertRaises(FrontRollbackError) as raised,
+        ):
+            _rollback_journal_with_recovery(
+                Transport(),
+                object(),
+                remote_dir="/remote",
+                journal=[],
+                original=original,
+            )
+
+        self.assertIs(raised.exception.__cause__, original)
+        self.assertIn("recovery SFTP transport", str(raised.exception))
+
+    def test_mixed_transport_and_state_failures_never_retry(self):
+        original = VerificationError("E2E failed")
+        journal = [Mock(target="first"), Mock(target="second")]
+
+        class Transport:
+            def session(self):
+                raise AssertionError("mixed rollback failures must not reconnect")
+
+        with (
+            patch(
+                "xhttp_setup.front._rollback_mutation",
+                side_effect=(
+                    SFTPTransportError("dead mux"),
+                    InstallerError("owner state conflict"),
+                ),
+            ),
+            self.assertRaises(FrontRollbackError) as raised,
+        ):
+            _rollback_journal_with_recovery(
+                Transport(),
+                object(),
+                remote_dir="/remote",
+                journal=journal,
+                original=original,
+            )
+
+        self.assertFalse(raised.exception.recoverable_transport)
+        self.assertIs(raised.exception.__cause__, original)
+
     def test_missing_remote_file_is_optional(self):
         with tempfile.TemporaryDirectory() as temp:
             local = Path(temp) / "copy"

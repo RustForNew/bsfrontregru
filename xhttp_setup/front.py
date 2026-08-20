@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import socket
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,13 +14,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .errors import InstallerError, VerificationError
+from .errors import (
+    HTTPSResponseError,
+    InstallerError,
+    TLSVerificationError,
+    VerificationError,
+)
 from .models import FrontDesired, TLS_MODE_PINNED, validate_cert_sha256
 from .osutil import atomic_write_text, ensure_dir, exclusive_lock, sha256_file
 from .placeholder import neutral_placeholder
 from .render import merge_managed_block, render_htaccess_block
 from .ssh_transport import (
+    SFTPBatch,
     SFTPClient,
+    SFTPSession,
+    SFTPTransportError,
     SSHAuth,
     SSHRoute,
     TCPRoute,
@@ -39,6 +48,10 @@ class FrontResult:
 
 class FrontRollbackError(InstallerError):
     """Frontend mutation could not be restored to its verified baseline."""
+
+    def __init__(self, message: str, *, recoverable_transport: bool = False) -> None:
+        super().__init__(message)
+        self.recoverable_transport = recoverable_transport
 
 
 @dataclass
@@ -94,13 +107,51 @@ def _verify_leaf_pin(tls: ssl.SSLSocket, expected_sha256: str) -> str:
     expected = validate_cert_sha256(expected_sha256)
     certificate_der = tls.getpeercert(binary_form=True)
     if not certificate_der:
-        raise VerificationError("TLS endpoint не предоставил leaf-сертификат")
+        raise TLSVerificationError("TLS endpoint не предоставил leaf-сертификат")
     actual = hashlib.sha256(certificate_der).hexdigest()
     if not hmac.compare_digest(actual, expected):
-        raise VerificationError(
+        raise TLSVerificationError(
             f"SHA-256 leaf-сертификата не совпал: ожидался {expected}, получен {actual}"
         )
     return actual
+
+
+def _remaining_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("общий срок HTTPS-запроса истёк")
+    return remaining
+
+
+def _read_http_status_line(tls: ssl.SSLSocket, *, deadline: float) -> int:
+    """Read only a bounded HTTP status line under one end-to-end deadline."""
+
+    received = bytearray()
+    while b"\r\n" not in received:
+        if len(received) >= 8192:
+            raise http.client.LineTooLong("status line")
+        tls.settimeout(_remaining_deadline(deadline))
+        chunk = tls.recv(min(1024, 8192 - len(received)))
+        if not chunk:
+            raise http.client.RemoteDisconnected(
+                "Remote end closed connection without response"
+            )
+        received.extend(chunk)
+    status_line = bytes(received).split(b"\r\n", 1)[0]
+    parts = status_line.split(b" ", 2)
+    if (
+        len(parts) < 2
+        or parts[0] not in {b"HTTP/1.0", b"HTTP/1.1"}
+        or len(parts[1]) != 3
+        or not parts[1].isdigit()
+    ):
+        raise http.client.BadStatusLine(status_line.decode("latin-1", "replace"))
+    status = int(parts[1])
+    # Diagnostic GETs require one final response.  Reject invalid codes and
+    # interim 1xx responses instead of treating them as a successful result.
+    if not 200 <= status <= 599:
+        raise http.client.BadStatusLine(status_line.decode("latin-1", "replace"))
+    return status
 
 
 def check_public_tls(
@@ -170,6 +221,7 @@ def https_status(
     )
     transport = route.validate() if route is not None else None
     if connect_ip is not None or pin is not None or transport is not None:
+        deadline = time.monotonic() + timeout
         logical_target = (connect_ip or parsed.hostname, parsed.port or 443)
         target = (
             (transport.connect_host, transport.connect_port)
@@ -185,8 +237,12 @@ def https_status(
         if parsed.port and parsed.port != 443:
             host = f"{host}:{parsed.port}"
         context = _client_tls_context(pin)
+        request_sent = False
         try:
-            with socket.create_connection(target, timeout=timeout) as raw:
+            with socket.create_connection(
+                target, timeout=_remaining_deadline(deadline)
+            ) as raw:
+                raw.settimeout(_remaining_deadline(deadline))
                 with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
                     if pin:
                         _verify_leaf_pin(tls, pin)
@@ -196,14 +252,19 @@ def https_status(
                         "User-Agent: xhttp-setup-doctor/0.1\r\n"
                         "Connection: close\r\n\r\n"
                     )
+                    tls.settimeout(_remaining_deadline(deadline))
                     tls.sendall(request.encode("ascii"))
-                    response = http.client.HTTPResponse(tls)
-                    response.begin()
-                    status = int(response.status)
-                    response.close()
-                    return status
-        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
-            raise VerificationError(
+                    request_sent = True
+                    return _read_http_status_line(tls, deadline=deadline)
+        except TLSVerificationError:
+            raise
+        except ssl.SSLError as exc:
+            raise TLSVerificationError(
+                f"TLS для HTTPS-запроса {url} не прошёл проверку: {exc}"
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            error_type = HTTPSResponseError if request_sent else VerificationError
+            raise error_type(
                 f"HTTPS-запрос {url} через {logical_target[0]} не выполнен: {exc}"
             ) from exc
     request = urllib.request.Request(
@@ -246,7 +307,7 @@ def build_front_plan(desired: FrontDesired) -> list[str]:
 
 
 def _download_optional(
-    client: SFTPClient, remote_dir: str, name: str, local: Path
+    client: SFTPBatch, remote_dir: str, name: str, local: Path
 ) -> bool:
     local.unlink(missing_ok=True)
     probe = client.batch(
@@ -277,7 +338,7 @@ def _download_optional(
 
 
 def _upload_verified(
-    client: SFTPClient,
+    client: SFTPBatch,
     *,
     remote_dir: str,
     local: Path,
@@ -338,7 +399,7 @@ def _upload_verified(
 
 
 def _remote_digest(
-    client: SFTPClient,
+    client: SFTPBatch,
     *,
     remote_dir: str,
     name: str,
@@ -352,7 +413,7 @@ def _remote_digest(
 
 
 def _is_restored(
-    client: SFTPClient, *, remote_dir: str, mutation: _RemoteMutation
+    client: SFTPBatch, *, remote_dir: str, mutation: _RemoteMutation
 ) -> bool:
     actual = _remote_digest(
         client,
@@ -379,11 +440,13 @@ def _is_restored(
     return True
 
 
-def _try_batch(client: SFTPClient, commands: list[str], errors: list[str]) -> None:
+def _try_batch(client: SFTPBatch, commands: list[str], errors: list[str]) -> None:
     try:
         result = client.batch(commands, check=False)
         if result.returncode != 0:
             errors.append(f"SFTP возвратил код {result.returncode}")
+    except SFTPTransportError:
+        raise
     except Exception as exc:  # The next probe reconciles an uncertain outcome.
         errors.append(str(exc))
 
@@ -393,7 +456,7 @@ def _remote_artifact_path(remote_dir: str, name: str) -> str:
 
 
 def _cleanup_unswitched_temp(
-    client: SFTPClient,
+    client: SFTPBatch,
     *,
     remote_dir: str,
     mutation: _RemoteMutation,
@@ -452,7 +515,7 @@ def _cleanup_unswitched_temp(
 
 
 def _remove_installed_target(
-    client: SFTPClient,
+    client: SFTPBatch,
     *,
     remote_dir: str,
     mutation: _RemoteMutation,
@@ -558,7 +621,7 @@ def _remove_installed_target(
 
 
 def _restore_expected_backup(
-    client: SFTPClient,
+    client: SFTPBatch,
     *,
     remote_dir: str,
     mutation: _RemoteMutation,
@@ -804,7 +867,7 @@ def _restore_expected_backup(
 
 
 def _rollback_mutation(
-    client: SFTPClient, *, remote_dir: str, mutation: _RemoteMutation
+    client: SFTPBatch, *, remote_dir: str, mutation: _RemoteMutation
 ) -> None:
     errors: list[str] = []
     if not mutation.switch_attempted:
@@ -899,7 +962,7 @@ def _rollback_mutation(
                     f"Remote {mutation.target} изменён после применения; "
                     "автоматический rollback отказался перезаписывать чужое состояние"
                 )
-        except _RemoteStateConflict:
+        except (_RemoteStateConflict, SFTPTransportError):
             raise
         except Exception as exc:
             errors.append(str(exc))
@@ -911,25 +974,78 @@ def _rollback_mutation(
 
 
 def _rollback_journal(
-    client: SFTPClient,
+    client: SFTPBatch,
     *,
     remote_dir: str,
     journal: list[_RemoteMutation],
     original: BaseException,
 ) -> None:
     failures: list[str] = []
+    failure_errors: list[BaseException] = []
     for mutation in reversed(journal):
         try:
             _rollback_mutation(client, remote_dir=remote_dir, mutation=mutation)
         except BaseException as exc:
             detail = str(exc).strip() or type(exc).__name__
             failures.append(f"{mutation.target}: {detail}")
+            failure_errors.append(exc)
     if not failures:
         return
     detail = " | ".join(failures)
     raise FrontRollbackError(
-        f"Применение не удалось, rollback неполон: {detail}"
+        f"Применение не удалось, rollback неполон: {detail}",
+        recoverable_transport=bool(failure_errors)
+        and all(isinstance(error, SFTPTransportError) for error in failure_errors),
     ) from original
+
+
+def _rollback_journal_with_recovery(
+    transport: SFTPClient,
+    active_session: SFTPSession,
+    *,
+    remote_dir: str,
+    journal: list[_RemoteMutation],
+    original: BaseException,
+) -> None:
+    """Retry only rollback reconciliation once over a fresh pinned transport.
+
+    The failed/uncertain mutating batch is never replayed.  A second master is
+    opened only after the normal rollback itself reports an incomplete result.
+    """
+
+    first_error: FrontRollbackError | None = None
+    try:
+        _rollback_journal(
+            active_session,
+            remote_dir=remote_dir,
+            journal=journal,
+            original=original,
+        )
+        return
+    except FrontRollbackError as error:
+        if not error.recoverable_transport:
+            raise
+        first_error = error
+
+    if first_error is None:  # pragma: no cover - guarded by the return above
+        raise AssertionError("rollback recovery invariant")
+
+    try:
+        with transport.session() as recovery_session:
+            _rollback_journal(
+                recovery_session,
+                remote_dir=remote_dir,
+                journal=journal,
+                original=original,
+            )
+    except FrontRollbackError:
+        raise
+    except BaseException as recovery_error:
+        detail = str(recovery_error).strip() or type(recovery_error).__name__
+        raise FrontRollbackError(
+            "Применение не удалось, rollback неполон: "
+            f"{first_error}; recovery SFTP transport: {detail}"
+        ) from original
 
 
 def apply_front(
@@ -942,6 +1058,7 @@ def apply_front(
     on_failure: Callable[[BaseException], None] | None = None,
     sftp_route: SSHRoute | None = None,
     https_route: TCPRoute | None = None,
+    trusted_known_hosts: Path | None = None,
 ) -> FrontResult:
     desired = desired.validate()
     expanded_state = state_dir.expanduser()
@@ -983,6 +1100,7 @@ def apply_front(
                 post_apply=post_apply,
                 sftp_route=sftp_route,
                 https_route=https_route,
+                trusted_known_hosts=trusted_known_hosts,
             )
         except BaseException as exc:
             if on_failure is not None:
@@ -1001,6 +1119,7 @@ def _apply_front_locked(
     post_apply: Callable[[FrontResult], None] | None = None,
     sftp_route: SSHRoute | None = None,
     https_route: TCPRoute | None = None,
+    trusted_known_hosts: Path | None = None,
 ) -> FrontResult:
     check_front_dns(desired.domain, desired.dns_ipv4)
     check_public_tls(
@@ -1027,6 +1146,7 @@ def _apply_front_locked(
         expected_sha256=desired.ssh_host_key_sha256,
         known_hosts=known_hosts,
         route=sftp_route,
+        trusted_known_hosts=trusted_known_hosts,
     )
     client = SFTPClient(
         host=desired.sftp_host,
@@ -1036,6 +1156,28 @@ def _apply_front_locked(
         auth=auth,
         route=sftp_route,
     )
+    with client.session() as session:
+        return _apply_front_sftp_transaction(
+            desired,
+            client=session,
+            recovery_transport=client,
+            state_dir=state_dir,
+            post_apply=post_apply,
+            https_route=https_route,
+        )
+
+
+def _apply_front_sftp_transaction(
+    desired: FrontDesired,
+    *,
+    client: SFTPSession,
+    recovery_transport: SFTPClient,
+    state_dir: Path,
+    post_apply: Callable[[FrontResult], None] | None,
+    https_route: TCPRoute | None,
+) -> FrontResult:
+    """Keep one authenticated SFTP transport through apply, E2E and rollback."""
+
     timestamp = (
         __import__("datetime")
         .datetime.now(__import__("datetime").timezone.utc)
@@ -1126,7 +1268,8 @@ def _apply_front_locked(
         if post_apply is not None:
             post_apply(result)
     except BaseException as exc:
-        _rollback_journal(
+        _rollback_journal_with_recovery(
+            recovery_transport,
             client,
             remote_dir=desired.document_root,
             journal=journal,

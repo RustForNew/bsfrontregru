@@ -24,17 +24,23 @@
 - SFTP uses `StrictHostKeyChecking=yes` with a dedicated known_hosts file.
 - Passwords are read with `getpass` and exposed once to OpenSSH askpass through
   a kernel-backed FIFO inside a private temporary directory. Password-auth SFTP
-  first authenticates a short-lived foreground ControlMaster, then preserves
-  fail-on-command semantics by running `sftp -b` only through its private
-  control socket. Passwords are not placed in argv, regular files, config files,
-  or environment values.
+  authenticates one short-lived foreground ControlMaster per bounded logical
+  transaction, then runs every isolated `sftp -b` batch in that transaction only
+  through the private control socket. A slave has `ProxyCommand=/bin/false` and
+  all authentication methods disabled, so a missing master cannot reconnect or
+  fall back to a direct path. Passwords are not placed in argv, regular files,
+  config files, or environment values.
 - The PC wizard discovers exit, optional bridge and SFTP host keys before
   password authentication, accepts the first supported key for each endpoint
-  as TOFU, and persists it in an endpoint-scoped private store. Later
-  disappearance or change of that exact key is rejected; adding another key
-  type does not silently replace it. This removes manual fingerprints but does
-  not independently authenticate the first network contact. Root passwords use
-  the same private FIFO transport.
+  as TOFU, and atomically persists it in an endpoint-scoped private store.
+  Subsequent runs validate and seed from that exact local record without another
+  unauthenticated `ssh-keyscan`, then immediately make a real OpenSSH connection
+  with `StrictHostKeyChecking=yes`, `GlobalKnownHostsFile=/dev/null`, and
+  `UpdateHostKeys=no`. That handshake rejects disappearance or change of the
+  pinned key before authentication or remote mutation; adding another key type
+  does not silently replace it. This removes manual fingerprints but does not
+  independently authenticate the first network contact. Root passwords use the
+  same private FIFO transport.
 - Ready-made credential blocks remain available only in advanced modes. They
   are read from the controlling Linux/WSL terminal with echo disabled for the
   whole bounded paste. The minimal PC wizard instead asks for each credential
@@ -52,13 +58,34 @@
   a structured OpenSSH authentication failure. Network, TLS and document-root
   errors never trigger credential guessing. Reflected remote errors are
   redacted without a secret-bearing exception chain.
+- PC mode uses one SFTP authentication for document-root discovery, one for
+  the independently rolled-back `302` rewrite control, one for each of three
+  independently rolled-back `[P]` frontend egress samples, and one for the final
+  frontend transaction through post-apply E2E and any rollback. It never opens
+  a new authenticated SSH master for every individual file command. Long remote
+  exit/front apply phases close the upload session and open a separate bounded
+  download session afterwards instead of keeping one idle for up to 900 seconds.
+  If an authenticated master dies after a possibly completed mutation, that
+  mutation is never replayed. Only a transport-only rollback failure may open
+  one fresh pinned session to reconcile the existing journal. A state conflict,
+  a mixed failure, or unsuccessful reconciliation remains an incomplete
+  rollback and blocks automatic continuation.
+- ISPmanager document roots are resolved with at most two read-only,
+  non-guessing interpretations. The exact validated API path is tried first.
+  Only one allowlisted OpenSSH `No such file` diagnostic permits a second path
+  formed from the authenticated SFTP start directory plus the same API path.
+  Every successful probe must return an unambiguous absolute `pwd`; a
+  user-rooted result (including a canonicalized in-tree symlink) must remain
+  below that start directory. Permission/mixed diagnostics, malformed output,
+  escape, and post-authentication transport changes fail closed and never
+  trigger another password prompt.
 - The optional PC bridge is a trusted, setup-only SSH control-plane host. PC
   mode uses fixed bridge TCP/22, hidden password input and one TOFU-pinned
   ControlMaster, then requires `id -u` to return `0`. The bridge password is
   consumed by the same FIFO-backed askpass mechanism and is not stored in argv,
   environment values, regular files or recovery state.
-- When selected, loopback-only forwards carry ISPmanager HTTPS, SFTP/keyscan,
-  frontend TLS, temporary-probe HTTPS and final E2E frontend TCP. ISPmanager and
+- When selected, loopback-only forwards carry ISPmanager HTTPS, SFTP and its
+  first-use keyscan, frontend TLS, temporary-probe HTTPS and final E2E frontend TCP. ISPmanager and
   frontend TLS retain their logical hostname/SNI checks, while SFTP remains a
   nested host-key-checked SSH connection. Exit SSH is always direct from the
   controller and DNS resolution remains local. The bridge session is closed at
@@ -73,16 +100,56 @@
   bridge. That older mode uploads bounded staging material and relays one SFTP
   password line over an already pinned SSH command; its wider bridge exposure
   does not describe the current PC forwarding design.
+- Direct exit commands are grouped into explicitly scoped, pinned OpenSSH
+  ControlMaster sessions instead of authenticating once per probe or package
+  check. Multiplexed children have `ProxyCommand=/bin/false`, `BatchMode=yes`
+  and every authentication/agent method disabled, so a missing control socket
+  cannot reconnect or fall back. Firewall transitions deliberately require a
+  separate fresh pinned root connection while the prior master remains alive
+  for an authorized rollback. Transport loss never causes an automatic command
+  replay; only an explicitly idempotent cleanup or already-authorized rollback
+  may open a separate recovery session. OpenSSH transport diagnostics are
+  bounded, allowlisted and secret-redacted before they become user-facing.
 - Remote firewall automation is fail-closed and restricted to clean supported
-  Debian/Ubuntu hosts. An already-active compatible UFW is preserved. For a
-  pristine inactive UFW, the PC flow installs only allowlisted prerequisites,
-  adds the actual SSH-port allow before enabling UFW, arms a bounded systemd
-  rollback guard, and verifies a fresh SSH connection both before and after
-  quiescing its timer and service. A later run detects and reconciles an owned
-  stale guard or the single exact pre-guard SSH rule; unexpected/additional
-  rules remain fail-closed.
-  It never edits provider cloud firewalls, merges custom nftables/iptables, or
-  disables a standalone firewall service.
+  Debian/Ubuntu hosts. Fresh preparation accepts only the exact current-port SSH
+  guard created by this flow. A proven resume may contain that guard plus the
+  complete exact managed allow/deny pair bound to the saved profile. The whole
+  numbered/user-rule inventory is checked; empty, foreign, uncommented,
+  duplicate, partial and wrong-port states are rejected. For a pristine inactive
+  UFW, the PC flow installs only allowlisted prerequisites, adds the actual
+  SSH-port allow before enabling UFW, arms a bounded systemd rollback guard, and
+  verifies a fresh SSH connection both before and after quiescing its timer and
+  service. The timer must report active before the first firewall mutation. It
+  only disables UFW and never deletes the sole SSH allow after a failed disable.
+  A later run detects and reconciles an owned stale guard or exact dormant SSH
+  rule. It never edits provider cloud firewalls, merges custom nftables/iptables,
+  or disables a standalone firewall service.
+- The firewall proof assumes a clean supported host and no concurrent privileged
+  actor. Local locking prevents a second wizard in the same state directory, but
+  it is not a distributed lock against another controller or a root operator.
+  Persistent UFW user rules are checked strictly; distribution-owned `ufw-*`
+  chain names are not cryptographic ownership evidence for pre-edited raw
+  `before/after` files or injected internal-chain contents. Such hosts are
+  outside the automatic merge contract and require manual audit or replacement.
+- Frontend egress discovery uses three distinct CSPRNG destination ports in
+  separate, deadline-complete captures. The exact triple is stored with mode
+  `0600`, bound to the domain and exit/SSH/backend endpoint, printed for a
+  restrictive provider-firewall retry, and reused rather than guessed again.
+  It is retained only after an inconclusive or failed measurement and is
+  exact-state deleted immediately after all three samples agree; a deletion
+  failure stops the workflow before the measured address is trusted. After
+  agreement, the wizard prints the measured `/32` and blocks at an interactive
+  checkpoint before exit apply/E2E. The operator must close the temporary
+  probe ports and, when a provider firewall exists, allow only that `/32` to
+  the backend port before continuing; no-firewall installations simply
+  acknowledge the same checkpoint.
+  Each capture starts only after its temporary `.htaccess` route is installed;
+  a packet-cap exit, a wrong destination port, no public source, multiple
+  sources in one sample, or different sources across samples fails closed.
+  This is a bounded probabilistic attribution against ordinary Internet scan
+  noise, not cryptographic proof against a targeted continuous scanner or an
+  on-path attacker. The final authenticated Xray E2E remains mandatory and no
+  client profile is issued from the SYN measurement alone.
 - The Windows bundle does not implement a second SSH stack. Its PowerShell
   launcher verifies the bundled runner and Linux zipapp SHA-256, prepares the
   allowlisted Ubuntu/Debian dependencies when needed, and starts that same
@@ -96,6 +163,10 @@
   pending markers bind interrupted work to the exact endpoint, UUID, XHTTP path
   and egress values without storing passwords or VLESS Encryption material.
   Incomplete frontend rollback phases refuse automatic continuation.
+  `exact_recovery=failed`, an unfinished exact reconciliation, or an incomplete
+  rollback is a manual-audit STOP condition; it is never treated as a generic
+  transport retry. Only a completed exact recovery or a proven pre-mutation
+  failure permits the bounded retry described by the operator documentation.
 - Release and Xray versions are pinned. Checksums, regular-file type, ownership
   and modes are verified by installer install/re-apply. Subsequent systemd
   restarts rely on the root-owned managed directory; they do not re-hash the

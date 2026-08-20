@@ -12,9 +12,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from xhttp_setup.cli import (
+    _confirm_pc_provider_firewall,
     _collect_pc_minimal_inputs,
     _read_pc_phase,
     _write_pc_phase,
+    _yes_no,
     wizard_pc,
 )
 from xhttp_setup.errors import InstallerError
@@ -87,6 +89,8 @@ def _prepared() -> PcPreparedInstall:
         desired_exit=desired_exit,
         desired_front=desired_front,
         front_auth=SSHAuth("password", password=SFTP_PASSWORD).validate(),
+        exit_known_hosts=Path("/private/exit.known_hosts"),
+        sftp_known_hosts=Path("/private/sftp.known_hosts"),
     )
 
 
@@ -114,6 +118,29 @@ def _assert_no_manual_technical_inputs(test: unittest.TestCase, transcript: str)
 
 
 class PcMinimalInputTests(unittest.TestCase):
+    def test_yes_no_accepts_ascii_y(self):
+        with patch("builtins.input", return_value="y"):
+            self.assertTrue(_yes_no("Использовать мост для входа?"))
+
+    def test_yes_no_accepts_cyrillic_u_and_reprompts_unknown_answers(self):
+        answers = iter(("unexpected", "у"))
+        error = StringIO()
+
+        with (
+            patch("builtins.input", side_effect=lambda _prompt: next(answers)),
+            redirect_stderr(error),
+        ):
+            self.assertTrue(_yes_no("Использовать мост для входа?"))
+
+        self.assertEqual(
+            error.getvalue(),
+            "Ошибка: ответьте y/yes/да или n/no/нет.\n",
+        )
+
+    def test_yes_no_accepts_explicit_negative_answers(self):
+        with patch("builtins.input", return_value="нет"):
+            self.assertFalse(_yes_no("Использовать мост для входа?", default=True))
+
     def test_direct_collects_eight_visible_fields_and_two_hidden_passwords(self):
         visible_answers = iter(
             (
@@ -177,7 +204,7 @@ class PcMinimalInputTests(unittest.TestCase):
                 "8.8.8.8",
                 "",
                 "",
-                "y",
+                "у",
                 "9.9.9.9",
                 "",
                 "https://vip999.hosting.reg.ru:1500/",
@@ -347,12 +374,18 @@ class PcMinimalWizardOrchestrationTests(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        firewall_patcher = patch("xhttp_setup.cli._confirm_pc_provider_firewall")
+        self.confirm_provider_firewall = firewall_patcher.start()
+        self.addCleanup(firewall_patcher.stop)
 
     def test_runs_prepare_then_existing_exit_front_and_e2e_without_firewall_ack(self):
         inputs = _inputs()
         prepared = _prepared()
         events: list[str] = []
         recovery_order: list[str] = []
+        self.confirm_provider_firewall.side_effect = (
+            lambda _desired: events.append("provider-firewall")
+        )
 
         with tempfile.TemporaryDirectory() as temp:
             output_dir = Path(temp) / "pc-output"
@@ -391,6 +424,9 @@ class PcMinimalWizardOrchestrationTests(unittest.TestCase):
                 self.assertIs(kwargs["target"], prepared.exit_target)
                 self.assertIs(kwargs["auth"], prepared.exit_auth)
                 self.assertEqual(kwargs["output_dir"], output_dir)
+                self.assertEqual(
+                    kwargs["trusted_known_hosts"], prepared.exit_known_hosts
+                )
                 return SimpleNamespace(
                     remote=SimpleNamespace(
                         handoff_path=handoff_path,
@@ -410,6 +446,9 @@ class PcMinimalWizardOrchestrationTests(unittest.TestCase):
                 events.append("front")
                 self.assertEqual(desired.domain, DOMAIN)
                 self.assertIs(kwargs["auth"], prepared.front_auth)
+                self.assertEqual(
+                    kwargs["trusted_known_hosts"], prepared.sftp_known_hosts
+                )
                 kwargs["pre_apply"]()
                 kwargs["post_apply"](front_result)
                 return front_result
@@ -479,7 +518,13 @@ class PcMinimalWizardOrchestrationTests(unittest.TestCase):
                 stack.enter_context(redirect_stderr(stderr))
                 self.assertEqual(wizard_pc(), 0)
 
-        self.assertEqual(events, ["prepare", "exit", "front", "e2e", "issue"])
+        self.assertEqual(
+            events,
+            ["prepare", "provider-firewall", "exit", "front", "e2e", "issue"],
+        )
+        self.confirm_provider_firewall.assert_called_once_with(
+            prepared.desired_exit
+        )
         self.assertEqual(
             [call.args[1] for call in phase.call_args_list],
             ["exit_applying", "exit_ready", "front_in_progress", "complete"],
@@ -695,6 +740,22 @@ class PcMinimalWizardOrchestrationTests(unittest.TestCase):
             marker = root / "pc-phase.json"
             self.assertEqual(_read_pc_phase(root), "exit_ready")
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+
+
+class PcProviderFirewallCheckpointTests(unittest.TestCase):
+    def test_prints_exact_rule_and_waits_once_before_apply(self):
+        desired = _prepared().desired_exit
+        output = StringIO()
+        with patch("builtins.input", return_value="") as prompt, redirect_stdout(
+            output
+        ):
+            _confirm_pc_provider_firewall(desired)
+
+        rendered = output.getvalue()
+        self.assertIn(f"TCP/{desired.listen_port}", rendered)
+        self.assertIn(f"{desired.front_egress_ip}/32", rendered)
+        self.assertIn("если такой панели нет", rendered.lower())
+        prompt.assert_called_once()
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX wizard lock semantics")

@@ -1,16 +1,22 @@
 import contextlib
 import hashlib
+import http.client
 import io
 import ssl
 import unittest
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from xhttp_setup.cli import _collect_front, _frontend_ips_from_args
 from xhttp_setup.doctor import doctor_front
-from xhttp_setup.errors import VerificationError
+from xhttp_setup.errors import (
+    HTTPSResponseError,
+    TLSVerificationError,
+    VerificationError,
+)
 from xhttp_setup.front import (
     _client_tls_context,
+    _read_http_status_line,
     build_front_plan,
     check_public_tls,
     https_status,
@@ -47,6 +53,9 @@ def front_desired() -> FrontDesired:
 
 
 class _ContextObject:
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
     def __enter__(self):
         return self
 
@@ -57,6 +66,7 @@ class _ContextObject:
 class _FakeTLS(_ContextObject):
     def __init__(self):
         self.sent = b""
+        self.received = False
 
     def getpeercert(self, binary_form=False):
         if binary_form:
@@ -71,6 +81,12 @@ class _FakeTLS(_ContextObject):
 
     def sendall(self, payload):
         self.sent += payload
+
+    def recv(self, _size):
+        if self.received:
+            return b""
+        self.received = True
+        return b"HTTP/1.1 204 No Content\r\n"
 
 
 class _FakeContext:
@@ -97,6 +113,126 @@ class _FakeResponse:
 
 
 class FrontAddressRoleTests(unittest.TestCase):
+    def test_https_status_classifies_connect_tls_send_and_response_stages(self):
+        url = "https://front.example.org/api/check"
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                side_effect=ConnectionError("connect failed"),
+            ),
+            self.assertRaises(VerificationError) as connect_error,
+        ):
+            https_status(url, connect_ip="198.51.100.20")
+        self.assertNotIsInstance(connect_error.exception, HTTPSResponseError)
+        self.assertNotIsInstance(connect_error.exception, TLSVerificationError)
+
+        class BrokenTLSContext:
+            def wrap_socket(self, _raw, *, server_hostname):
+                del server_hostname
+                raise ssl.SSLError("handshake failed")
+
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ),
+            patch(
+                "xhttp_setup.front.ssl.create_default_context",
+                return_value=BrokenTLSContext(),
+            ),
+            self.assertRaises(TLSVerificationError),
+        ):
+            https_status(url, connect_ip="198.51.100.20")
+
+        send_context = _FakeContext()
+        send_context.tls.sendall = Mock(side_effect=TimeoutError("send"))
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ),
+            patch(
+                "xhttp_setup.front.ssl.create_default_context",
+                return_value=send_context,
+            ),
+            self.assertRaises(VerificationError) as send_error,
+        ):
+            https_status(url, connect_ip="198.51.100.20")
+        self.assertNotIsInstance(send_error.exception, HTTPSResponseError)
+
+        response_context = _FakeContext()
+        response_context.tls.recv = Mock(
+            side_effect=TimeoutError("response")
+        )
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ),
+            patch(
+                "xhttp_setup.front.ssl.create_default_context",
+                return_value=response_context,
+            ),
+            self.assertRaises(HTTPSResponseError),
+        ):
+            https_status(url, connect_ip="198.51.100.20")
+
+    def test_http_status_reader_rejects_nonfinal_and_out_of_range_codes(self):
+        class PayloadTLS:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def settimeout(self, _value):
+                pass
+
+            def recv(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        invalid = (
+            b"HTTP/1.1 000 Invalid\r\n",
+            b"HTTP/1.1 100 Continue\r\nHTTP/1.1 204 No Content\r\n",
+            b"HTTP/1.1 600 Invalid\r\n",
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(
+                http.client.BadStatusLine
+            ):
+                _read_http_status_line(PayloadTLS(payload), deadline=float("inf"))
+
+    def test_http_status_reader_rejects_overlong_line(self):
+        class LongTLS:
+            def settimeout(self, _value):
+                pass
+
+            def recv(self, size):
+                return b"X" * size
+
+        with self.assertRaises(http.client.LineTooLong):
+            _read_http_status_line(LongTLS(), deadline=float("inf"))
+
+    def test_http_status_reader_uses_one_absolute_deadline(self):
+        class SlowTLS:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def recv(self, _size):
+                return b"H"
+
+        tls = SlowTLS()
+        with (
+            patch(
+                "xhttp_setup.front.time.monotonic",
+                side_effect=(1.0, 2.0, 3.1),
+            ),
+            self.assertRaisesRegex(TimeoutError, "общий срок"),
+        ):
+            _read_http_status_line(tls, deadline=3.0)
+        self.assertEqual(tls.timeouts, [2.0, 1.0])
+
     def test_model_and_plan_keep_three_ip_roles_distinct(self):
         desired = front_desired()
         self.assertEqual(desired.client_connect_ip, "198.51.100.20")
@@ -177,7 +313,11 @@ class FrontAddressRoleTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 204)
-        create_connection.assert_called_once_with(("198.51.100.20", 443), timeout=15)
+        target = create_connection.call_args.args[0]
+        connect_timeout = create_connection.call_args.kwargs["timeout"]
+        self.assertEqual(target, ("198.51.100.20", 443))
+        self.assertGreater(connect_timeout, 0)
+        self.assertLessEqual(connect_timeout, 15)
         self.assertEqual(context.server_name, "front.example.org")
         request = context.tls.sent.decode("ascii")
         self.assertIn("GET /api/check?probe=1 HTTP/1.1\r\n", request)
@@ -201,7 +341,11 @@ class FrontAddressRoleTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 204)
-        create_connection.assert_called_once_with(("127.0.0.1", 43126), timeout=15)
+        target = create_connection.call_args.args[0]
+        connect_timeout = create_connection.call_args.kwargs["timeout"]
+        self.assertEqual(target, ("127.0.0.1", 43126))
+        self.assertGreater(connect_timeout, 0)
+        self.assertLessEqual(connect_timeout, 15)
         self.assertEqual(context.server_name, "front.example.org")
         self.assertIn("Host: front.example.org\r\n", context.tls.sent.decode("ascii"))
 

@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from xhttp_setup.errors import InstallerError
 from xhttp_setup.exit_installer import XRAY_VERSION, _firewall_plan
+from xhttp_setup.exit_network import ExitNetworkProfile
 from xhttp_setup.models import ExitDesired, Handoff
 from xhttp_setup.pc_autosetup import (
     PcUserInputs,
@@ -179,7 +180,11 @@ class PcExitResumeTests(unittest.TestCase):
         self.assertEqual(result.desired, desired)
         self.assertEqual(result.handoff, handoff)
         self.assertNotIn(ENCRYPTION, repr(result))
-        preflight.assert_called_once()
+        preflight.assert_called_once_with(
+            ssh,
+            ExitNetworkProfile("9.9.9.9", 8083),
+            ssh_port=22,
+        )
         measure.assert_called_once_with(ssh)
 
     def test_no_local_artifacts_is_a_new_install_without_remote_calls(self):

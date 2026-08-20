@@ -6,6 +6,7 @@ It stages and returns a firewall plan but never executes that plan.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -22,6 +23,9 @@ from .osutil import atomic_write, atomic_write_text, ensure_dir, load_json, sha2
 from .ssh_transport import (
     SSHAuth,
     SSHClient,
+    SSHCommand,
+    SSHTransportError,
+    SFTPBatch,
     SFTPClient,
     pin_host_key,
     sftp_quote,
@@ -96,6 +100,10 @@ class RemoteExitError(InstallerError):
         artifact_status: ArtifactStatus,
         cleanup_status: CleanupStatus,
         remote_temp: str | None = None,
+        transport_failure: bool = False,
+        session_cleanup_failed: bool = False,
+        recovery_completed: bool = False,
+        recovery_failed: bool = False,
     ) -> None:
         detail = _STAGE_MESSAGES.get(stage, "удалённая установка не завершена")
         message = (
@@ -104,12 +112,22 @@ class RemoteExitError(InstallerError):
         )
         if cleanup_status in {"failed", "unknown"} and remote_temp is not None:
             message += f"; проверить вручную: {remote_temp}"
+        if session_cleanup_failed:
+            message += "; ssh_session_cleanup=failed"
+        if recovery_completed:
+            message += "; exact_recovery=succeeded"
+        if recovery_failed:
+            message += "; exact_recovery=failed"
         super().__init__(message)
         self.stage = stage
         self.remote_status = remote_status
         self.artifact_status = artifact_status
         self.cleanup_status = cleanup_status
         self.remote_temp = remote_temp
+        self.transport_failure = transport_failure
+        self.session_cleanup_failed = session_cleanup_failed
+        self.recovery_completed = recovery_completed
+        self.recovery_failed = recovery_failed
 
     @property
     def remote_applied(self) -> bool | None:
@@ -118,6 +136,13 @@ class RemoteExitError(InstallerError):
         if self.remote_status == "not_started":
             return False
         return None
+
+    @property
+    def recovery_allowed(self) -> bool:
+        return (
+            self.remote_status in {"not_started", "failed"}
+            and self.transport_failure
+        )
 
 
 @dataclass(frozen=True)
@@ -134,6 +159,56 @@ class _LocalPersistError(InstallerError):
 
 class _UploadVerificationError(InstallerError):
     pass
+
+
+@dataclass(frozen=True)
+class _RemoteTempCleanup:
+    succeeded: bool
+    transport_failure: bool = False
+
+
+@dataclass
+class _TeardownCapture:
+    error: BaseException | None = None
+
+
+@contextlib.contextmanager
+def _capture_context_teardown(scope, capture: _TeardownCapture):
+    entered = False
+    body_error: BaseException | None = None
+    try:
+        with scope as value:
+            entered = True
+            try:
+                yield value
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except BaseException as exc:
+        if not entered:
+            raise
+        if body_error is not None:
+            if exc is body_error:
+                raise
+            if hasattr(body_error, "add_note"):
+                body_error.add_note(
+                    "Дополнительно не завершился SSH session teardown"
+                )
+            raise body_error.with_traceback(body_error.__traceback__) from None
+        if not isinstance(exc, Exception):
+            raise
+        capture.error = exc
+
+
+def _caused_by_ssh_transport(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SSHTransportError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _validated_local_file(path: Path, *, description: str) -> Path:
@@ -184,13 +259,13 @@ def _parse_remote_id(value: str) -> int:
     return identifier
 
 
-def _checked_remote(ssh: SSHClient, argv: list[str], *, timeout: int = 120) -> None:
+def _checked_remote(ssh: SSHCommand, argv: list[str], *, timeout: int = 120) -> None:
     result = ssh.command(argv, check=False, timeout=timeout)
     if result.returncode != 0:
         raise InstallerError("Удалённая команда вернула ошибку")
 
 
-def _create_remote_temp(ssh: SSHClient) -> str:
+def _create_remote_temp(ssh: SSHCommand) -> str:
     result = ssh.command(
         ["mktemp", "-d", "-p", "/tmp", "xhttp-exit.XXXXXXXXXX"],
         check=False,
@@ -204,7 +279,7 @@ def _create_remote_temp(ssh: SSHClient) -> str:
     return lines[0].strip()
 
 
-def _remote_mode(ssh: SSHClient, path: str) -> str:
+def _remote_mode(ssh: SSHCommand, path: str) -> str:
     result = ssh.command(["stat", "-c", "%a", "--", path], check=False, timeout=30)
     if result.returncode != 0:
         raise InstallerError("Не удалось проверить права удалённого файла")
@@ -212,8 +287,8 @@ def _remote_mode(ssh: SSHClient, path: str) -> str:
 
 
 def _upload_and_verify(
-    sftp: SFTPClient,
-    ssh: SSHClient,
+    sftp: SFTPBatch,
+    ssh: SSHCommand,
     *,
     installer: Path,
     client_id_file: Path,
@@ -289,7 +364,7 @@ def _remote_apply_argv(
 
 
 def _stage_remote_artifact(
-    ssh: SSHClient,
+    ssh: SSHCommand,
     *,
     source: Path,
     destination: str,
@@ -314,7 +389,7 @@ def _stage_remote_artifact(
 
 
 def _download_artifacts(
-    sftp: SFTPClient,
+    sftp: SFTPBatch,
     *,
     remote_handoff: str,
     remote_firewall_plan: str,
@@ -411,22 +486,30 @@ def _persist_local_artifacts(
         atomic_write(firewall_target, firewall_source.read_bytes(), 0o600)
         _assert_regular_0600(handoff_target)
         _assert_regular_0600(firewall_target)
-    except Exception as original:
+    except BaseException as original:
         rollback_errors: list[Exception] = []
         for path, snapshot in snapshots.items():
             try:
                 _restore_local(path, snapshot)
             except Exception as exc:
                 rollback_errors.append(exc)
+        if not isinstance(original, Exception):
+            if rollback_errors and hasattr(original, "add_note"):
+                original.add_note(
+                    "Не удалось полностью откатить локальные exit-артефакты"
+                )
+            raise
         if rollback_errors:
-            raise _LocalPersistError(partial=True) from original
-        raise _LocalPersistError(partial=False) from original
+            raise _LocalPersistError(partial=True) from None
+        raise _LocalPersistError(partial=False) from None
     return handoff_target, firewall_target
 
 
-def _cleanup_remote_temp(ssh: SSHClient, remote_temp: str) -> bool:
+def _cleanup_remote_temp(
+    ssh: SSHCommand, remote_temp: str
+) -> _RemoteTempCleanup:
     if not _REMOTE_TEMP.fullmatch(remote_temp):
-        return False
+        return _RemoteTempCleanup(False)
     exact_files = [
         f"{remote_temp}/installer.pyz",
         f"{remote_temp}/client-id",
@@ -436,11 +519,19 @@ def _cleanup_remote_temp(ssh: SSHClient, remote_temp: str) -> bool:
     try:
         removed = ssh.command(["rm", "-f", "--", *exact_files], check=False, timeout=60)
         if removed.returncode != 0:
-            return False
+            return _RemoteTempCleanup(False)
         directory = ssh.command(["rmdir", "--", remote_temp], check=False, timeout=30)
-        return directory.returncode == 0
+        return _RemoteTempCleanup(directory.returncode == 0)
+    except SSHTransportError:
+        return _RemoteTempCleanup(False, transport_failure=True)
     except Exception:
-        return False
+        return _RemoteTempCleanup(False)
+
+
+def cleanup_remote_exit_temp(ssh: SSHCommand, remote_temp: str) -> bool:
+    """Remove only the exact bounded exit staging namespace."""
+
+    return _cleanup_remote_temp(ssh, remote_temp).succeeded
 
 
 def apply_remote_exit(
@@ -450,13 +541,15 @@ def apply_remote_exit(
     target: RemoteExitTarget,
     auth: SSHAuth,
     output_dir: Path,
+    ssh_runner: SSHCommand | None = None,
 ) -> RemoteExitResult:
     """Install the exit through pinned OpenSSH without applying its firewall plan.
 
     The remote apply is transactional inside ``apply_exit``. If the SSH session
     becomes uncertain or local artifact collection fails after a successful
     apply, ``RemoteExitError`` exposes that partial state without echoing remote
-    output or credentials.
+    output or credentials. A supplied ``ssh_runner`` is reused by the PC
+    orchestrator; standalone callers get one scoped command session.
     """
 
     desired = desired.validate()
@@ -476,13 +569,15 @@ def apply_remote_exit(
         known_hosts=known_hosts,
     )
     _assert_regular_0600(known_hosts)
-    ssh = SSHClient(
-        host=target.host,
-        port=target.port,
-        user=target.user,
-        known_hosts=known_hosts,
-        auth=auth,
-    )
+    command_client = None
+    if ssh_runner is None:
+        command_client = SSHClient(
+            host=target.host,
+            port=target.port,
+            user=target.user,
+            known_hosts=known_hosts,
+            auth=auth,
+        )
     sftp = SFTPClient(
         host=target.host,
         port=target.port,
@@ -497,10 +592,23 @@ def apply_remote_exit(
     stage = "remote_identity"
     remote_temp: str | None = None
     failure: Exception | None = None
+    failure_transport = False
+    cleanup_transport = False
     handoff_target: Path | None = None
     firewall_target: Path | None = None
 
-    with tempfile.TemporaryDirectory(prefix=".remote-exit-", dir=output) as temp:
+    if ssh_runner is None:
+        assert command_client is not None
+        command_scope = command_client.session()
+    else:
+        command_scope = contextlib.nullcontext(ssh_runner)
+    teardown = _TeardownCapture()
+
+    with _capture_context_teardown(
+        command_scope, teardown
+    ) as ssh, tempfile.TemporaryDirectory(
+        prefix=".remote-exit-", dir=output
+    ) as temp:
         local_temp = Path(temp)
         client_id_file = local_temp / "client-id"
         atomic_write_text(client_id_file, desired.client_id + "\n", 0o600)
@@ -523,15 +631,16 @@ def apply_remote_exit(
 
             stage = "upload"
             try:
-                _upload_and_verify(
-                    sftp,
-                    ssh,
-                    installer=installer,
-                    client_id_file=client_id_file,
-                    remote_installer=remote_installer,
-                    remote_client_id=remote_client_id,
-                    local_roundtrip_dir=local_temp,
-                )
+                with sftp.session() as upload_session:
+                    _upload_and_verify(
+                        upload_session,
+                        ssh,
+                        installer=installer,
+                        client_id_file=client_id_file,
+                        remote_installer=remote_installer,
+                        remote_client_id=remote_client_id,
+                        local_roundtrip_dir=local_temp,
+                    )
             except _UploadVerificationError:
                 stage = "upload_verify"
                 raise
@@ -573,12 +682,13 @@ def apply_remote_exit(
             )
 
             stage = "artifact_download"
-            handoff_download, firewall_download = _download_artifacts(
-                sftp,
-                remote_handoff=remote_handoff,
-                remote_firewall_plan=remote_firewall,
-                local_dir=local_temp,
-            )
+            with sftp.session() as download_session:
+                handoff_download, firewall_download = _download_artifacts(
+                    download_session,
+                    remote_handoff=remote_handoff,
+                    remote_firewall_plan=remote_firewall,
+                    local_dir=local_temp,
+                )
             stage = "artifact_validation"
             _validate_downloaded_artifacts(
                 desired,
@@ -599,20 +709,66 @@ def apply_remote_exit(
             artifact_status = "saved"
         except Exception as exc:
             failure = exc
+            failure_transport = _caused_by_ssh_transport(exc)
         finally:
             if remote_temp is not None:
-                cleanup_status = (
-                    "succeeded" if _cleanup_remote_temp(ssh, remote_temp) else "failed"
-                )
+                cleanup = _cleanup_remote_temp(ssh, remote_temp)
+                cleanup_status = "succeeded" if cleanup.succeeded else "failed"
+                cleanup_transport = cleanup.transport_failure
 
-    if failure is not None:
-        raise RemoteExitError(
-            stage=stage,
+    session_cleanup_failed = teardown.error is not None
+    if failure is not None or teardown.error is not None:
+        original = failure if failure is not None else teardown.error
+        assert original is not None
+        error_stage = stage if failure is not None else "cleanup"
+        error = RemoteExitError(
+            stage=error_stage,
             remote_status=remote_status,
             artifact_status=artifact_status,
             cleanup_status=cleanup_status,
             remote_temp=remote_temp,
-        ) from failure
+            transport_failure=(
+                failure_transport
+                or cleanup_transport
+                or _caused_by_ssh_transport(original)
+            ),
+            session_cleanup_failed=session_cleanup_failed,
+        )
+        if (
+            command_client is not None
+            and error.recovery_allowed
+            and cleanup_status != "succeeded"
+            and remote_temp is not None
+        ):
+            recovered = False
+            try:
+                with command_client.session() as recovery_ssh:
+                    recovered = cleanup_remote_exit_temp(recovery_ssh, remote_temp)
+            except Exception:
+                recovered = False
+            if recovered:
+                error = RemoteExitError(
+                    stage=error_stage,
+                    remote_status=remote_status,
+                    artifact_status=artifact_status,
+                    cleanup_status="succeeded",
+                    remote_temp=remote_temp,
+                    transport_failure=True,
+                    session_cleanup_failed=session_cleanup_failed,
+                    recovery_completed=True,
+                )
+            else:
+                error = RemoteExitError(
+                    stage=error_stage,
+                    remote_status=remote_status,
+                    artifact_status=artifact_status,
+                    cleanup_status=cleanup_status,
+                    remote_temp=remote_temp,
+                    transport_failure=True,
+                    session_cleanup_failed=session_cleanup_failed,
+                    recovery_failed=True,
+                )
+        raise error from None
     if cleanup_status != "succeeded":
         raise RemoteExitError(
             stage="cleanup",
@@ -620,6 +776,7 @@ def apply_remote_exit(
             artifact_status=artifact_status,
             cleanup_status=cleanup_status,
             remote_temp=remote_temp,
+            transport_failure=cleanup_transport,
         )
     if handoff_target is None or firewall_target is None:
         raise RemoteExitError(

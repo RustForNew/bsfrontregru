@@ -55,6 +55,24 @@ class FakeMaster:
         self.returncode = 0
 
 
+class UnkillableMaster(FakeMaster):
+    def __init__(self):
+        super().__init__()
+        self.unkillable = True
+
+    def wait(self, timeout=None):
+        if self.unkillable:
+            self.wait_calls.append(timeout)
+            raise subprocess.TimeoutExpired(["ssh"], timeout)
+        return super().wait(timeout=timeout)
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+
 class SSHBridgeTests(unittest.TestCase):
     def test_bridge_routes_are_loopback_only(self):
         with self.assertRaisesRegex(InstallerError, "loopback-only"):
@@ -205,7 +223,8 @@ class SSHBridgeTests(unittest.TestCase):
                 mock.patch.object(SSHBridgeSession, "_wait_for_master"),
             ):
                 opened = session.open()
-                temporary_path = Path(session._temporary.name)
+                temporary_path = session._temporary
+                self.assertIsNotNone(temporary_path)
                 route = session.ssh_route("sftp")
                 self.assertIs(opened, session)
                 self.assertEqual(session.tcp_route("panel").connect_host, "127.0.0.1")
@@ -244,7 +263,7 @@ class SSHBridgeTests(unittest.TestCase):
 
             def fake_run(argv, **_kwargs):
                 if argv[-1] == "id -u":
-                    temporary_paths.append(Path(session._temporary.name))
+                    temporary_paths.append(session._temporary)
                     return completed(argv, stdout="1000\n")
                 if "-O" in argv:
                     return completed(argv)
@@ -288,7 +307,7 @@ class SSHBridgeTests(unittest.TestCase):
             captured_temp = []
 
             def fake_popen(*_args, **_kwargs):
-                captured_temp.append(Path(session._temporary.name))
+                captured_temp.append(session._temporary)
                 return master
 
             with (
@@ -315,6 +334,179 @@ class SSHBridgeTests(unittest.TestCase):
             self.assertIsNone(session._master)
             self.assertIsNone(session._control_path)
             self.assertTrue(master.stderr.closed)
+
+    def test_route_setup_failure_cleans_private_bridge_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self._session(Path(temp))
+            captured_temp = []
+            real_mkdtemp = tempfile.mkdtemp
+
+            def make_temp(*args, **kwargs):
+                path = Path(real_mkdtemp(*args, **kwargs))
+                captured_temp.append(path)
+                return str(path)
+
+            body_error = KeyboardInterrupt("route allocation interrupted")
+            with (
+                mock.patch(
+                    "xhttp_setup.ssh_transport.tempfile.mkdtemp",
+                    side_effect=make_temp,
+                ),
+                mock.patch(
+                    "xhttp_setup.ssh_transport._free_loopback_port",
+                    side_effect=body_error,
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                session.open()
+
+            self.assertIs(raised.exception, body_error)
+            self.assertEqual(len(captured_temp), 1)
+            self.assertFalse(captured_temp[0].exists())
+            self.assertIsNone(session._temporary)
+            self.assertIsNone(session._control_path)
+            self.assertIsNone(session._master)
+
+    def test_unkillable_bridge_preserves_control_state_for_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self._session(Path(temp))
+            bridge_temp = Path(tempfile.mkdtemp(prefix=".bridge-close-test-"))
+            control_path = bridge_temp / "c"
+            control_path.touch()
+            master = UnkillableMaster()
+            session._temporary = bridge_temp
+            session._control_path = control_path
+            session._master = master
+            session._routes = {"front": TCPRoute("127.0.0.1", 43140)}
+
+            with (
+                mock.patch(
+                    "xhttp_setup.ssh_transport.subprocess.run",
+                    return_value=completed([]),
+                ),
+                mock.patch(
+                    "xhttp_setup.ssh_transport.os.killpg",
+                    side_effect=ProcessLookupError,
+                    create=True,
+                ),
+                self.assertRaisesRegex(InstallerError, "master"),
+            ):
+                session.close()
+
+            self.assertTrue(bridge_temp.exists())
+            self.assertIs(session._temporary, bridge_temp)
+            self.assertIs(session._control_path, control_path)
+            self.assertIs(session._master, master)
+            self.assertEqual(session._routes, {})
+
+            master.unkillable = False
+            with mock.patch(
+                "xhttp_setup.ssh_transport.subprocess.run",
+                return_value=completed([]),
+            ):
+                session.close()
+            self.assertFalse(bridge_temp.exists())
+
+    def test_bridge_teardown_keyboard_interrupt_propagates_and_preserves_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self._session(Path(temp))
+            bridge_temp = Path(tempfile.mkdtemp(prefix=".bridge-interrupt-test-"))
+            control_path = bridge_temp / "c"
+            control_path.touch()
+            master = FakeMaster()
+            session._temporary = bridge_temp
+            session._control_path = control_path
+            session._master = master
+
+            with (
+                mock.patch(
+                    "xhttp_setup.ssh_transport.subprocess.run",
+                    side_effect=KeyboardInterrupt(),
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                session.close()
+
+            self.assertTrue(bridge_temp.exists())
+            self.assertIs(session._temporary, bridge_temp)
+            self.assertIs(session._control_path, control_path)
+            self.assertIs(session._master, master)
+
+            with mock.patch(
+                "xhttp_setup.ssh_transport.subprocess.run",
+                return_value=completed([]),
+            ):
+                session.close()
+            self.assertFalse(bridge_temp.exists())
+
+    def test_bridge_context_body_error_remains_primary_with_safe_note(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self._session(Path(temp))
+            body_error = InstallerError("primary bridge body failure")
+            cleanup_secret = "cleanup-must-not-leak"
+
+            with (
+                mock.patch.object(session, "open", return_value=session),
+                mock.patch.object(
+                    session,
+                    "close",
+                    side_effect=InstallerError(cleanup_secret),
+                ),
+                self.assertRaises(InstallerError) as raised,
+            ):
+                with session:
+                    raise body_error
+
+            self.assertIs(raised.exception, body_error)
+            self.assertIn("teardown SSH-моста", repr(body_error.__notes__))
+            self.assertNotIn(cleanup_secret, repr(body_error.__notes__))
+
+    def test_bridge_open_error_remains_primary_when_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self._session(Path(temp))
+            master = FakeMaster()
+            body_error = InstallerError("primary bridge open failure")
+            cleanup_secret = "open-cleanup-must-not-leak"
+
+            with (
+                mock.patch(
+                    "xhttp_setup.ssh_transport._password_askpass",
+                    side_effect=self._askpass,
+                ),
+                mock.patch(
+                    "xhttp_setup.ssh_transport._free_loopback_port",
+                    side_effect=(43141, 43142, 43143),
+                ),
+                mock.patch(
+                    "xhttp_setup.ssh_transport.subprocess.Popen",
+                    return_value=master,
+                ),
+                mock.patch.object(
+                    SSHBridgeSession,
+                    "_wait_for_master",
+                    side_effect=body_error,
+                ),
+                mock.patch.object(
+                    session,
+                    "close",
+                    side_effect=InstallerError(cleanup_secret),
+                ),
+                self.assertRaises(InstallerError) as raised,
+            ):
+                session.open()
+
+            self.assertIs(raised.exception, body_error)
+            self.assertIn("teardown SSH-моста", repr(body_error.__notes__))
+            self.assertNotIn(cleanup_secret, repr(body_error.__notes__))
+            bridge_temp = session._temporary
+            self.assertIsNotNone(bridge_temp)
+            master.returncode = 0
+            with mock.patch(
+                "xhttp_setup.ssh_transport.subprocess.run",
+                return_value=completed([]),
+            ):
+                session.close()
+            self.assertFalse(bridge_temp.exists())
 
 
 if __name__ == "__main__":

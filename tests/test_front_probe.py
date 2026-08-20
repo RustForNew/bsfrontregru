@@ -1,16 +1,39 @@
 import contextlib
 import tempfile
+import traceback
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from xhttp_setup.errors import InstallerError, VerificationError
-from xhttp_setup.front_probe import run_with_temporary_front_route
+from xhttp_setup.errors import (
+    HTTPSResponseError,
+    InstallerError,
+    TLSVerificationError,
+    VerificationError,
+)
+from xhttp_setup.front_probe import (
+    run_with_temporary_front_route,
+    verify_front_rewrite_control,
+)
 from xhttp_setup.models import FrontDesired
-from xhttp_setup.ssh_transport import SSHAuth
+from xhttp_setup.ssh_transport import SSHAuth, TCPRoute
 
 
 _HOST_FINGERPRINT = "SHA256:" + "A" * 43
+
+
+class _ScopedClient:
+    def __init__(self):
+        self.session_events = []
+
+    @contextlib.contextmanager
+    def session(self):
+        self.session_events.append("open")
+        try:
+            yield self
+        finally:
+            self.session_events.append("close")
 
 
 def _desired() -> FrontDesired:
@@ -35,6 +58,7 @@ class TemporaryFrontRouteTests(unittest.TestCase):
         root: Path,
         *,
         operation,
+        route_mode="proxy",
         rollback_side_effect=None,
         upload_side_effect=None,
     ):
@@ -42,7 +66,7 @@ class TemporaryFrontRouteTests(unittest.TestCase):
         captured: dict[str, object] = {}
         self.last_events = events
         self.last_captured = captured
-        client = object()
+        client = _ScopedClient()
 
         def download(_client, remote_dir, name, local):
             self.assertIs(_client, client)
@@ -64,8 +88,9 @@ class TemporaryFrontRouteTests(unittest.TestCase):
             if upload_side_effect is not None:
                 raise upload_side_effect
 
-        def rollback(_client, **kwargs):
-            self.assertIs(_client, client)
+        def rollback(_transport, _session, **kwargs):
+            self.assertIs(_transport, client)
+            self.assertIs(_session, client)
             self.assertEqual(kwargs["remote_dir"], "/var/www/site")
             self.assertEqual(kwargs["journal"], ["temporary-htaccess-mutation"])
             captured["rollback_original"] = kwargs["original"]
@@ -85,7 +110,7 @@ class TemporaryFrontRouteTests(unittest.TestCase):
         with (
             mock.patch("xhttp_setup.front_probe.check_front_dns"),
             mock.patch("xhttp_setup.front_probe.check_public_tls"),
-            mock.patch("xhttp_setup.front_probe.pin_host_key"),
+            mock.patch("xhttp_setup.front_probe.pin_host_key") as pin,
             mock.patch("xhttp_setup.front_probe.SFTPClient", return_value=client) as sftp,
             mock.patch(
                 "xhttp_setup.front_probe.exclusive_lock",
@@ -100,7 +125,8 @@ class TemporaryFrontRouteTests(unittest.TestCase):
             ),
             mock.patch("xhttp_setup.front_probe._upload_verified", side_effect=upload),
             mock.patch(
-                "xhttp_setup.front_probe._rollback_journal", side_effect=rollback
+                "xhttp_setup.front_probe._rollback_journal_with_recovery",
+                side_effect=rollback,
             ),
         ):
             try:
@@ -109,9 +135,16 @@ class TemporaryFrontRouteTests(unittest.TestCase):
                     auth=auth,
                     state_dir=root / "probe-state",
                     operation=wrapped_operation,
+                    route_mode=route_mode,
+                    rewrite_control_nonce=(
+                        "b" * 32 if route_mode == "rewrite-control" else None
+                    ),
+                    trusted_known_hosts=root / "persistent-sftp.known_hosts",
                 )
             finally:
                 captured["sftp_calls"] = sftp.call_args_list
+                captured["pin_calls"] = pin.call_args_list
+                captured["session_events"] = client.session_events
 
         self.assertNotIn(secret, repr(captured))
         return result, events, captured
@@ -124,11 +157,56 @@ class TemporaryFrontRouteTests(unittest.TestCase):
 
         self.assertEqual(result, "measurement complete")
         self.assertEqual(events, ["upload", "operation", "rollback"])
+        self.assertEqual(captured["session_events"], ["open", "close"])
         temporary = captured["temporary"]
         self.assertIn("# owner rule", temporary)
         self.assertIn("203.0.113.20:25432", temporary)
         self.assertIn("/api/temporary-probe", temporary)
         self.assertIsInstance(captured["rollback_original"], InstallerError)
+        self.assertEqual(
+            captured["pin_calls"][0].kwargs["trusted_known_hosts"],
+            Path(temp) / "persistent-sftp.known_hosts",
+        )
+
+    def test_rewrite_control_uses_only_exact_redirect_rule_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, events, captured = self._run(
+                Path(temp),
+                operation=lambda: "control complete",
+                route_mode="rewrite-control",
+            )
+
+        self.assertEqual(result, "control complete")
+        self.assertEqual(events, ["upload", "operation", "rollback"])
+        temporary = captured["temporary"]
+        self.assertIn(
+            "RewriteRule ^api/temporary-probe/xhttp-setup-control-"
+            + "b" * 32
+            + "$ / [R=302,L]",
+            temporary,
+        )
+        self.assertNotIn("[P,", temporary)
+        self.assertNotIn("203.0.113.20:25432", temporary)
+        self.assertNotIn("ProxyRequests", temporary)
+        self.assertNotIn("CGI", temporary)
+
+    def test_rewrite_control_error_is_reraised_only_after_rollback(self):
+        original = VerificationError("control response was not 302")
+
+        def fail():
+            raise original
+
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(VerificationError) as raised:
+                self._run(
+                    Path(temp),
+                    operation=fail,
+                    route_mode="rewrite-control",
+                )
+
+        self.assertIs(raised.exception, original)
+        self.assertEqual(self.last_events, ["upload", "operation", "rollback"])
+        self.assertIs(self.last_captured["rollback_original"], original)
 
     def test_operation_error_is_reraised_only_after_rollback(self):
         original = VerificationError("frontend request failed")
@@ -205,6 +283,121 @@ class TemporaryFrontRouteTests(unittest.TestCase):
                 )
 
         self.assertIs(raised.exception, rollback_error)
+
+
+class RewriteControlVerificationTests(unittest.TestCase):
+    def _verify(self, desired: FrontDesired, *, status_or_error):
+        route = TCPRoute("127.0.0.1", 44321)
+        auth = SSHAuth("password", password="secret-never-log")
+        seen: dict[str, object] = {}
+
+        def temporary_route(route_desired, **kwargs):
+            seen["desired"] = route_desired
+            seen["kwargs"] = kwargs
+            return kwargs["operation"]()
+
+        with (
+            mock.patch(
+                "xhttp_setup.front_probe.secrets.token_hex",
+                return_value="a" * 32,
+            ),
+            mock.patch(
+                "xhttp_setup.front_probe.run_with_temporary_front_route",
+                side_effect=temporary_route,
+            ) as temporary,
+            mock.patch(
+                "xhttp_setup.front_probe.https_status",
+                side_effect=(
+                    status_or_error
+                    if isinstance(status_or_error, BaseException)
+                    else None
+                ),
+                return_value=(
+                    status_or_error
+                    if not isinstance(status_or_error, BaseException)
+                    else None
+                ),
+            ) as status,
+        ):
+            verify_front_rewrite_control(
+                desired,
+                auth=auth,
+                state_dir=Path("/tmp/front-control"),
+                https_route=route,
+                trusted_known_hosts=Path("/tmp/persistent-sftp.known_hosts"),
+            )
+
+        seen["temporary_calls"] = temporary.call_args_list
+        seen["status_calls"] = status.call_args_list
+        self.assertNotIn("secret-never-log", repr(seen))
+        return seen
+
+    def test_exact_302_passes_on_unique_suffix_without_mutating_max_path(self):
+        desired = replace(_desired(), xhttp_path="/" + "a" * 179).validate()
+        seen = self._verify(desired, status_or_error=302)
+
+        installed = seen["desired"]
+        self.assertEqual(installed.xhttp_path, desired.xhttp_path)
+        kwargs = seen["kwargs"]
+        self.assertEqual(kwargs["route_mode"], "rewrite-control")
+        self.assertEqual(kwargs["rewrite_control_nonce"], "a" * 32)
+        self.assertEqual(kwargs["https_route"], TCPRoute("127.0.0.1", 44321))
+        call = seen["status_calls"][0]
+        self.assertEqual(
+            call.args[0],
+            f"https://front.example.org{desired.xhttp_path}"
+            "/xhttp-setup-control-" + "a" * 32,
+        )
+        self.assertEqual(call.kwargs["connect_ip"], "192.0.2.10")
+        self.assertEqual(call.kwargs["timeout"], 8)
+        self.assertEqual(call.kwargs["route"], TCPRoute("127.0.0.1", 44321))
+
+    def test_non_302_status_fails_distinctly_without_path_disclosure(self):
+        desired = _desired()
+        with self.assertRaises(VerificationError) as caught:
+            self._verify(desired, status_or_error=404)
+
+        rendered = "".join(traceback.format_exception(caught.exception))
+        self.assertIn("ожидался HTTP 302, получен HTTP 404", rendered)
+        self.assertNotIn(desired.xhttp_path, rendered)
+        self.assertNotIn("https://", rendered)
+
+    def test_transport_and_tls_failures_are_distinct_and_sanitized(self):
+        desired = _desired()
+        cases = (
+            (
+                HTTPSResponseError(
+                    f"response failed at https://front.example.org{desired.xhttp_path}"
+                ),
+                VerificationError,
+                "отправлен, но корректный HTTP-ответ не получен",
+            ),
+            (
+                VerificationError(
+                    f"connect failed at https://front.example.org{desired.xhttp_path}"
+                ),
+                VerificationError,
+                "не удалось безопасно отправить",
+            ),
+            (
+                TLSVerificationError(
+                    f"pin failed at https://front.example.org{desired.xhttp_path}"
+                ),
+                TLSVerificationError,
+                "TLS/SNI/leaf-сертификат не прошёл",
+            ),
+        )
+        for error, expected_type, message in cases:
+            with self.subTest(error=type(error).__name__), self.assertRaises(
+                expected_type
+            ) as caught:
+                self._verify(desired, status_or_error=error)
+            rendered = "".join(traceback.format_exception(caught.exception))
+            self.assertIn(message, rendered)
+            self.assertNotIn(desired.xhttp_path, rendered)
+            self.assertNotIn("https://", rendered)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertIsNone(caught.exception.__context__)
 
 
 if __name__ == "__main__":

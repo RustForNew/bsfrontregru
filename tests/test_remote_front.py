@@ -5,6 +5,7 @@ import shlex
 import stat
 import subprocess
 import tempfile
+import traceback
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,10 +16,13 @@ from xhttp_setup.models import FrontDesired, Handoff
 from xhttp_setup.remote_front import (
     RemoteFrontError,
     RemoteFrontTarget,
+    _TeardownCapture,
+    _capture_context_teardown,
+    _persist_local_client,
     apply_remote_front,
 )
 from xhttp_setup.render import render_vless_uri
-from xhttp_setup.ssh_transport import SSHAuth
+from xhttp_setup.ssh_transport import SSHAuth, SSHTransportError
 
 
 UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
@@ -88,6 +92,14 @@ class RemoteState:
         self.files: dict[str, bytes] = {}
         self.modes: dict[str, int] = {}
         self.directories: set[str] = set()
+        self.ssh_session_events: list[str] = []
+        self.ssh_session_count = 0
+        self.teardown_error_sessions: set[int] = set()
+        self.broken_session = False
+        self.transport_fail_stat_once = False
+        self.transport_fail_cleanup_once = False
+        self.sftp_session_events: list[str] = []
+        self.transport_events: list[str] = []
         self.commands: list[list[str]] = []
         self.apply_input: str | None = None
         self.apply_command: list[str] | None = None
@@ -115,6 +127,21 @@ class FakeSSH:
     def __init__(self, state: RemoteState):
         self.state = state
 
+    @contextmanager
+    def session(self):
+        self.state.ssh_session_count += 1
+        session_number = self.state.ssh_session_count
+        self.state.broken_session = False
+        self.state.ssh_session_events.append("open")
+        self.state.transport_events.append("ssh-open")
+        try:
+            yield self
+        finally:
+            self.state.ssh_session_events.append("close")
+            self.state.transport_events.append("ssh-close")
+            if session_number in self.state.teardown_error_sessions:
+                raise InstallerError("simulated SSH session teardown failure")
+
     def command(
         self,
         argv,
@@ -126,6 +153,8 @@ class FakeSSH:
         del check, timeout
         command = list(argv)
         self.state.commands.append(command)
+        if self.state.broken_session:
+            raise SSHTransportError("simulated broken SSH session")
         if command == ["id", "-u"]:
             return subprocess.CompletedProcess(command, 0, f"{self.state.uid}\n", "")
         if command == [
@@ -144,6 +173,10 @@ class FakeSSH:
             self.state.modes[command[3]] = 0o700
             return subprocess.CompletedProcess(command, 0, "", "")
         if command[:4] == ["stat", "-c", "%f %a %u %g %s", "--"]:
+            if self.state.transport_fail_stat_once:
+                self.state.transport_fail_stat_once = False
+                self.state.broken_session = True
+                raise SSHTransportError("simulated SSH loss during stat")
             metadata = self.state.metadata(command[4])
             return subprocess.CompletedProcess(
                 command, 0 if metadata is not None else 1, metadata or "", ""
@@ -155,10 +188,12 @@ class FakeSSH:
             digest = hashlib.sha256(self.state.files[path]).hexdigest()
             return subprocess.CompletedProcess(command, 0, f"{digest}  {path}\n", "")
         if command and command[0] == "python3" and "--apply" in command:
+            self.state.transport_events.append("apply")
             self.state.apply_command = command
             self.state.apply_input = input_text
             if self.state.apply_raises:
-                raise InstallerError(
+                self.state.broken_session = True
+                raise SSHTransportError(
                     "simulated SSH loss " + SFTP_PASSWORD + " " + ENCRYPTION
                 )
             if self.state.apply_returncode != 0:
@@ -181,6 +216,10 @@ class FakeSSH:
                 command, 0, expected_client().decode("utf-8"), ""
             )
         if command[:3] == ["rm", "-f", "--"]:
+            if self.state.transport_fail_cleanup_once:
+                self.state.transport_fail_cleanup_once = False
+                self.state.broken_session = True
+                raise SSHTransportError("simulated cleanup transport loss")
             if self.state.fail_cleanup:
                 return subprocess.CompletedProcess(command, 1, "", "cleanup failed")
             for remote_path in command[3:]:
@@ -196,10 +235,30 @@ class FakeSSH:
             return subprocess.CompletedProcess(command, 0, "", "")
         raise AssertionError(f"unexpected SSH command: {command!r}")
 
+    def fresh_command(
+        self, argv, *, check=True, timeout=300, input_text=None
+    ):
+        return self.command(
+            argv,
+            check=check,
+            timeout=timeout,
+            input_text=input_text,
+        )
+
 
 class FakeSFTP:
     def __init__(self, state: RemoteState):
         self.state = state
+
+    @contextmanager
+    def session(self):
+        self.state.sftp_session_events.append("open")
+        self.state.transport_events.append("sftp-open")
+        try:
+            yield self
+        finally:
+            self.state.sftp_session_events.append("close")
+            self.state.transport_events.append("sftp-close")
 
     def batch(self, commands, *, check=True):
         del check
@@ -323,6 +382,26 @@ class RemoteFrontTests(unittest.TestCase):
         self.assertFalse(
             any(path.startswith(state.remote_temp + "/") for path in state.files)
         )
+        self.assertEqual(
+            state.ssh_session_events,
+            ["open", "close"],
+        )
+        self.assertEqual(
+            state.sftp_session_events,
+            ["open", "close", "open", "close"],
+        )
+        self.assertEqual(
+            state.transport_events,
+            [
+                "ssh-open",
+                "sftp-open",
+                "sftp-close",
+                "apply",
+                "sftp-open",
+                "sftp-close",
+                "ssh-close",
+            ],
+        )
 
     def test_firewall_confirmation_is_required_before_network(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -383,6 +462,25 @@ class RemoteFrontTests(unittest.TestCase):
         self.assertEqual(raised.exception.cleanup_status, "succeeded")
         self.assertIsNone(state.apply_command)
 
+    def test_preapply_transport_loss_recovers_temp_in_one_new_session(self):
+        state = RemoteState()
+        state.transport_fail_stat_once = True
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteFrontError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "remote_temp")
+        self.assertEqual(error.remote_status, "not_started")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.recovery_completed)
+        self.assertFalse(error.recovery_failed)
+        self.assertEqual(
+            state.ssh_session_events,
+            ["open", "close", "open", "close"],
+        )
+        self.assertIsNone(state.apply_command)
+
     def test_apply_failure_reports_state_without_echoing_secrets(self):
         state = RemoteState()
         state.apply_returncode = 17
@@ -406,10 +504,122 @@ class RemoteFrontTests(unittest.TestCase):
             with self.assertRaises(RemoteFrontError) as raised:
                 self.run_install(state, Path(temp))
 
-        self.assertEqual(raised.exception.remote_status, "unknown")
-        self.assertIsNone(raised.exception.remote_applied)
-        self.assertNotIn(SFTP_PASSWORD, str(raised.exception))
-        self.assertNotIn(ENCRYPTION, str(raised.exception))
+        error = raised.exception
+        self.assertEqual(error.remote_status, "unknown")
+        self.assertIsNone(error.remote_applied)
+        rendered = "".join(traceback.format_exception(error))
+        for secret in (SFTP_PASSWORD, ENCRYPTION):
+            self.assertNotIn(secret, str(error))
+            self.assertNotIn(secret, repr(error))
+            self.assertNotIn(secret, rendered)
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertEqual(
+            sum("--apply" in command for command in state.commands),
+            1,
+        )
+        self.assertEqual(state.ssh_session_events, ["open", "close"])
+        self.assertEqual(error.cleanup_status, "failed")
+        self.assertFalse(error.recovery_completed)
+        self.assertFalse(error.recovery_failed)
+
+    def test_known_failed_apply_cleanup_transport_uses_one_recovery_session(self):
+        state = RemoteState()
+        state.apply_returncode = 17
+        state.transport_fail_cleanup_once = True
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteFrontError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "remote_apply")
+        self.assertEqual(error.remote_status, "failed")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.recovery_completed)
+        self.assertEqual(
+            state.ssh_session_events,
+            ["open", "close", "open", "close"],
+        )
+        self.assertEqual(
+            sum("--apply" in command for command in state.commands),
+            1,
+        )
+
+    def test_body_failure_stage_survives_session_teardown_failure(self):
+        state = RemoteState()
+        state.bad_client = True
+        state.teardown_error_sessions.add(1)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteFrontError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "artifact_validation")
+        self.assertEqual(error.remote_status, "succeeded")
+        self.assertEqual(error.artifact_status, "not_saved")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.session_cleanup_failed)
+
+    def test_teardown_capture_preserves_body_and_control_baseexceptions(self):
+        @contextmanager
+        def fails_during_teardown(error):
+            try:
+                yield object()
+            finally:
+                raise error
+
+        ordinary_body = RuntimeError("body failure")
+        capture = _TeardownCapture()
+        with self.assertRaises(RuntimeError) as raised:
+            with _capture_context_teardown(
+                fails_during_teardown(InstallerError("teardown failure")),
+                capture,
+            ):
+                raise ordinary_body
+        self.assertIs(raised.exception, ordinary_body)
+        self.assertIsNone(capture.error)
+
+        interrupted_body = KeyboardInterrupt("body interrupted")
+        capture = _TeardownCapture()
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            with _capture_context_teardown(
+                fails_during_teardown(InstallerError("teardown failure")),
+                capture,
+            ):
+                raise interrupted_body
+        self.assertIs(raised.exception, interrupted_body)
+        self.assertIsNone(capture.error)
+
+        capture = _TeardownCapture()
+        with self.assertRaises(KeyboardInterrupt):
+            with _capture_context_teardown(
+                fails_during_teardown(KeyboardInterrupt("teardown interrupted")),
+                capture,
+            ):
+                pass
+        self.assertIsNone(capture.error)
+
+        teardown_error = InstallerError("ordinary teardown failure")
+        capture = _TeardownCapture()
+        with _capture_context_teardown(
+            fails_during_teardown(teardown_error), capture
+        ):
+            pass
+        self.assertIs(capture.error, teardown_error)
+
+    def test_successful_apply_teardown_failure_is_typed_cleanup_error(self):
+        state = RemoteState()
+        state.teardown_error_sessions.add(1)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(RemoteFrontError) as raised:
+                self.run_install(state, Path(temp))
+
+        error = raised.exception
+        self.assertEqual(error.stage, "cleanup")
+        self.assertEqual(error.remote_status, "succeeded")
+        self.assertEqual(error.artifact_status, "saved")
+        self.assertEqual(error.cleanup_status, "succeeded")
+        self.assertTrue(error.session_cleanup_failed)
 
     def test_invalid_client_after_success_is_explicit_partial_success(self):
         state = RemoteState()
@@ -452,6 +662,46 @@ class RemoteFrontTests(unittest.TestCase):
         self.assertEqual(raised.exception.cleanup_status, "failed")
         self.assertEqual(raised.exception.remote_temp, state.remote_temp)
         self.assertNotIn("vless://", str(raised.exception))
+
+    def test_local_client_transaction_rolls_back_control_baseexceptions(self):
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            for previous in (b"old-client", None):
+                with self.subTest(
+                    exception_type=exception_type.__name__, previous=previous
+                ):
+                    with tempfile.TemporaryDirectory() as temp:
+                        root = Path(temp)
+                        output = root / "result"
+                        output.mkdir()
+                        target = output / "client.vless"
+                        if previous is not None:
+                            target.write_bytes(previous)
+                        source = root / "client.download.vless"
+                        source.write_bytes(b"new-client")
+                        calls = 0
+
+                        def replace_then_interrupt(path, data, mode=0o600):
+                            nonlocal calls
+                            calls += 1
+                            portable_atomic_write(path, data, mode)
+                            if calls == 1:
+                                raise exception_type(
+                                    "interrupted local client transaction"
+                                )
+
+                        with (
+                            patch(
+                                "xhttp_setup.remote_front.atomic_write",
+                                side_effect=replace_then_interrupt,
+                            ),
+                            self.assertRaises(exception_type),
+                        ):
+                            _persist_local_client(source, output)
+
+                        if previous is None:
+                            self.assertFalse(target.exists())
+                        else:
+                            self.assertEqual(target.read_bytes(), previous)
 
     def test_target_validation_happens_before_any_network_call(self):
         bad_target = RemoteFrontTarget(
