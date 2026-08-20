@@ -22,7 +22,7 @@ HTTP, потому что обычный пользователь shared-hosting
 hostname. Для подтверждённого рабочего случая с чужим/неподходящим сертификатом
 есть отдельный явный режим закрепления SHA-256 именно текущего leaf-сертификата.
 
-## Что делает версия 0.4.0
+## Что делает версия 0.4.1
 
 - `pc`: с Linux/WSL-компьютера настраивает exit по закреплённому root SSH,
   затем применяет тот же frontend-процесс напрямую либо через доверенный
@@ -73,7 +73,8 @@ hostname. Для подтверждённого рабочего случая с
 
 Последний пункт принципиален: поля изменения ISPmanager зависят от версии, тарифа и
 плагинов провайдера. Неправильный универсальный запрос может изменить не тот
-сайт. В 0.4.0 сайт, SSL-vhost и сертификат создаются заранее через ISPmanager.
+сайт. Начиная с 0.4.0 сайт, SSL-vhost и сертификат создаются заранее через
+ISPmanager.
 В режиме `public` нужен сертификат публичного CA; в режиме `pinned` допускается
 проверенный self-signed leaf. Мастер получает `document root` из списка сайтов
 панели или принимает точное значение оператора.
@@ -103,8 +104,9 @@ hostname. Для подтверждённого рабочего случая с
   предпочтителен валидный публичный сертификат, а pin-режим предназначен только
   для уже проверенного точного leaf-сертификата;
 - exit: Debian/Ubuntu-подобный Linux, `systemd`, root/sudo, `x86_64` или
-  `aarch64`, свободный TCP-порт выше 1024; для режима `pc` — прямой root SSH,
-  уже активный UFW и доступная read-only команда `nft list ruleset`;
+  `aarch64`, свободный TCP-порт выше 1024; готовый путь подготовки для режима
+  `pc` поддерживает новый Debian 12+ или Ubuntu 22.04+ с прямым root SSH, уже
+  активным UFW и доступной read-only командой `nft list ruleset`;
 - оператор отдельно задаёт три IPv4-роли, перечисленные ниже;
 - проверенный через панель/поддержку SHA-256 fingerprint SFTP-сервера;
 - `curl`, `ssh`, `sftp`, `ssh-keyscan`, `ssh-keygen` на машине запуска.
@@ -115,12 +117,10 @@ hostname. Для подтверждённого рабочего случая с
 
 ## Пошаговая установка
 
-Инструкции для пользователя:
-
-- [`docs/home-pc-linux-windows.txt`](docs/home-pc-linux-windows.txt) — скачать,
-  проверить, запустить и что вводить в Linux/Windows;
-- [`docs/reg-ru-ispmanager-setup.txt`](docs/reg-ru-ispmanager-setup.txt) — создать
-  сайт, настроить DNS/TLS, получить DOCROOT и измерить `FRONT_EGRESS_IP`.
+Одна пользовательская инструкция:
+[`INSTRUCTION.txt`](https://github.com/RustForNew/bsfrontregru/releases/download/v0.4.1/INSTRUCTION.txt).
+В ней собраны подготовка REG.RU/ISPmanager, Linux/Windows-запуск и точные
+значения для мастера. Windows ZIP содержит тот же файл.
 
 Технический проверенный runbook сохранён отдельно:
 [`docs/reg-ru-pinned-tls.txt`](docs/reg-ru-pinned-tls.txt).
@@ -138,17 +138,15 @@ hostname. Для подтверждённого рабочего случая с
 document root и измеренный `FRONT_EGRESS_IP`. После этой подготовки сам
 установщик запускается только с домашнего компьютера.
 
-Linux:
+Linux: скачайте `.pyz` вместе с `.pyz.sha256` и используйте только
+checksum-gated блок из единой `INSTRUCTION.txt`; он не запустит мастер при
+несовпадении SHA-256.
 
-```bash
-python3 xhttp-setup-0.4.0.pyz pc
-```
-
-Windows 10/11:
+Windows 10 версии 2004 (build 19041)+ или Windows 11:
 
 1. Один раз установите WSL2: `wsl --install -d Ubuntu`, затем перезагрузитесь.
-2. Распакуйте `xhttp-setup-0.4.0-windows-wsl.zip`.
-3. Запустите `START-WINDOWS.cmd` двойным кликом.
+2. Распакуйте `xhttp-setup-0.4.1-windows-wsl.zip`.
+3. Прочитайте `INSTRUCTION.txt` и запустите `START-WINDOWS.cmd` двойным кликом.
 
 Windows-пакет сверяет SHA-256 вложенного `.pyz` и запускает тот же мастер внутри
 WSL2. Native Windows без WSL не поддерживается: отдельный SSH-транспорт для него
@@ -275,12 +273,11 @@ python3 -m unittest discover -s tests -v
 Артефакты появятся в `dist/`:
 
 ```text
-xhttp-setup-0.4.0.pyz
-xhttp-setup-0.4.0.pyz.sha256
-xhttp-setup-0.4.0-windows-wsl.zip
-xhttp-setup-0.4.0-windows-wsl.zip.sha256
-home-pc-linux-windows.txt
-reg-ru-ispmanager-setup.txt
+xhttp-setup-0.4.1.pyz
+xhttp-setup-0.4.1.pyz.sha256
+xhttp-setup-0.4.1-windows-wsl.zip
+xhttp-setup-0.4.1-windows-wsl.zip.sha256
+INSTRUCTION.txt
 ```
 
 GitHub workflow публикует только tag вида `vX.Y.Z`. В репозитории включите
@@ -317,7 +314,7 @@ journalctl -u xhttp-setup-xray --since today
 
 - автоматический rollback покрывает неуспешный запуск managed systemd-сервиса и
   frontend-транзакцию вплоть до подтверждения firewall, E2E и записи профиля;
-  отдельной команды rollback после уже успешной установки в 0.4.0 ещё нет;
+  отдельной команды rollback после уже успешной установки в 0.4.1 ещё нет;
 - выдача Let's Encrypt, DNS propagation и capability-driven ISPmanager adapter
   оставлены для следующей версии;
 - Windows-пакет требует WSL2; native Windows без WSL не поддерживается;

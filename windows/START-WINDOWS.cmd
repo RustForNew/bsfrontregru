@@ -3,14 +3,15 @@ setlocal
 chcp 65001 >nul
 
 set "XHTTP_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if not exist "%~dp0xhttp-setup.ps1" goto :incomplete
+set "XHTTP_LAUNCHER=%~dp0_internal\xhttp-setup.ps1"
+if not exist "%XHTTP_LAUNCHER%" goto :incomplete
 if not exist "%XHTTP_POWERSHELL%" (
     echo ERROR: Windows PowerShell was not found.
     set "XHTTP_EXIT_CODE=1"
     goto :finished
 )
 
-"%XHTTP_POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0xhttp-setup.ps1"
+"%XHTTP_POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%XHTTP_LAUNCHER%"
 set "XHTTP_EXIT_CODE=%ERRORLEVEL%"
 goto :finished
 
