@@ -20,6 +20,8 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       linux_asset: ${{ steps.meta.outputs.linux_asset }}
       windows_asset: ${{ steps.meta.outputs.windows_asset }}
+      home_guide: ${{ steps.meta.outputs.home_guide }}
+      regru_guide: ${{ steps.meta.outputs.regru_guide }}
     steps:
       - name: Checkout exact tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,6 +51,8 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "linux_asset=xhttp-setup-$version.pyz" >> "$GITHUB_OUTPUT"
           echo "windows_asset=xhttp-setup-$version-windows-wsl.zip" >> "$GITHUB_OUTPUT"
+          echo "home_guide=home-pc-linux-windows.txt" >> "$GITHUB_OUTPUT"
+          echo "regru_guide=reg-ru-ispmanager-setup.txt" >> "$GITHUB_OUTPUT"
       - name: Test and build
         shell: bash
         run: |
@@ -69,6 +73,14 @@ jobs:
           python scripts/build_windows_bundle.py
           linux_asset="dist/${{ steps.meta.outputs.linux_asset }}"
           windows_asset="dist/${{ steps.meta.outputs.windows_asset }}"
+          home_guide="dist/${{ steps.meta.outputs.home_guide }}"
+          regru_guide="dist/${{ steps.meta.outputs.regru_guide }}"
+          install -m 0644 docs/home-pc-linux-windows.txt "$home_guide"
+          install -m 0644 docs/reg-ru-ispmanager-setup.txt "$regru_guide"
+          cmp -s docs/home-pc-linux-windows.txt "$home_guide"
+          cmp -s docs/reg-ru-ispmanager-setup.txt "$regru_guide"
+          test -s "$home_guide"
+          test -s "$regru_guide"
           python "$linux_asset" --version
           unzip -tq "$windows_asset"
           for asset in "$linux_asset" "$windows_asset"; do
@@ -86,6 +98,8 @@ jobs:
             dist/${{ steps.meta.outputs.linux_asset }}.sha256
             dist/${{ steps.meta.outputs.windows_asset }}
             dist/${{ steps.meta.outputs.windows_asset }}.sha256
+            dist/${{ steps.meta.outputs.home_guide }}
+            dist/${{ steps.meta.outputs.regru_guide }}
           if-no-files-found: error
           retention-days: 7
 
@@ -106,6 +120,8 @@ jobs:
         env:
           LINUX_ASSET: ${{ needs.build.outputs.linux_asset }}
           WINDOWS_ASSET: ${{ needs.build.outputs.windows_asset }}
+          HOME_GUIDE: ${{ needs.build.outputs.home_guide }}
+          REGRU_GUIDE: ${{ needs.build.outputs.regru_guide }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -115,6 +131,8 @@ jobs:
             test "$expected" = "$actual"
             [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
           done
+          test -s "dist/$HOME_GUIDE"
+          test -s "dist/$REGRU_GUIDE"
       - name: Attest release provenance
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -122,12 +140,16 @@ jobs:
           subject-path: |
             dist/${{ needs.build.outputs.linux_asset }}
             dist/${{ needs.build.outputs.windows_asset }}
+            dist/${{ needs.build.outputs.home_guide }}
+            dist/${{ needs.build.outputs.regru_guide }}
       - name: Verify release attestations
         env:
           GH_TOKEN: ${{ github.token }}
           BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
           LINUX_ASSET: ${{ needs.build.outputs.linux_asset }}
           WINDOWS_ASSET: ${{ needs.build.outputs.windows_asset }}
+          HOME_GUIDE: ${{ needs.build.outputs.home_guide }}
+          REGRU_GUIDE: ${{ needs.build.outputs.regru_guide }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -140,12 +162,22 @@ jobs:
             --bundle "$BUNDLE_PATH" \
             --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \
             --source-ref "$GITHUB_REF"
+          gh attestation verify "dist/$HOME_GUIDE" \
+            --bundle "$BUNDLE_PATH" \
+            --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \
+            --source-ref "$GITHUB_REF"
+          gh attestation verify "dist/$REGRU_GUIDE" \
+            --bundle "$BUNDLE_PATH" \
+            --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \
+            --source-ref "$GITHUB_REF"
       - name: Create draft, upload every asset, then publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           LINUX_ASSET: ${{ needs.build.outputs.linux_asset }}
           WINDOWS_ASSET: ${{ needs.build.outputs.windows_asset }}
+          HOME_GUIDE: ${{ needs.build.outputs.home_guide }}
+          REGRU_GUIDE: ${{ needs.build.outputs.regru_guide }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -159,7 +191,8 @@ jobs:
             while IFS= read -r old_asset; do
               case "$old_asset" in
                 "$LINUX_ASSET"|"$LINUX_ASSET.sha256"|\
-                "$WINDOWS_ASSET"|"$WINDOWS_ASSET.sha256") ;;
+                "$WINDOWS_ASSET"|"$WINDOWS_ASSET.sha256"|\
+                "$HOME_GUIDE"|"$REGRU_GUIDE") ;;
                 *) gh release delete-asset "$TAG" "$old_asset" \
                      --repo "$GITHUB_REPOSITORY" --yes ;;
               esac
@@ -168,13 +201,25 @@ jobs:
             gh release upload "$TAG" \
               "dist/$LINUX_ASSET" "dist/$LINUX_ASSET.sha256" \
               "dist/$WINDOWS_ASSET" "dist/$WINDOWS_ASSET.sha256" \
+              "dist/$HOME_GUIDE" "dist/$REGRU_GUIDE" \
               --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" \
               "dist/$LINUX_ASSET" "dist/$LINUX_ASSET.sha256" \
               "dist/$WINDOWS_ASSET" "dist/$WINDOWS_ASSET.sha256" \
+              "dist/$HOME_GUIDE" "dist/$REGRU_GUIDE" \
               --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
               --generate-notes --title "$TAG"
+          fi
+          expected_assets="$(printf '%s\n' \
+            "$LINUX_ASSET" "$LINUX_ASSET.sha256" \
+            "$WINDOWS_ASSET" "$WINDOWS_ASSET.sha256" \
+            "$HOME_GUIDE" "$REGRU_GUIDE" | sort)"
+          actual_assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | sort)"
+          if [ "$actual_assets" != "$expected_assets" ]; then
+            echo "Draft release does not contain exactly the six expected assets" >&2
+            exit 1
           fi
           gh release edit "$TAG" \
             --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false

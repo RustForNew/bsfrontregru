@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from . import __version__
+from .credential_parser import (
+    ExitCredentials,
+    RegRuCredentials,
+    parse_exit_credentials,
+    parse_regru_credentials,
+)
 from .doctor import Check, doctor_exit, doctor_front, e2e_probe
 from .errors import InstallerError, ValidationError
 from .exit_installer import Layout, apply_exit, build_exit_plan
@@ -24,7 +30,8 @@ from .front import (
     check_front_dns,
     check_public_tls,
 )
-from .ispmanager import inspect_site
+from .hidden_input import read_hidden_block
+from .ispmanager import inspect_site, panel_login_url_to_endpoint
 from .models import (
     DEFAULT_TLS_FINGERPRINT,
     TLS_FINGERPRINTS,
@@ -104,6 +111,21 @@ def _require_linux_apply() -> None:
         raise InstallerError(
             "Применение поддерживается только на Linux/WSL; plan и doctor доступны без записи"
         )
+
+
+def _disable_pc_core_dumps() -> None:
+    """Keep imported credentials out of process core files on Linux/WSL."""
+
+    if platform.system() != "Linux":
+        return
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, OSError, ValueError):
+        raise InstallerError(
+            "Не удалось запретить core dump перед вводом credentials"
+        ) from None
 
 
 def _read_password_stdin() -> str:
@@ -227,14 +249,22 @@ def _collect_front_tls_policy() -> tuple[str, str | None]:
 
 
 def _collect_front(
-    handoff: Handoff, *, allow_panel_inspection: bool = True
+    handoff: Handoff,
+    *,
+    allow_panel_inspection: bool = True,
+    regru_credentials: RegRuCredentials | None = None,
 ) -> FrontDesired:
     print("\nFrontend shared-hosting")
     domain = _validated_prompt(
         "FQDN/SNI существующего сайта frontend", normalize_domain
     )
+    hosting_ipv4_default = (
+        regru_credentials.ftp_server_ip if regru_credentials is not None else None
+    )
     client_connect_ip = _validated_prompt(
-        "IPv4 подключения клиента (адрес в VLESS URI)", validate_ipv4
+        "IPv4 подключения клиента (адрес в VLESS URI)",
+        validate_ipv4,
+        hosting_ipv4_default,
     )
     dns_ipv4 = _validated_prompt(
         "IPv4 в DNS A домена (для сайта и ACME)",
@@ -242,15 +272,39 @@ def _collect_front(
         client_connect_ip,
     )
     tls_mode, pinned_peer_cert_sha256 = _collect_front_tls_policy()
-    sftp_host = _validated_prompt("SFTP hostname/IP", validate_host)
-    sftp_port = _validated_prompt("SFTP port", validate_port, "22")
-    sftp_user = _validated_prompt("SFTP user", validate_ssh_user)
+    if regru_credentials is None:
+        sftp_host = _validated_prompt("SFTP hostname/IP", validate_host)
+        sftp_port = _validated_prompt("SFTP port", validate_port, "22")
+        sftp_user = _validated_prompt("SFTP user", validate_ssh_user)
+    else:
+        parsed_panel_url = urllib.parse.urlsplit(regru_credentials.panel_url)
+        if not parsed_panel_url.hostname:  # Already enforced by the strict parser.
+            raise InstallerError("В адресе панели REG.RU отсутствует hostname")
+        sftp_host = validate_host(parsed_panel_url.hostname)
+        sftp_port = 22
+        sftp_user = validate_ssh_user(regru_credentials.panel_login)
+        print(
+            "Из блока REG.RU определены SFTP host, port 22 и основной пользователь. "
+            "IP сервера предложен только как входной IPv4 и будет проверен по "
+            "DNS/TLS; пароли FTP/MySQL не используются."
+        )
     if allow_panel_inspection and _yes_no(
         "Получить document root read-only запросом к ISPmanager API?"
     ):
-        endpoint = _prompt("ISPmanager endpoint", f"https://{sftp_host}:1500/ispmgr")
-        panel_user = _prompt("ISPmanager user", sftp_user)
-        panel_password = getpass.getpass("ISPmanager password (не сохраняется): ")
+        if regru_credentials is None:
+            endpoint = _prompt(
+                "ISPmanager endpoint", f"https://{sftp_host}:1500/ispmgr"
+            )
+            panel_user = _prompt("ISPmanager user", sftp_user)
+            panel_password = getpass.getpass("ISPmanager password (не сохраняется): ")
+        else:
+            endpoint = panel_login_url_to_endpoint(regru_credentials.panel_url)
+            panel_user = regru_credentials.panel_login
+            panel_password = regru_credentials.panel_password
+            print(
+                "Выполняется HTTPS-запрос только к импортированному узлу REG.RU; "
+                "операция ISPmanager read-only."
+            )
         site = inspect_site(
             endpoint=endpoint,
             username=panel_user,
@@ -337,10 +391,86 @@ def _collect_remote_front_target() -> RemoteFrontTarget:
     ).validate()
 
 
-def _collect_bridge_sftp_password() -> str:
-    password = getpass.getpass(
-        "SFTP password frontend для одноразовой передачи через bridge: "
+def _read_exit_credentials_block(label: str) -> ExitCredentials:
+    block = read_hidden_block(label, minimum_data_lines=3)
+    try:
+        return parse_exit_credentials(block)
+    finally:
+        block = ""
+
+
+def _read_regru_credentials_block() -> RegRuCredentials:
+    block = read_hidden_block("Блок «Логины и пароли» REG.RU")
+    try:
+        credentials = parse_regru_credentials(block)
+    finally:
+        block = ""
+    if credentials.panel_login != credentials.ftp_login:
+        raise InstallerError(
+            "В блоке REG.RU различаются логины панели и FTP; отключите импорт и "
+            "укажите проверенные SFTP-данные вручную"
+        )
+    print(
+        "Блок REG.RU распознан. Пароль панели получен скрыто; данные FTP/MySQL "
+        "не будут использоваться для входа."
     )
+    return credentials
+
+
+def _collect_pc_exit_access() -> tuple[RemoteExitTarget, SSHAuth | None]:
+    if not _yes_no(
+        "Вставить готовый блок выхода (IPv4, root, password)?", default=True
+    ):
+        return _collect_remote_exit_target(), None
+    credentials = _read_exit_credentials_block("Три строки данных выходного VPS")
+    try:
+        target = RemoteExitTarget(
+            host=credentials.ip,
+            port=_validated_prompt("SSH port выхода", validate_port, "22"),
+            user=credentials.username,
+            host_key_sha256=_validated_prompt(
+                "Проверенный SSH host-key fingerprint выхода SHA256",
+                validate_fingerprint,
+            ),
+        ).validate()
+        auth = SSHAuth(method="password", password=credentials.password).validate()
+    finally:
+        credentials = None
+    print("Блок выхода распознан; root password получен скрыто.")
+    return target, auth
+
+
+def _collect_pc_bridge_access() -> tuple[RemoteFrontTarget, SSHAuth | None]:
+    if not _yes_no(
+        "Вставить готовый блок российского bridge (IPv4, root, password)?",
+        default=True,
+    ):
+        return _collect_remote_front_target(), None
+    credentials = _read_exit_credentials_block("Три строки данных российского bridge")
+    try:
+        target = RemoteFrontTarget(
+            host=credentials.ip,
+            port=_validated_prompt("SSH port bridge", validate_port, "22"),
+            user=credentials.username,
+            host_key_sha256=_validated_prompt(
+                "Проверенный SSH host-key fingerprint bridge SHA256",
+                validate_fingerprint,
+            ),
+        ).validate()
+        auth = SSHAuth(method="password", password=credentials.password).validate()
+    finally:
+        credentials = None
+    print("Блок bridge распознан; root password получен скрыто.")
+    return target, auth
+
+
+def _collect_regru_credentials_import() -> RegRuCredentials | None:
+    if not _yes_no("Вставить готовый блок «Логины и пароли» REG.RU?", default=True):
+        return None
+    return _read_regru_credentials_block()
+
+
+def _validate_bridge_sftp_password(password: str) -> str:
     if (
         not password
         or len(password.encode("utf-8")) > _MAX_STDIN_SECRET_BYTES
@@ -348,6 +478,14 @@ def _collect_bridge_sftp_password() -> str:
     ):
         raise InstallerError("SFTP password нельзя безопасно передать одной строкой")
     return password
+
+
+def _collect_bridge_sftp_password() -> str:
+    return _validate_bridge_sftp_password(
+        getpass.getpass(
+            "SFTP password frontend для одноразовой передачи через bridge: "
+        )
+    )
 
 
 def _installer_pyz_from_runtime() -> Path:
@@ -651,8 +789,9 @@ def wizard_pc() -> int:
     """Run both existing server transactions from one Linux/WSL controller."""
 
     _require_linux_apply()
+    _disable_pc_core_dumps()
     installer_pyz = _installer_pyz_from_runtime()
-    exit_target = _collect_remote_exit_target()
+    exit_target, imported_exit_auth = _collect_pc_exit_access()
     try:
         public_address_default = validate_ipv4(exit_target.host)
     except ValidationError:
@@ -661,6 +800,14 @@ def wizard_pc() -> int:
         remote=True,
         public_address_default=public_address_default,
     )
+    if (
+        imported_exit_auth is not None
+        and desired_exit.public_address != exit_target.host
+    ):
+        raise InstallerError(
+            "Публичный IPv4 выхода должен совпадать с первой строкой "
+            "импортированного блока"
+        )
     if desired_exit.listen_port == exit_target.port:
         raise InstallerError("Backend-порт не должен совпадать с SSH-портом выхода")
     preview_handoff = Handoff(
@@ -682,11 +829,21 @@ def wizard_pc() -> int:
             "Bridge должен быть доверенным: root этого VPS участвует только в настройке, "
             "но видит handoff и выполняет frontend/E2E. В рабочем трафике он не участвует."
         )
+    regru_credentials = _collect_regru_credentials_import()
     desired_front = _collect_front(
         preview_handoff,
         allow_panel_inspection=not use_bridge,
+        regru_credentials=regru_credentials,
     )
-    bridge_target = _collect_remote_front_target() if use_bridge else None
+    imported_panel_password = (
+        regru_credentials.panel_password if regru_credentials is not None else None
+    )
+    regru_credentials = None
+    if use_bridge:
+        bridge_target, imported_bridge_auth = _collect_pc_bridge_access()
+    else:
+        bridge_target = None
+        imported_bridge_auth = None
 
     pc_steps = [
         (
@@ -727,76 +884,105 @@ def wizard_pc() -> int:
     _ack_provider()
     _confirm_apply("PC")
 
-    exit_auth = _collect_auth("Exit root SSH")
+    exit_auth = imported_exit_auth or _collect_auth("Exit root SSH")
     if bridge_target is None:
-        front_auth = _collect_auth("Frontend SFTP")
+        if imported_panel_password is not None and _yes_no(
+            "Использовать импортированный пароль панели как SFTP password?"
+        ):
+            front_auth = SSHAuth(
+                method="password", password=imported_panel_password
+            ).validate()
+        else:
+            front_auth = _collect_auth("Frontend SFTP")
         bridge_auth = None
         sftp_password = None
     else:
         front_auth = None
-        bridge_auth = _collect_auth("Bridge root SSH")
-        sftp_password = _collect_bridge_sftp_password()
+        bridge_auth = imported_bridge_auth or _collect_auth("Bridge root SSH")
+        if imported_panel_password is not None:
+            print(
+                "При использовании пароля панели для SFTP доверенный root bridge "
+                "сможет увидеть его во время настройки."
+            )
+        if imported_panel_password is not None and _yes_no(
+            "Передать импортированный пароль панели как SFTP password через bridge?"
+        ):
+            sftp_password = _validate_bridge_sftp_password(imported_panel_password)
+        else:
+            sftp_password = _collect_bridge_sftp_password()
+    imported_exit_auth = None
+    imported_bridge_auth = None
+    imported_panel_password = None
 
     output_dir = _pc_output_dir(desired_front.domain)
-    if bridge_target is not None:
-        if bridge_auth is None:
-            raise InstallerError("Не получена SSH-аутентификация bridge")
-        preflight_remote_front_bridge(
-            target=bridge_target,
-            auth=bridge_auth,
-            output_dir=output_dir,
-        )
-
-    exit_result = apply_pc_exit(
-        installer_pyz=installer_pyz,
-        desired=desired_exit,
-        target=exit_target,
-        auth=exit_auth,
-        output_dir=output_dir,
-    )
-    handoff = Handoff.from_dict(load_json(exit_result.remote.handoff_path))
-    desired_front = front_for_handoff(desired_front, handoff)
-    client_handoff = handoff.with_pinned_peer_cert(
-        desired_front.pinned_peer_cert_sha256
-    )
     try:
         if bridge_target is not None:
-            if bridge_auth is None or sftp_password is None:
-                raise InstallerError("Не получены учётные данные frontend через bridge")
-            result = apply_remote_front(
-                installer_pyz=installer_pyz,
-                handoff_path=exit_result.remote.handoff_path,
-                desired=desired_front,
+            if bridge_auth is None:
+                raise InstallerError("Не получена SSH-аутентификация bridge")
+            preflight_remote_front_bridge(
                 target=bridge_target,
-                bridge_auth=bridge_auth,
-                sftp_password=sftp_password,
+                auth=bridge_auth,
                 output_dir=output_dir,
-                firewall_verified=True,
             )
-            print("\nE2E пройден. Клиентская ссылка сохранена с правами 0600:")
-            print(result.client_path)
-        else:
-            if front_auth is None:
-                raise InstallerError("Не получена SFTP-аутентификация frontend")
-            front_state = output_dir / "front"
-            result = _apply_front_and_issue(
-                desired=desired_front,
-                auth=front_auth,
-                state_dir=front_state,
-                handoff=client_handoff,
-                layout=Layout(root=front_state / "probe-runtime"),
-                firewall_plan_path=exit_result.remote.firewall_plan_path,
-                firewall_supplied=True,
-            )
-            _print_front_result(result)
-    except Exception:
-        print(
-            "\nВыход уже настроен, а backend ограничен UFW. Frontend/E2E не завершён, "
-            "ссылка не выдана. Не удаляйте локальный handoff: "
-            f"{exit_result.remote.handoff_path}",
-            file=sys.stderr,
+
+        exit_result = apply_pc_exit(
+            installer_pyz=installer_pyz,
+            desired=desired_exit,
+            target=exit_target,
+            auth=exit_auth,
+            output_dir=output_dir,
         )
-        raise
+        exit_auth = None
+        handoff = Handoff.from_dict(load_json(exit_result.remote.handoff_path))
+        desired_front = front_for_handoff(desired_front, handoff)
+        client_handoff = handoff.with_pinned_peer_cert(
+            desired_front.pinned_peer_cert_sha256
+        )
+        try:
+            if bridge_target is not None:
+                if bridge_auth is None or sftp_password is None:
+                    raise InstallerError(
+                        "Не получены учётные данные frontend через bridge"
+                    )
+                result = apply_remote_front(
+                    installer_pyz=installer_pyz,
+                    handoff_path=exit_result.remote.handoff_path,
+                    desired=desired_front,
+                    target=bridge_target,
+                    bridge_auth=bridge_auth,
+                    sftp_password=sftp_password,
+                    output_dir=output_dir,
+                    firewall_verified=True,
+                )
+                print("\nE2E пройден. Клиентская ссылка сохранена с правами 0600:")
+                print(result.client_path)
+            else:
+                if front_auth is None:
+                    raise InstallerError("Не получена SFTP-аутентификация frontend")
+                front_state = output_dir / "front"
+                result = _apply_front_and_issue(
+                    desired=desired_front,
+                    auth=front_auth,
+                    state_dir=front_state,
+                    handoff=client_handoff,
+                    layout=Layout(root=front_state / "probe-runtime"),
+                    firewall_plan_path=exit_result.remote.firewall_plan_path,
+                    firewall_supplied=True,
+                )
+                _print_front_result(result)
+        except Exception:
+            print(
+                "\nВыход уже настроен, а backend ограничен UFW. Frontend/E2E не "
+                "завершён, ссылка не выдана. Не удаляйте локальный handoff: "
+                f"{exit_result.remote.handoff_path}",
+                file=sys.stderr,
+            )
+            raise
+    finally:
+        exit_auth = None
+        front_auth = None
+        bridge_auth = None
+        sftp_password = None
     return 0
 
 

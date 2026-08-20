@@ -6,9 +6,12 @@
 
 ## Скачать
 
-- [Linux](https://github.com/RustForNew/bsfrontregru/releases/download/v0.3.0/xhttp-setup-0.3.0.pyz)
-- [Windows 10/11 через WSL2](https://github.com/RustForNew/bsfrontregru/releases/download/v0.3.0/xhttp-setup-0.3.0-windows-wsl.zip)
-- [Релиз v0.3.0 и SHA-256](https://github.com/RustForNew/bsfrontregru/releases/tag/v0.3.0)
+- [Linux](https://github.com/RustForNew/bsfrontregru/releases/download/v0.4.0/xhttp-setup-0.4.0.pyz)
+- [Windows 10/11 через WSL2](https://github.com/RustForNew/bsfrontregru/releases/download/v0.4.0/xhttp-setup-0.4.0-windows-wsl.zip)
+- [Релиз v0.4.0, инструкции и SHA-256](https://github.com/RustForNew/bsfrontregru/releases/tag/v0.4.0)
+
+Инструкции: [запуск и все поля](docs/home-pc-linux-windows.txt),
+[подготовка сайта REG.RU/ISPmanager](docs/reg-ru-ispmanager-setup.txt).
 
 ## До запуска
 
@@ -29,7 +32,7 @@
 Требования: Python 3.10+, `curl` и OpenSSH client.
 
 ```bash
-python3 xhttp-setup-0.3.0.pyz pc
+python3 xhttp-setup-0.4.0.pyz pc
 ```
 
 ## Windows
@@ -50,12 +53,14 @@ WSL2 с Ubuntu:
 
 ## Что вводить
 
-Сначала exit: IP, SSH-порт, root-пароль или ключ, fingerprint, исходящий IP и
-backend-порт. Затем frontend: домен, IP подключения клиента, IP A-записи,
-`FRONT_EGRESS_IP`, TLS-режим, SFTP и `document root`. Российский SSH bridge —
-необязательная опция для хостинга, доступного только из РФ.
+Мастер скрыто принимает готовый блок exit из трёх строк
+`IPv4 / root / password` и полный блок REG.RU «Логины и пароли». После каждой
+вставки введите отдельной строкой `ГОТОВО`. Пароли FTP/MySQL не используются.
+IP сервера REG.RU предлагается как входной IP и проверяется по DNS/TLS; он не
+заменяет измеренный `FRONT_EGRESS_IP`. Российский SSH bridge — необязательная
+опция для хостинга, доступного только из РФ.
 
-Пароли вводятся интерактивно и не сохраняются в конфиги или аргументы команд.
+Пароли вводятся скрыто и не сохраняются в конфиги или аргументы команд.
 При нестандартном firewall, Docker или неактивном UFW мастер останавливается без
 изменений. Использование должно соответствовать правилам хостинга и закону.
 

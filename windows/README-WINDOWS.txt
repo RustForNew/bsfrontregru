@@ -4,8 +4,9 @@ XHTTP Setup @@VERSION@@ для Windows (через WSL2)
 
 Запуск:
 1. В Проводнике выберите для ZIP «Извлечь всё» и откройте полученную папку.
-2. Запустите точный файл START-WINDOWS.cmd.
-3. Введите запрошенные данные exit, frontend и необязательного bridge.
+2. Подготовьте сайт по INSTRUCTION-REG-RU-ISPMANAGER.txt.
+3. Откройте INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt и выполните раздел Windows.
+4. Запустите точный файл START-WINDOWS.cmd.
 
 Установщик сам не устанавливает и не обновляет WSL. Если WSL ещё нет, выполните отдельно в PowerShell от администратора:
   wsl --install -d Ubuntu

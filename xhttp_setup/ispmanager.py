@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .errors import InstallerError, VerificationError
 from .validate import normalize_domain, validate_remote_dir
@@ -41,6 +41,36 @@ def validate_panel_endpoint(value: str) -> str:
     if parsed.query or parsed.fragment:
         raise InstallerError("ISPmanager endpoint не должен содержать query/fragment")
     return endpoint
+
+
+def panel_login_url_to_endpoint(value: str) -> str:
+    """Convert a provider login URL into the read-only ISPmanager API endpoint."""
+
+    try:
+        parsed = urlsplit(value.strip())
+        hostname = parsed.hostname
+        port = parsed.port
+    except (AttributeError, ValueError):
+        raise InstallerError("Некорректный HTTPS-адрес панели ISPmanager") from None
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise InstallerError(
+            "Адрес панели ISPmanager должен быть HTTPS URL без credentials/query"
+        )
+    if parsed.path in {"", "/"}:
+        path = "/ispmgr"
+    elif parsed.path.rstrip("/") in {"/ispmgr", "/manager/ispmgr"}:
+        path = parsed.path.rstrip("/")
+    else:
+        raise InstallerError("Неожиданный путь в адресе панели ISPmanager")
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    return validate_panel_endpoint(urlunsplit(("https", netloc, path, "", "")))
 
 
 def _xml_post(
@@ -106,22 +136,31 @@ def inspect_site(
     endpoint = validate_panel_endpoint(endpoint)
     if not username.strip() or not password:
         raise InstallerError("Пустой логин или пароль ISPmanager")
-    auth_root = _xml_post(
-        endpoint,
-        {
-            "func": "auth",
-            "username": username.strip(),
-            "password": password,
-            "out": "xml",
-            "lang": "en",
-        },
-    )
-    auth = auth_root.find(".//auth")
-    session_id = auth.attrib.get("id", "") if auth is not None else ""
-    if not session_id:
-        raise VerificationError("ISPmanager не вернул session id")
-    sites = _xml_post(
-        endpoint,
-        {"func": "webdomain", "auth": session_id, "out": "xml", "lang": "en"},
-    )
-    return parse_site_list(sites, domain)
+    try:
+        auth_root = _xml_post(
+            endpoint,
+            {
+                "func": "auth",
+                "username": username.strip(),
+                "password": password,
+                "out": "xml",
+                "lang": "en",
+            },
+        )
+        auth = auth_root.find(".//auth")
+        session_id = auth.attrib.get("id", "") if auth is not None else ""
+        if not session_id:
+            raise VerificationError("ISPmanager не вернул session id")
+        sites = _xml_post(
+            endpoint,
+            {
+                "func": "webdomain",
+                "auth": session_id,
+                "out": "xml",
+                "lang": "en",
+            },
+        )
+        return parse_site_list(sites, domain)
+    except InstallerError as exc:
+        detail = str(exc).replace(password, "[REDACTED]")
+        raise VerificationError(detail) from None

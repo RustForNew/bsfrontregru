@@ -3,8 +3,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import contextmanager
-from contextlib import redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -250,7 +249,12 @@ class PcOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.xhttp_path, handoff.xhttp_path)
 
     def test_pc_wizard_preflights_bridge_then_reuses_existing_server_flows(self):
-        exit_target = self.target
+        exit_target = RemoteExitTarget(
+            host=desired_exit().public_address,
+            user="root",
+            port=22,
+            host_key_sha256=FINGERPRINT,
+        )
         bridge_target = RemoteFrontTarget(
             host="bridge.example.org",
             user="root",
@@ -305,48 +309,75 @@ class PcOrchestratorTests(unittest.TestCase):
                 events.append("front")
                 return remote_front
 
-            with (
-                patch("xhttp_setup.cli._require_linux_apply"),
-                patch(
-                    "xhttp_setup.cli._installer_pyz_from_runtime",
-                    return_value=root / "installer.pyz",
-                ),
-                patch(
-                    "xhttp_setup.cli._collect_remote_exit_target",
-                    return_value=exit_target,
-                ),
-                patch("xhttp_setup.cli._collect_exit", return_value=desired_exit()),
-                patch("xhttp_setup.cli._yes_no", return_value=True),
-                patch("xhttp_setup.cli._collect_front", return_value=desired_front()),
-                patch(
-                    "xhttp_setup.cli._collect_remote_front_target",
-                    return_value=bridge_target,
-                ),
-                patch("xhttp_setup.cli._show_plan"),
-                patch("xhttp_setup.cli._ack_provider"),
-                patch("xhttp_setup.cli._confirm_apply"),
-                patch(
-                    "xhttp_setup.cli._collect_auth",
-                    side_effect=(self.auth, self.auth),
-                ),
-                patch(
-                    "xhttp_setup.cli._collect_bridge_sftp_password",
-                    return_value="sftp-secret",
-                ),
-                patch("xhttp_setup.cli._pc_output_dir", return_value=root),
-                patch(
-                    "xhttp_setup.cli.preflight_remote_front_bridge",
-                    side_effect=preflight,
-                ),
-                patch("xhttp_setup.cli.apply_pc_exit", side_effect=apply_exit),
-                patch("xhttp_setup.cli.apply_remote_front", side_effect=apply_front),
-                patch("xhttp_setup.cli.check_front_dns") as dns,
-                patch("xhttp_setup.cli.check_public_tls") as tls,
-                redirect_stdout(StringIO()),
-            ):
+            with ExitStack() as stack:
+                stack.enter_context(patch("xhttp_setup.cli._require_linux_apply"))
+                stack.enter_context(patch("xhttp_setup.cli._disable_pc_core_dumps"))
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli._installer_pyz_from_runtime",
+                        return_value=root / "installer.pyz",
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli._collect_pc_exit_access",
+                        return_value=(exit_target, self.auth),
+                    )
+                )
+                stack.enter_context(
+                    patch("xhttp_setup.cli._collect_exit", return_value=desired_exit())
+                )
+                stack.enter_context(patch("xhttp_setup.cli._yes_no", return_value=True))
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli._collect_regru_credentials_import",
+                        return_value=None,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli._collect_front", return_value=desired_front()
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli._collect_pc_bridge_access",
+                        return_value=(bridge_target, self.auth),
+                    )
+                )
+                for name in ("_show_plan", "_ack_provider", "_confirm_apply"):
+                    stack.enter_context(patch(f"xhttp_setup.cli.{name}"))
+                collect_auth = stack.enter_context(
+                    patch("xhttp_setup.cli._collect_auth")
+                )
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli._collect_bridge_sftp_password",
+                        return_value="sftp-secret",
+                    )
+                )
+                stack.enter_context(
+                    patch("xhttp_setup.cli._pc_output_dir", return_value=root)
+                )
+                stack.enter_context(
+                    patch(
+                        "xhttp_setup.cli.preflight_remote_front_bridge",
+                        side_effect=preflight,
+                    )
+                )
+                stack.enter_context(
+                    patch("xhttp_setup.cli.apply_pc_exit", side_effect=apply_exit)
+                )
+                stack.enter_context(
+                    patch("xhttp_setup.cli.apply_remote_front", side_effect=apply_front)
+                )
+                dns = stack.enter_context(patch("xhttp_setup.cli.check_front_dns"))
+                tls = stack.enter_context(patch("xhttp_setup.cli.check_public_tls"))
+                stack.enter_context(redirect_stdout(StringIO()))
                 self.assertEqual(wizard_pc(), 0)
 
         self.assertEqual(events, ["bridge-preflight", "exit", "front"])
+        collect_auth.assert_not_called()
         dns.assert_not_called()
         tls.assert_not_called()
 

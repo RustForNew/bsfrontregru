@@ -28,6 +28,21 @@
   or environment values.
 - The PC wizard pins exit and optional bridge host keys before password
   authentication. Root passwords use the same private FIFO transport.
+- Ready-made credential blocks are read only from the controlling Linux/WSL
+  terminal with echo disabled for the whole bounded paste. The exact terminator
+  is removed, queued suffix input is flushed, terminal settings are restored in
+  `finally`, and PC mode disables core dumps before reading credentials. The
+  program cannot clear the host clipboard or its history.
+- REG.RU import accepts only ISPmanager login URLs on
+  `vip<digits>.hosting.reg.ru:1500` with a known path. FTP and MySQL passwords
+  are recognized for section boundaries but are not retained or used. Reusing
+  the panel password for SFTP requires a separate explicit confirmation; there
+  is no password fallback or retry list.
+- Imported panel credentials may be sent only after explicit consent to the
+  provider HTTPS endpoint for the existing read-only site lookup. The endpoint
+  uses the system CA store, rejects redirects and has no userinfo, query or
+  fragment. Reflected remote errors are redacted without a secret-bearing
+  exception chain.
 - In bridge mode the SFTP password is sent as one bounded stdin line inside an
   already host-key-pinned SSH command. It is not placed in argv, environment,
   regular files, or relayed command output.
@@ -38,8 +53,9 @@
   UFW on clean Debian/Ubuntu. It never changes UFW state, defaults, SSH access,
   or cloud firewall.
 - The Windows bundle does not implement a second SSH stack. Its PowerShell
-  launcher verifies the bundled Linux zipapp SHA-256 and starts that same
-  controller inside WSL2. Native Windows execution without WSL is rejected.
+  launcher verifies the bundled runner and Linux zipapp SHA-256 and starts that
+  same controller inside one selected WSL2 distribution. Native Windows
+  execution without WSL is rejected.
 - UUID, VLESS Encryption material, handoff, backups and client URI are secrets.
 - Xray runs as a dedicated unprivileged user and does not replace another Xray
   service.
