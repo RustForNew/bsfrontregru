@@ -30,6 +30,10 @@ class FrontResult:
     remote_index_backup: str | None
 
 
+class FrontRollbackError(InstallerError):
+    """Frontend mutation could not be restored to its verified baseline."""
+
+
 @dataclass
 class _RemoteMutation:
     target: str
@@ -896,12 +900,13 @@ def _rollback_journal(
     for mutation in reversed(journal):
         try:
             _rollback_mutation(client, remote_dir=remote_dir, mutation=mutation)
-        except Exception as exc:
-            failures.append(f"{mutation.target}: {exc}")
+        except BaseException as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            failures.append(f"{mutation.target}: {detail}")
     if not failures:
         return
     detail = " | ".join(failures)
-    raise InstallerError(
+    raise FrontRollbackError(
         f"Применение не удалось, rollback неполон: {detail}"
     ) from original
 

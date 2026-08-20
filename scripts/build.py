@@ -58,7 +58,9 @@ def build() -> Path:
         )
     output.chmod(output.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    (output_dir / f"{output.name}.sha256").write_text(digest + "\n", encoding="ascii")
+    (output_dir / f"{output.name}.sha256").write_text(
+        digest + "\n", encoding="ascii", newline="\n"
+    )
     print(output)
     print(digest)
     return output

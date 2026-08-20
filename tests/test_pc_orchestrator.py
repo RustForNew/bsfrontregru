@@ -1,25 +1,21 @@
-import json
 import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import ExitStack, contextmanager, redirect_stdout
-from io import StringIO
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from xhttp_setup.cli import wizard_pc
 from xhttp_setup.errors import InstallerError
 from xhttp_setup.models import ExitDesired, FrontDesired, Handoff
 from xhttp_setup.pc_orchestrator import (
-    PcExitResult,
     apply_pc_exit,
     front_for_handoff,
     preflight_remote_front_bridge,
 )
 from xhttp_setup.remote_exit import RemoteExitError, RemoteExitResult, RemoteExitTarget
-from xhttp_setup.remote_front import RemoteFrontResult, RemoteFrontTarget
+from xhttp_setup.remote_front import RemoteFrontTarget
 from xhttp_setup.remote_network import RemoteExitNetworkApplyResult
 from xhttp_setup.ssh_transport import SSHAuth
 
@@ -247,139 +243,6 @@ class PcOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.exit_address, handoff.exit_address)
         self.assertEqual(result.exit_port, handoff.exit_port)
         self.assertEqual(result.xhttp_path, handoff.xhttp_path)
-
-    def test_pc_wizard_preflights_bridge_then_reuses_existing_server_flows(self):
-        exit_target = RemoteExitTarget(
-            host=desired_exit().public_address,
-            user="root",
-            port=22,
-            host_key_sha256=FINGERPRINT,
-        )
-        bridge_target = RemoteFrontTarget(
-            host="bridge.example.org",
-            user="root",
-            host_key_sha256=FINGERPRINT,
-        )
-        handoff = Handoff(
-            exit_address="203.0.113.10",
-            exit_port=8083,
-            client_id=UUID,
-            xhttp_path=PATH,
-            encryption="mlkem768x25519plus.native.0rtt.clientmaterialxxxxxxxx",
-        ).validate()
-        events: list[str] = []
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            handoff_path = root / "handoff.json"
-            handoff_path.write_text(
-                json.dumps(handoff.to_dict()),
-                encoding="utf-8",
-            )
-            os.chmod(handoff_path, 0o600)
-            remote_exit = RemoteExitResult(
-                target=exit_target,
-                handoff_path=handoff_path,
-                firewall_plan_path=root / "firewall-plan.txt",
-                known_hosts_path=root / "exit-known_hosts",
-                installer_sha256="0" * 64,
-            )
-            network = RemoteExitNetworkApplyResult(
-                profile=Mock(),
-                allow_comment="allow",
-                deny_comment="deny",
-                ufw_allow_added=True,
-                ufw_deny_added=True,
-            )
-            remote_front = RemoteFrontResult(
-                target=bridge_target,
-                client_path=root / "client.vless",
-                known_hosts_path=root / "bridge-known_hosts",
-                installer_sha256="0" * 64,
-            )
-
-            def preflight(**_kwargs):
-                events.append("bridge-preflight")
-                return root / "bridge-known_hosts"
-
-            def apply_exit(**_kwargs):
-                events.append("exit")
-                return PcExitResult(remote_exit, network)
-
-            def apply_front(**_kwargs):
-                events.append("front")
-                return remote_front
-
-            with ExitStack() as stack:
-                stack.enter_context(patch("xhttp_setup.cli._require_linux_apply"))
-                stack.enter_context(patch("xhttp_setup.cli._disable_pc_core_dumps"))
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli._installer_pyz_from_runtime",
-                        return_value=root / "installer.pyz",
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli._collect_pc_exit_access",
-                        return_value=(exit_target, self.auth),
-                    )
-                )
-                stack.enter_context(
-                    patch("xhttp_setup.cli._collect_exit", return_value=desired_exit())
-                )
-                stack.enter_context(patch("xhttp_setup.cli._yes_no", return_value=True))
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli._collect_regru_credentials_import",
-                        return_value=None,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli._collect_front", return_value=desired_front()
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli._collect_pc_bridge_access",
-                        return_value=(bridge_target, self.auth),
-                    )
-                )
-                for name in ("_show_plan", "_ack_provider", "_confirm_apply"):
-                    stack.enter_context(patch(f"xhttp_setup.cli.{name}"))
-                collect_auth = stack.enter_context(
-                    patch("xhttp_setup.cli._collect_auth")
-                )
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli._collect_bridge_sftp_password",
-                        return_value="sftp-secret",
-                    )
-                )
-                stack.enter_context(
-                    patch("xhttp_setup.cli._pc_output_dir", return_value=root)
-                )
-                stack.enter_context(
-                    patch(
-                        "xhttp_setup.cli.preflight_remote_front_bridge",
-                        side_effect=preflight,
-                    )
-                )
-                stack.enter_context(
-                    patch("xhttp_setup.cli.apply_pc_exit", side_effect=apply_exit)
-                )
-                stack.enter_context(
-                    patch("xhttp_setup.cli.apply_remote_front", side_effect=apply_front)
-                )
-                dns = stack.enter_context(patch("xhttp_setup.cli.check_front_dns"))
-                tls = stack.enter_context(patch("xhttp_setup.cli.check_public_tls"))
-                stack.enter_context(redirect_stdout(StringIO()))
-                self.assertEqual(wizard_pc(), 0)
-
-        self.assertEqual(events, ["bridge-preflight", "exit", "front"])
-        collect_auth.assert_not_called()
-        dns.assert_not_called()
-        tls.assert_not_called()
 
 
 if __name__ == "__main__":

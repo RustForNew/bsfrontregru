@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from xhttp_setup.errors import InstallerError, VerificationError
 from xhttp_setup.ispmanager import (
+    ISPmanagerAuthenticationError,
     inspect_site,
     panel_login_url_to_endpoint,
     parse_site_list,
@@ -62,6 +63,39 @@ class ISPmanagerTests(unittest.TestCase):
         with self.assertRaises(VerificationError):
             parse_site_list(ET.fromstring("<doc/>"), "front.example.org")
 
+    def test_duplicate_exact_site_fails_closed(self):
+        root = ET.fromstring(
+            """<doc>
+            <elem><name>front.example.org</name><docroot>/one</docroot></elem>
+            <elem><name>FRONT.EXAMPLE.ORG.</name><docroot>/two</docroot></elem>
+            </doc>"""
+        )
+        with self.assertRaisesRegex(VerificationError, "несколько сайтов"):
+            parse_site_list(root, "front.example.org")
+
+    def test_inspection_uses_only_auth_and_read_only_site_list(self):
+        auth = ET.fromstring('<doc><auth id="session-123" /></doc>')
+        sites = ET.fromstring(
+            """<doc><elem><name>front.example.org</name>
+            <docroot>/var/www/front.example.org</docroot></elem></doc>"""
+        )
+        calls = []
+
+        def post(_endpoint, fields, **_kwargs):
+            calls.append(dict(fields))
+            return auth if len(calls) == 1 else sites
+
+        with patch("xhttp_setup.ispmanager._xml_post", side_effect=post):
+            inspect_site(
+                endpoint="https://panel.example.org:1500/ispmgr",
+                username="example",
+                password="secret",
+                domain="front.example.org",
+            )
+
+        self.assertEqual([call["func"] for call in calls], ["auth", "webdomain"])
+        self.assertFalse(any("sok" in call for call in calls))
+
     def test_inspection_redacts_reflected_password_without_exception_chain(self):
         secret = "FakeReflectedPanelSecret"
         with (
@@ -78,6 +112,41 @@ class ISPmanagerTests(unittest.TestCase):
                 domain="front.example.org",
             )
 
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_missing_auth_session_is_a_typed_password_failure(self):
+        with (
+            patch(
+                "xhttp_setup.ispmanager._xml_post",
+                return_value=ET.fromstring("<doc><ok /></doc>"),
+            ),
+            self.assertRaises(ISPmanagerAuthenticationError),
+        ):
+            inspect_site(
+                endpoint="https://panel.example.org:1500/ispmgr",
+                username="example",
+                password="wrong-secret",
+                domain="front.example.org",
+            )
+
+    def test_typed_auth_failure_stays_typed_and_redacts_password(self):
+        secret = "FakePanelSecretForRetry"
+        with (
+            patch(
+                "xhttp_setup.ispmanager._xml_post",
+                side_effect=ISPmanagerAuthenticationError(
+                    f"Invalid password: {secret}"
+                ),
+            ),
+            self.assertRaises(ISPmanagerAuthenticationError) as caught,
+        ):
+            inspect_site(
+                endpoint="https://panel.example.org:1500/ispmgr",
+                username="example",
+                password=secret,
+                domain="front.example.org",
+            )
         self.assertNotIn(secret, str(caught.exception))
         self.assertIsNone(caught.exception.__cause__)
 

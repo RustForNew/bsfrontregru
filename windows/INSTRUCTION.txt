@@ -1,298 +1,164 @@
-XHTTP Setup @@VERSION@@ — одна инструкция
+XHTTP Setup @@VERSION@@ — быстрый запуск
 =========================================
 
-Для Windows нужен Windows 10 версии 2004 (build 19041) или новее либо
-Windows 11:
+WINDOWS: СКАЧАТЬ, РАСПАКОВАТЬ, ЗАПУСТИТЬ
+----------------------------------------
 
-  1. Скачайте xhttp-setup-@@VERSION@@-windows-wsl.zip со страницы Release.
-  2. В Проводнике нажмите правой кнопкой по ZIP -> «Извлечь все». Не запускайте
-     отдельные файлы прямо из открытого архива.
-  3. В извлечённой папке прочитайте этот файл и подготовьте значения ниже.
-  4. После подготовки дважды нажмите START-WINDOWS.cmd.
+1. Нужна Windows 10 версии 2004 (build 19041)+ или Windows 11 и один уже
+   установленный WSL2-дистрибутив Ubuntu/Debian.
 
-Папка _internal служебная. Ничего в ней не запускайте, не переносите и не
-удаляйте. Отдельный файл windows-wsl.zip.sha256 нужен только для необязательной
-ручной проверки загрузки; запуск его не требует и сам проверит внутренние файлы.
-
-Для Linux-контроллера используйте Debian 12+ или Ubuntu 22.04+ и выполните:
-
-  sudo apt-get update
-  sudo apt-get install -y python3 ca-certificates curl coreutils openssh-client openssl
-  python3 -c 'import sys; assert sys.version_info >= (3, 10)'
-
-Затем скачайте в одну папку xhttp-setup-@@VERSION@@.pyz и его .pyz.sha256.
-Сначала прочитайте разделы 2–6: проверка файла и запуск одной fail-closed
-командой приведены в разделе 6.
-
-Раздел 1 ниже относится только к Windows. Разделы 2–6 относятся и к Windows,
-и к Linux.
-
-
-1. ОДИН РАЗ УСТАНОВИТЬ WSL2
-
-Если Ubuntu ещё не установлена, выполните шаги 1–2. Шаги 3–4 проверьте в любом
-случае, даже если Ubuntu уже запускается.
-
-1) Откройте PowerShell от имени администратора и выполните:
+   Если WSL2 ещё нет, один раз откройте PowerShell от имени администратора:
 
      wsl --install -d Ubuntu
 
-2) Перезагрузите компьютер. Откройте Ubuntu из меню «Пуск» и создайте локальные
-   имя и пароль Linux. Это не данные сервера.
-3) В Ubuntu выполните:
+   Выполните предложенную перезагрузку и один раз откройте Ubuntu. Это системная
+   подготовка Windows; сам ZIP не может безопасно выполнить её без прав
+   администратора и возможной перезагрузки.
 
-     sudo apt update
-     sudo apt install -y python3 curl coreutils openssh-client openssl
-     python3 -c 'import sys; assert sys.version_info >= (3, 10)'
+2. Скачайте xhttp-setup-@@VERSION@@-windows-wsl.zip со страницы Release.
+3. В Проводнике: правая кнопка по ZIP -> «Извлечь все». Не запускайте файлы
+   прямо из открытого архива.
+4. В извлечённой папке дважды нажмите START-WINDOWS.cmd.
 
-   Если проверка Python завершилась ошибкой, эта Ubuntu слишком старая:
-   установите/обновите Ubuntu до 22.04+ и не продолжайте до успешной проверки.
-
-4) В PowerShell проверьте столбец VERSION:
-
-     wsl --list --verbose
-
-   Если у Ubuntu указано 1, выполните `wsl --set-version Ubuntu 2`.
-
-Закройте Ubuntu. Дальше всё запускается через START-WINDOWS.cmd.
+Launcher сам проверит SHA-256 внутренних файлов, выберет WSL2 и при
+необходимости установит в Ubuntu/Debian Python и системные утилиты. Папка
+_internal служебная: ничего в ней не запускайте, не переносите и не удаляйте.
 
 
-2. ПОДГОТОВИТЬ ВЫХОДНОЙ VPS
+ЧТО ПОДГОТОВИТЬ
+---------------
 
-Нужен новый Debian 12+ или Ubuntu 22.04+ с systemd, прямым root SSH и стабильным
-публичным IPv4. Не используйте VPS с Docker/containerd, активным или enabled
-nftables.service либо своими правилами nftables/iptables.
+Выходной VPS:
 
-До первого SSH-входа получите fingerprint SSH host key через независимую
-web/VNC-консоль провайдера или его поддержку. При первом подключении сравните
-показанный SHA256:... посимвольно и подтверждайте ключ только при совпадении.
+  - Debian 12+ или Ubuntu 22.04+ с systemd;
+  - публичный IPv4 и прямой root SSH по паролю;
+  - свободный TCP/8083;
+  - без Docker/containerd, Remnawave/чужого Xray, custom nftables/iptables,
+    отдельного активного nftables.service и нестандартного UFW.
 
-Если это новый VPS и UFW ещё не подготовлен, после проверки host key войдите как
-root, не закрывайте текущую SSH-сессию и выполните весь блок, подставив настоящий
-SSH-порт:
+Сайт REG.RU:
 
-  (
-    set -Eeuo pipefail
-    SSH_PORT='22'
-    apt-get update
-    apt-get install -y python3 ca-certificates curl iproute2 ufw nftables
-    python3 -c 'import sys; assert sys.version_info >= (3, 10)'
-    if systemctl is-active --quiet nftables.service \
-       || systemctl is-enabled --quiet nftables.service; then
-      echo 'Обнаружен отдельный nftables.service; остановитесь' >&2
-      exit 1
-    fi
-    curl -4 --fail --silent --show-error --location --noproxy '*' --max-time 20 \
-      https://github.com/robots.txt --output /dev/null
-    mapfile -t EXIT_EGRESS_SAMPLES < <(
-      for XH_N in $(seq 1 5); do
-        curl -4 --fail --silent --show-error --noproxy '*' --max-time 20 \
-          https://www.cloudflare.com/cdn-cgi/trace \
-          | tr -d '\r' | sed -n 's/^ip=//p'
-        sleep 2
-      done
-    )
-    test "${#EXIT_EGRESS_SAMPLES[@]}" -eq 5
-    mapfile -t EXIT_EGRESS_IPS < <(
-      printf '%s\n' "${EXIT_EGRESS_SAMPLES[@]}" | sort -u
-    )
-    test "${#EXIT_EGRESS_IPS[@]}" -eq 1
-    EXIT_EGRESS_IP="${EXIT_EGRESS_IPS[0]}"
-    python3 -c 'import ipaddress,sys; v=ipaddress.ip_address(sys.argv[1]); (v.version == 4 and v.is_global) or sys.exit("egress не публичный IPv4")' \
-      "$EXIT_EGRESS_IP"
-    printf 'EXIT_EGRESS_IP=%s\n' "$EXIT_EGRESS_IP"
-    ufw allow "$SSH_PORT/tcp"
-    ufw --force enable
-    ufw status numbered
-  )
+  - сайт уже вручную создан в ISPmanager; мастер сайт не создаёт;
+  - PHP -> FastCGI (Apache) включён;
+  - SSL-vhost этого домена работает на 443;
+  - HSTS и принудительный HTTP -> HTTPS redirect выключены на время настройки;
+  - ровно одна DNS A-запись, CDN/proxy выключен; DNS A и введённый IPv4
+    подключения проверяются как разные роли;
+  - AAAA и CNAME для этого имени отсутствуют;
+  - основной аккаунт REG.RU имеет SFTP-доступ к document root сайта.
 
-Запишите напечатанный EXIT_EGRESS_IP. Не закрывая первую сессию, проверьте вход
-по SSH второй сессией с тем же закреплённым host key. Если сервер не новый, UFW
-уже содержит другие правила, egress оказался нестабильным или проверка SSH не
-прошла, мастер не запускайте. Он сам UFW не включает и SSH/default policy не
-меняет.
-
-Подготовьте блок ровно из трёх строк:
-
-  IP
-  root
-  пароль
-
-Если понадобится российский SSH bridge, используйте новый Debian 12+ или Ubuntu
-22.04+ с root SSH. До первого SSH так же независимо получите и сравните его
-host-key fingerprint. Bridge участвует только в настройке; на нём нужны исходящие
-DNS/HTTPS и пакеты ниже:
-
-  apt-get update
-  apt-get install -y python3 ca-certificates curl coreutils openssh-client openssl
-  python3 -c 'import sys; assert sys.version_info >= (3, 10)'
-  curl -4 --fail --silent --show-error --location --noproxy '*' --max-time 20 \
-    https://github.com/robots.txt --output /dev/null
+Главную страницу готовить или заменять не нужно. Мастер не трогает index.html,
+не создаёт заглушку, не копирует и не проксирует RuFox или другой сайт.
 
 
-3. ПОДГОТОВИТЬ САЙТ REG.RU
+ЧТО СПРОСИТ МАСТЕР
+------------------
 
-Используйте схему только с разрешения хостинга на такое проксирование.
+Вводите по одному значению:
 
-1) В ISPmanager откройте «Сайты» -> «Добавить сайт».
-2) Укажите домен. Получение IP — автоматически. Псевдонимы и автоподдомены —
-   выключены. Индексы: index.php index.html.
-3) Включите SSL на порту 443 и создайте самоподписанный сертификат. HSTS и
-   HTTP -> HTTPS выключите.
-4) Оставьте PHP в режиме FastCGI (Apache). Создайте сайт.
-5) Запишите назначенный IPv4 и точную корневую директорию (document root).
-6) У DNS-провайдера создайте одну A-запись домена на этот IPv4. CDN/proxy
-   выключите; AAAA и CNAME для этого имени удалите.
+  1. IPv4 выходного сервера
+  2. SSH port выхода [22]
+  3. SSH login выхода [root]
+  4. SSH password выхода                  (ввод скрыт)
+  5. точный HTTPS-адрес панели REG.RU,
+     например https://vip123.hosting.reg.ru:1500/
+  6. основной логин REG.RU
+  7. пароль панели REG.RU                 (ввод скрыт)
+  8. IPv4 подключения REG.RU из поля «IP-адрес сервера»
+  9. домен frontend
 
-Подготовьте полный блок REG.RU «Логины и пароли». Мастер возьмёт из него URL
-панели, основной логин и IP сайта. FTP- и MySQL-пароли не используются.
+Пароль панели сначала проверяется как SFTP-пароль основного аккаунта. Только
+если SFTP вернул именно отказ аутентификации, появится отдельный скрытый вопрос
+про SFTP-пароль; всего допускается не более трёх попыток. Сетевая ошибка или
+неверный document root не считаются поводом перебирать пароли.
 
-Получите у REG.RU проверенный SFTP host-key fingerprint SHA256:... . Для
-виртуального хостинга SFTP host берётся из URL панели без https:// и :1500,
-порт — 22, пользователь — основной логин.
-
-
-4. ПОЛУЧИТЬ TLS PIN
-
-В Ubuntu/WSL подставьте домен и IPv4 сайта:
-
-  DOMAIN='front.example.org'
-  SITE_IP='192.0.2.30'
-  CERT_FILE="$(mktemp)"
-  timeout 20 openssl s_client -connect "$SITE_IP:443" -servername "$DOMAIN" \
-    </dev/null 2>/dev/null | openssl x509 -outform DER > "$CERT_FILE"
-  test -s "$CERT_FILE" && sha256sum "$CERT_FILE"
-  rm -f "$CERT_FILE"
-
-Сохраните первые 64 шестнадцатеричных символа. Если команда завершилась с
-ошибкой или файл пуст, сначала исправьте SSL сайта. После замены сертификата pin
-нужно получить заново.
+Не нужны: SHA/fingerprint, TLS pin, egress-IP, UUID, XHTTP path, probe port,
+команды UFW, firewall-plan, APPLY PC, bridge или ручное редактирование
+.htaccess. Эти значения и действия мастер получает/выполняет сам.
 
 
-5. ИЗМЕРИТЬ FRONT_EGRESS_IP
+ЧТО ПРОИСХОДИТ АВТОМАТИЧЕСКИ
+----------------------------
 
-Это IP, с которого хостинг REG.RU подключается к выходному VPS. Его нельзя
-брать из DNS, IP сайта или блока FTP.
+До изменений на exit мастер read-only проверяет существующий сайт через
+ISPmanager, DNS, SFTP и TLS/SNI. Затем он:
 
-1) В Ubuntu/WSL (bash) подставьте домен, IPv4 сайта и IP выхода. Команда выведет
-   две строки временного .htaccess со случайным путём:
+  - закрепляет первые SSH/SFTP host keys по TOFU;
+  - проверяет публичный CA либо автоматически закрепляет стабильный точный leaf,
+    не прошедший CA+hostname проверку (обычно self-signed); allowInsecure не
+    используется;
+  - ставит разрешённые пакеты на чистый exit, безопасно готовит UFW и проверяет
+    новый root SSH-вход;
+  - измеряет исходящие IPv4 exit и Apache REG.RU;
+  - создаёт UUID и случайный XHTTP path;
+  - разрешает backend TCP/8083 только от измеренного REG.RU IPv4 /32 и
+    запрещает остальным;
+  - транзакционно добавляет только свой блок .htaccess, сохраняя чужие правила;
+  - выполняет настоящий E2E через локальный SOCKS и сверяет внешний IP выхода.
 
-     FRONT_DOMAIN='front.example.org'
-     CLIENT_CONNECT_IP='192.0.2.30'
-     EXIT_IP='203.0.113.10'
-     XH_PROBE_PORT='18083'
-     XH_PROBE_TOKEN="xhttp-egress-$(openssl rand -hex 8)"
-     printf 'RewriteEngine On\nRewriteRule ^%s$ http://%s:%s/ [P,L]\n' \
-       "$XH_PROBE_TOKEN" "$EXIT_IP" "$XH_PROBE_PORT"
-
-2) В ISPmanager откройте точный document root нового сайта. Файл .htaccess
-   должен отсутствовать. Если он уже есть, остановитесь: не дописывайте и не
-   перезаписывайте существующие правила. Иначе создайте временный .htaccess
-   ровно из двух строк, напечатанных выше.
-
-3) На выходном VPS в root SSH-сессии установите tcpdump, проверьте, что порт
-   свободен, и добавьте одно временное именованное правило UFW. Сервис на этом
-   порту запускать не нужно:
-
-     (
-       set -Eeuo pipefail
-       apt-get update
-       apt-get install -y python3 tcpdump iproute2
-       XH_PROBE_PORT='18083'
-       if ss -H -lnt "sport = :$XH_PROBE_PORT" | grep .; then
-         echo 'Порт 18083 занят'; exit 1
-       fi
-       if env LC_ALL=C ufw status numbered \
-            | grep -Fq 'xhttp-setup-egress-probe'; then
-         echo 'Осталось старое временное правило UFW; сначала удалите его' >&2
-         exit 1
-       fi
-       ufw allow proto tcp from 0.0.0.0/0 to any port "$XH_PROBE_PORT" \
-         comment 'xhttp-setup-egress-probe'
-       XH_RULE_COUNT="$(env LC_ALL=C ufw status numbered \
-         | grep -Fc 'xhttp-setup-egress-probe')"
-       test "$XH_RULE_COUNT" -ge 1
-       test "$XH_RULE_COUNT" -le 2
-     )
-
-   Во внешнем firewall временно разрешите TCP/18083, если он блокирует пробу.
-
-4) На exit запустите весь блок ниже. Он ждёт ровно 12 SYN:
-
-     (
-       set -Eeuo pipefail
-       XH_PROBE_PORT='18083'
-       XH_CAPTURE="$(mktemp)"
-       trap 'rm -f -- "$XH_CAPTURE"' EXIT
-       timeout 240 tcpdump -nn -l -i any -c 12 \
-         "tcp dst port $XH_PROBE_PORT and (tcp[tcpflags] & tcp-syn != 0)" \
-         | tee "$XH_CAPTURE"
-       XH_SYN_COUNT="$(awk '{for (i=1; i<=NF; i++) if ($i == ">") c++} END {print c+0}' \
-         "$XH_CAPTURE")"
-       test "$XH_SYN_COUNT" -eq 12
-       mapfile -t XH_SOURCES < <(
-         awk '{for (i=1; i<=NF; i++) if ($i == ">") {s=$(i-1); sub(/\.[0-9]+$/, "", s); print s}}' \
-           "$XH_CAPTURE" | sort -u
-       )
-       test "${#XH_SOURCES[@]}" -eq 1
-       FRONT_EGRESS_IP="${XH_SOURCES[0]}"
-       python3 -c 'import ipaddress,sys; v=ipaddress.ip_address(sys.argv[1]); (v.version == 4 and v.is_global) or sys.exit("FRONT_EGRESS_IP не публичный IPv4")' \
-         "$FRONT_EGRESS_IP"
-       printf 'FRONT_EGRESS_IP=%s\n' "$FRONT_EGRESS_IP"
-     )
-
-5) Пока capture ждёт, в той же Ubuntu/WSL-сессии, где заданы переменные из
-   шага 1, выполните 12 запросов:
-
-     for XH_N in $(seq 1 12); do
-       curl --insecure --silent --show-error --noproxy '*' \
-         --connect-timeout 5 --max-time 10 \
-         --resolve "$FRONT_DOMAIN:443:$CLIENT_CONNECT_IP" \
-         "https://$FRONT_DOMAIN/$XH_PROBE_TOKEN" \
-         --output /dev/null || true
-       sleep 5
-     done
-
-6) Запишите напечатанный FRONT_EGRESS_IP. Если capture завершился ошибкой,
-   пришло меньше 12 SYN или обнаружено несколько IPv4: значение не угадывайте,
-   текущая схема с одним /32 не подходит.
-
-7) Даже если probe завершился ошибкой, удалите только созданный в шаге 2
-   временный .htaccess, затем удалите ровно именованное локальное правило UFW:
-
-     (
-       set -Eeuo pipefail
-       mapfile -t XH_RULE_NUMS < <(
-         env LC_ALL=C ufw status numbered \
-           | sed -n '/xhttp-setup-egress-probe/s/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' \
-           | sort -rn
-       )
-       if test "${#XH_RULE_NUMS[@]}" -lt 1 \
-          || test "${#XH_RULE_NUMS[@]}" -gt 2; then
-         echo 'Не удалось однозначно найти временное правило UFW' >&2
-         exit 1
-       fi
-       for XH_RULE_NUM in "${XH_RULE_NUMS[@]}"; do
-         ufw --force delete "$XH_RULE_NUM"
-       done
-       if env LC_ALL=C ufw status numbered \
-            | grep -Fq 'xhttp-setup-egress-probe'; then
-         echo 'Временное правило UFW осталось; удалите его до запуска мастера' >&2
-         exit 1
-       fi
-     )
-
-   Удалите и временное правило TCP/18083 во внешнем firewall. Если у VPS есть
-   постоянный cloud firewall, разрешите рабочий backend-порт (обычно TCP/8083)
-   только от FRONT_EGRESS_IP/32; не открывайте его всему интернету.
+client.vless и VLESS-ссылка появляются только после успешного E2E. До этого
+профиль не считается готовым.
 
 
-6. ЗАПУСТИТЬ МАСТЕР
+ВАЖНЫЙ КОМПРОМИСС TOFU
+----------------------
 
-Windows: дважды нажмите START-WINDOWS.cmd в извлечённой папке.
+Ручная подготовка fingerprint больше не нужна. При первом подключении мастер
+принимает увиденный SSH/SFTP-ключ, закрепляет его для точного endpoint и при
+последующей смене ключа останавливается.
 
-Linux: в папке с двумя скачанными файлами выполните весь блок. При несовпадении
-SHA-256 мастер не запустится:
+Шифрование и защита от незаметной подмены после первого контакта сохраняются.
+Но независимой проверки личности сервера при самом первом контакте нет:
+активная MITM-атака в этот момент может закрепить чужой ключ. Доверие своему ПК
+не устраняет сетевой риск. Для обычной установки это осознанный TOFU-компромисс;
+при более строгой модели угроз используйте ручной advanced workflow и
+fingerprint от независимого канала провайдера.
+
+Для leaf, не прошедшего публичную CA+hostname проверку, мастер требует одинаковый
+DER в двух соединениях и сохраняет его SHA-256. В pin-режиме срок, CA и hostname
+уже не проверяются, а pin сам по себе не доказывает правильность Apache vhost.
+Смена leaf будет заблокирована. Переход на сертификат публичного CA допускается
+только после обычной проверки trust store и hostname; публичный сертификат
+может штатно обновляться.
+
+
+ЕСЛИ ЗАПУСК ПРЕРВАЛСЯ
+---------------------
+
+Запустите START-WINDOWS.cmd ещё раз и введите те же данные. Мастер проверит
+managed exit и продолжит с теми же UUID/XHTTP path. Пароли в recovery state не
+сохраняются. Не удаляйте созданный каталог состояния и не запускайте два окна
+одновременно.
+
+Если жёсткое прерывание произошло во время временного или финального изменения
+.htaccess, автоматическое продолжение остановится fail-closed. Не удаляйте
+backups: сначала сопоставьте их с текущим .htaccess по сообщению диагностики.
+Если frontend/E2E не завершён, exit уже может быть защищён UFW, но client.vless
+не выдаётся.
+
+
+ВНЕШНИЙ FIREWALL VPS
+--------------------
+
+UFW внутри exit мастер настраивает сам. Отдельный cloud firewall/security group
+в панели VPS по SSH недоступен. Обычная установка не требует открывать диапазон
+портов. Если restrictive cloud firewall не пропустил probe, мастер покажет
+точный высокий TCP-порт; временно разрешите только этот порт и повторите запуск
+с теми же данными. Порт выбирается стабильно для этого endpoint.
+
+После измерения мастер напечатает IPv4 Apache REG.RU. Закройте временный probe-
+порт и разрешите во внешнем firewall TCP/8083 только от этого IPv4 /32, затем
+повторите запуск. SSH-порт управления должен оставаться доступен. Без API
+конкретного VPS-провайдера этот внешний слой нельзя автоматизировать
+универсально.
+
+
+LINUX
+-----
+
+На Debian 12+/Ubuntu 22.04+ установите Python 3.10+, ca-certificates, curl,
+coreutils и openssh-client. Скачайте в одну папку xhttp-setup-@@VERSION@@.pyz и
+xhttp-setup-@@VERSION@@.pyz.sha256, затем выполните:
 
   (
     set -Eeuo pipefail
@@ -303,55 +169,17 @@ SHA-256 мастер не запустится:
     exec python3 xhttp-setup-@@VERSION@@.pyz pc
   )
 
-На вопросы импорта готовых блоков нажимайте Enter. Вставляемый блок вводится
-скрыто: текста на экране не будет. После блока на новой строке напишите ГОТОВО и
-нажмите Enter.
 
-Основные ответы:
+ПРАВИЛА ХОСТИНГА
+----------------
 
-  • блок выхода: IP, root, пароль;
-  • SSH fingerprint выхода: полученный у провайдера;
-  • публичный IP выхода: первая строка блока выхода;
-  • ожидаемый исходящий IP выхода: записанный EXIT_EGRESS_IP из раздела 2;
-  • FRONT_EGRESS_IP: только измеренный в разделе 5;
-  • порт Xray 8083, случайный XHTTP path и название: обычно Enter;
-  • TLS fingerprint клиента [edge]: Enter;
-  • российский SSH bridge: «да» только если REG.RU доступен для настройки лишь
-    с российского IP; тогда нужны IP/root/пароль и fingerprint этого bridge;
-  • блок REG.RU: вставьте полный блок «Логины и пароли»;
-  • домен, IP подключения клиента и DNS A: данные сайта из раздела 3;
-  • закрепить leaf-сертификат: «да» для самоподписанного сертификата, затем
-    введите TLS pin из раздела 4;
-  • document root: точный путь из ISPmanager; либо разрешите read-only поиск;
-  • SFTP fingerprint: полученный у REG.RU;
-  • заменить index.html: обычно «нет».
+Справка REG.RU перечисляет proxy-сервисы среди запрещённого контента на
+виртуальном хостинге. Рабочая техническая настройка не является разрешением и
+не гарантирует отсутствие блокировки. Используйте схему только после
+письменного разрешения REG.RU либо у провайдера, который явно разрешает такой
+трафик:
 
-Проверьте показанный план. Для начала установки введите точно:
+  https://help.reg.ru/support/hosting/zakaz-hostinga-rabota-s-uslugoy/sovety-po-vyboru-tarifa-hostinga
 
-  APPLY PC
-
-При прямой настройке frontend используйте импортированный пароль панели как
-SFTP-пароль только если заранее проверили, что он подходит. Иначе ответьте «нет».
-На следующем вопросе про отдельный SSH-ключ отвечайте «да» только если такой ключ
-уже существует в WSL/Linux; на свежей установке с password-auth ответьте «нет» и
-введите SFTP-пароль скрыто.
-
-В bridge-режиме ключ frontend не используется: передайте проверенный пароль
-панели либо введите отдельный SFTP-пароль. Для root SSH самого bridge допустим
-импортированный блок или уже существующий проверенный SSH-ключ.
-
-Не закрывайте окно до результата E2E. Успех содержит путь к client.vless. При
-ошибке сохраните полный текст сообщения и исправьте указанную причину; не
-открывайте backend всему интернету и не перебирайте пароли.
-
-После успеха скопируйте единственную строку vless:// из client.vless и
-импортируйте её в совместимый Xray-клиент. В Windows, если URI не показан прямо,
-откройте Ubuntu и выполните `cat -- 'напечатанный путь к client.vless'`. Этот
-файл даёт доступ к серверу: не публикуйте и не пересылайте его открытым текстом.
-
-Для self-signed/pinned TLS клиент обязан сохранить параметры `pcs` /
-`pinnedPeerCertSha256`, XHTTP и VLESS Encryption. Не удаляйте pin и не включайте
-`allowInsecure`; если GUI отбрасывает эти поля, используйте совместимый клиент
-или публичный сертификат. Проверка мастера доказывает путь через Xray core, но не
-поведение любого GUI. Доступ именно через целевую SIM/оператора проверьте отдельно
-с выключенным Wi-Fi — только такой тест подтверждает работу в этой сети.
+Мастер не обходит антифрод, лимиты или блокировки, не ротирует домены и не
+маскирует трафик под сторонний сайт.

@@ -169,7 +169,11 @@ def _reject_nftables_service(ssh: SSHClient) -> None:
     active_code, active = _systemd_state(ssh, "is-active")
     if active_code == 0 or active == "active":
         raise InstallerError("Обнаружен активный nftables.service")
-    if active_code not in {3, 4} or active not in {"inactive", "unknown"}:
+    if active_code not in {1, 3, 4} or active not in {
+        "inactive",
+        "unknown",
+        "not-found",
+    }:
         raise InstallerError("Не удалось однозначно проверить nftables.service")
 
     enabled_code, enabled = _systemd_state(ssh, "is-enabled")

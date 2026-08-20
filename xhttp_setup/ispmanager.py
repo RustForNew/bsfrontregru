@@ -19,6 +19,10 @@ class SiteInfo:
     ipaddr: str | None
 
 
+class ISPmanagerAuthenticationError(VerificationError):
+    """The panel answered the auth request but did not issue a session."""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -74,7 +78,11 @@ def panel_login_url_to_endpoint(value: str) -> str:
 
 
 def _xml_post(
-    endpoint: str, fields: dict[str, str], *, timeout: int = 20
+    endpoint: str,
+    fields: dict[str, str],
+    *,
+    timeout: int = 20,
+    authentication_request: bool = False,
 ) -> ET.Element:
     data = urllib.parse.urlencode(fields).encode("utf-8")
     request = urllib.request.Request(
@@ -107,12 +115,18 @@ def _xml_post(
     error = root.find(".//error")
     if error is not None:
         message = " ".join(text.strip() for text in error.itertext() if text.strip())
-        raise VerificationError(f"ISPmanager API: {message or 'unknown error'}")
+        error_type = (
+            ISPmanagerAuthenticationError
+            if authentication_request
+            else VerificationError
+        )
+        raise error_type(f"ISPmanager API: {message or 'unknown error'}")
     return root
 
 
 def parse_site_list(root: ET.Element, domain: str) -> SiteInfo:
     expected = normalize_domain(domain)
+    matches: list[SiteInfo] = []
     for element in root.iter("elem"):
         fields = {child.tag: (child.text or "").strip() for child in list(element)}
         name = fields.get("name", "").rstrip(".").lower()
@@ -122,11 +136,19 @@ def parse_site_list(root: ET.Element, domain: str) -> SiteInfo:
                 raise VerificationError(
                     "ISPmanager не вернул docroot существующего сайта"
                 )
-            return SiteInfo(
-                name=expected,
-                docroot=validate_remote_dir(docroot),
-                ipaddr=fields.get("ipaddr") or None,
+            matches.append(
+                SiteInfo(
+                    name=expected,
+                    docroot=validate_remote_dir(docroot),
+                    ipaddr=fields.get("ipaddr") or None,
+                )
             )
+    if len(matches) > 1:
+        raise VerificationError(
+            f"ISPmanager вернул несколько сайтов с точным именем {expected}"
+        )
+    if matches:
+        return matches[0]
     raise VerificationError(f"Сайт {expected} не найден в ISPmanager")
 
 
@@ -146,11 +168,12 @@ def inspect_site(
                 "out": "xml",
                 "lang": "en",
             },
+            authentication_request=True,
         )
         auth = auth_root.find(".//auth")
         session_id = auth.attrib.get("id", "") if auth is not None else ""
         if not session_id:
-            raise VerificationError("ISPmanager не вернул session id")
+            raise ISPmanagerAuthenticationError("ISPmanager не вернул session id")
         sites = _xml_post(
             endpoint,
             {
@@ -161,6 +184,9 @@ def inspect_site(
             },
         )
         return parse_site_list(sites, domain)
+    except ISPmanagerAuthenticationError as exc:
+        detail = str(exc).replace(password, "[REDACTED]")
+        raise ISPmanagerAuthenticationError(detail) from None
     except InstallerError as exc:
         detail = str(exc).replace(password, "[REDACTED]")
         raise VerificationError(detail) from None

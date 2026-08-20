@@ -51,20 +51,8 @@ jobs:
           python "$linux_asset" --version
           python "$linux_asset" --help >/dev/null
           unzip -tq "$windows_asset"
-          python - "$windows_asset" <<'PY'
-          import pathlib
-          import sys
-          import zipfile
-
-          archive_path = pathlib.Path(sys.argv[1])
-          standalone = pathlib.Path("dist/INSTRUCTION.txt").read_bytes()
-          with zipfile.ZipFile(archive_path) as archive:
-              bundled = archive.read("INSTRUCTION.txt")
-          if bundled != standalone:
-              raise SystemExit("Bundled and standalone instructions differ")
-          if b"@@" in standalone:
-              raise SystemExit("Standalone instruction contains template tokens")
-          PY
+          unzip -p "$windows_asset" _internal/run-wsl.sh | sh -n
+          python scripts/verify_built_artifacts.py
           first_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
           first_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
           test "$first_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
@@ -78,6 +66,8 @@ jobs:
           test "$first_windows" = "$second_windows"
           test "$second_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
           test "$second_windows" = "$(tr -d '\r\n' < "$windows_asset.sha256")"
+          unzip -p "$windows_asset" _internal/run-wsl.sh | sh -n
+          python scripts/verify_built_artifacts.py
 
   windows-launcher:
     runs-on: windows-latest

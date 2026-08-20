@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from xhttp_setup.errors import InstallerError, VerificationError
 from xhttp_setup.front import (
+    FrontRollbackError,
     _RemoteMutation,
     _download_optional,
     _rollback_journal,
@@ -361,6 +362,36 @@ class FrontTransactionTests(unittest.TestCase):
             self.assertIn(".htaccess", detail)
             self.assertIn("first", detail)
             self.assertIn("second", detail)
+
+    def test_interrupt_during_rollback_is_typed_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work_dir = Path(temp)
+            mutation = _RemoteMutation(
+                target=".htaccess",
+                backup_name="backup-htaccess",
+                remote_temp="temp-htaccess",
+                original_local=work_dir / "original",
+                original_existed=False,
+                original_sha256=None,
+                work_dir=work_dir,
+                installed_sha256="00" * 32,
+            )
+            original = VerificationError("frontend verification failed")
+            with patch(
+                "xhttp_setup.front._rollback_mutation",
+                side_effect=KeyboardInterrupt(),
+            ):
+                with self.assertRaisesRegex(
+                    FrontRollbackError, "rollback неполон.*KeyboardInterrupt"
+                ) as raised:
+                    _rollback_journal(
+                        object(),
+                        remote_dir="/remote",
+                        journal=[mutation],
+                        original=original,
+                    )
+
+        self.assertIs(raised.exception.__cause__, original)
 
 
 if __name__ == "__main__":

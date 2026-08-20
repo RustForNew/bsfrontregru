@@ -35,6 +35,43 @@ VLESS Encryption, bare Xray exit без Remnawave. `METHOD-bs-front.md` и ви�
   совпадают. Это не проверка импорта GUI-клиентом;
 - `client.vless` создан с правами `0600` только после успешного E2E.
 
+## Контракт автоматического PC-мастера v0.5.0
+
+Версия 0.5.0 автоматизирует тот же dataplane, не меняя проверенную схему выше.
+Этот раздел фиксирует реализованный контракт и автоматические проверки кода; он
+сам по себе не добавляет новую live-проверку к фактам развёртывания 2026-08-19.
+
+- обычный пользователь вводит только exit IPv4/SSH port/login/password, точный
+  URL ISPmanager, основной логин/пароль REG.RU, IPv4 подключения сайта и домен;
+- сайт уже существует: ISPmanager используется read-only для единственного
+  точного совпадения и фактического document root; site creation отсутствует;
+- SSH/SFTP используют endpoint-scoped TOFU. Первый увиденный ключ сохраняется,
+  последующее исчезновение/изменение закреплённого ключа блокируется;
+- public TLS проверяется через системный CA и hostname. При certificate-
+  verification отказе требуются два одинаковых TLS handshakes, после чего exact
+  DER SHA-256 сохраняется и проверяется; обычно это ISPmanager self-signed leaf,
+  но pin-режим сам не проверяет CA/hostname/vhost; `allowInsecure` отсутствует;
+- сайт, DNS, SFTP/docroot и TLS проверяются до первой мутации нового exit;
+- поддерживается только чистый Debian 12+/Ubuntu 22.04+ exit без
+  Docker/containerd/custom firewall. Pristine inactive UFW включается через
+  SSH allow, временный systemd rollback guard и новые SSH-проверки до и после
+  остановки timer/service; stale guard или единственная exact orphaned SSH rule
+  следующего запуска согласуется до apt, дополнительные rules блокируют процесс;
+- egress exit и Apache frontend измеряются автоматически. Временный
+  `.htaccess` применяется через тот же compare-and-swap/rollback механизм, что
+  и финальный frontend;
+- финальный backend остаётся TCP/8083 с точным UFW allow `/32` и deny;
+- UUID и XHTTP path создаются автоматически, homepage/index не меняются
+  (`placeholder_mode=keep`);
+- URI выдаётся только после SOCKS E2E и совпадения внешнего IP с egress exit;
+- phase/pending/receipt state позволяет после прерванного exit apply повторить
+  точное состояние с теми же UUID/path. Незавершённый frontend rollback
+  блокирует автоматическое продолжение fail-closed.
+
+Пароли не входят в persistent recovery state. Отдельный SFTP-пароль запрашивается
+только после точной ошибки SFTP-аутентификации, а не после сетевой или файловой
+ошибки; общий предел — три попытки аутентификации.
+
 ## Исходный предоставленный пример
 
 В старом рабочем примере были подтверждены Apache `[P]`, XHTTP `packet-up`,
@@ -77,21 +114,28 @@ TLS без сертификата невозможен. В проверенно�
 - публичный CA/Let's Encrypt сценарий;
 - длительная нагрузка и стабильность Apache egress `/32` во времени;
 - применимость `PHP → FastCGI (Apache)` к другим тарифам и узлам REG.RU;
-- PC-orchestrator, remote UFW и bridge-транспорт не участвовали в live-проверке
-  2026-08-19; отдельно подтверждены только используемые ими серверные
-  `exit`/`front` и E2E-контракты;
+- автоматический PC-orchestrator v0.5.0 и включение pristine UFW не участвовали
+  в live-проверке 2026-08-19; отдельно подтверждены используемые ими
+  серверные `exit`/`front` и E2E-контракты;
+- recovery после реального power loss/kill в каждой phase; поведение проверено
+  автоматическими тестами и структурой receipt/marker, но не аппаратным сбоем;
 - Windows launcher проверен настоящим Windows PowerShell 5.1 и локальным WSL2
   до первого интерактивного запроса из распакованного ZIP; запуск PC-orchestrator
   на реальных узлах отдельно не выполнялся;
 - persistence optional MSS-профиля после reboot.
 
 Создание сайта и сертификата через ISPmanager не автоматизировано. Форма панели
-зависит от версии и тарифа; мастер использует готовый vhost и точный document
-root. Пошаговый порядок находится в
-[`reg-ru-pinned-tls.txt`](reg-ru-pinned-tls.txt).
+зависит от версии и тарифа; мастер использует готовый vhost и получает точный
+document root read-only. Актуальная подготовка сайта находится в
+[`reg-ru-ispmanager-setup.txt`](reg-ru-ispmanager-setup.txt). Большой
+[`reg-ru-pinned-tls.txt`](reg-ru-pinned-tls.txt) — архивный ручной runbook
+v0.4.x, а не инструкция PC-мастера v0.5.0.
 
 ## Границы автоматизации
 
-Проект не отключает TLS/SSH host-key проверку, не меняет чужие Docker/Xray/
-systemd namespace, не копирует сторонний сайт и не выдаёт VLESS URI до E2E со
-сверкой IP выхода. Правила и лимиты хостинга остаются внешним условием.
+Проект не использует `allowInsecure`, не меняет чужие Docker/Xray/systemd
+namespace, не копирует сторонний сайт и не выдаёт VLESS URI до E2E со сверкой
+IP выхода. PC-мастер заменяет независимую первичную сверку SSH/SFTP fingerprint
+на TOFU: это сохраняет обнаружение последующей смены ключа, но не аутентифицирует
+первый контакт против активного MITM. Правила хостинга и provider cloud firewall
+остаются внешними условиями.

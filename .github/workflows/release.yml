@@ -46,7 +46,9 @@ jobs:
               raise SystemExit("Releases older than v0.3.0 are not supported")
           PY
           code_version="$(python -c 'from xhttp_setup import __version__; print(__version__)')"
+          project_version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text("utf-8"))["project"]["version"])')"
           test "$version" = "$code_version"
+          test "$version" = "$project_version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "linux_asset=xhttp-setup-$version.pyz" >> "$GITHUB_OUTPUT"
           echo "windows_asset=xhttp-setup-$version-windows-wsl.zip" >> "$GITHUB_OUTPUT"
@@ -77,12 +79,25 @@ jobs:
           ! grep -F '@@' "$instruction"
           python "$linux_asset" --version
           unzip -tq "$windows_asset"
+          unzip -p "$windows_asset" _internal/run-wsl.sh | sh -n
+          python scripts/verify_built_artifacts.py
           for asset in "$linux_asset" "$windows_asset"; do
             expected="$(tr -d '\r\n' < "$asset.sha256")"
             actual="$(sha256sum "$asset" | awk '{print $1}')"
             test "$expected" = "$actual"
             [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
           done
+          first_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
+          first_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
+          first_instruction="$(sha256sum "$instruction" | awk '{print $1}')"
+          rm -rf dist
+          python scripts/build.py
+          python scripts/build_windows_bundle.py
+          test "$first_linux" = "$(sha256sum "$linux_asset" | awk '{print $1}')"
+          test "$first_windows" = "$(sha256sum "$windows_asset" | awk '{print $1}')"
+          test "$first_instruction" = "$(sha256sum "$instruction" | awk '{print $1}')"
+          unzip -p "$windows_asset" _internal/run-wsl.sh | sh -n
+          python scripts/verify_built_artifacts.py
       - name: Upload tested release files
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -97,6 +112,7 @@ jobs:
           retention-days: 7
 
   windows-launcher:
+    needs: build
     runs-on: windows-latest
     permissions:
       contents: read
@@ -114,6 +130,25 @@ jobs:
           python -m unittest
           tests.test_windows_launcher_runtime
           tests.test_windows_bundle -v
+      - name: Download built release files
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-${{ needs.build.outputs.version }}
+          path: dist
+      - name: Verify the actual release bundle in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python scripts/verify_built_artifacts.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $Version = '${{ needs.build.outputs.version }}'
+          python "dist\xhttp-setup-$Version.pyz" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $Extracted = Join-Path $env:RUNNER_TEMP 'xhttp-release-bundle'
+          Expand-Archive -LiteralPath "dist\xhttp-setup-$Version-windows-wsl.zip" `
+            -DestinationPath $Extracted
+          $Launcher = Join-Path $Extracted '_internal\xhttp-setup.ps1'
+          $null = [scriptblock]::Create([IO.File]::ReadAllText($Launcher))
 
   publish:
     needs: [build, windows-launcher]

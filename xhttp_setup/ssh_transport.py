@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
+import hashlib
 import os
+import re
 import shlex
 import signal
 import stat
@@ -14,10 +18,30 @@ from pathlib import Path
 
 from .errors import InstallerError, VerificationError
 from .osutil import atomic_write_text, ensure_dir, run
-from .validate import validate_host, validate_port, validate_ssh_user
+from .validate import (
+    validate_fingerprint,
+    validate_host,
+    validate_port,
+    validate_ssh_user,
+)
 
 
 _MAX_SSH_INPUT_BYTES = 4096
+_MAX_KNOWN_HOSTS_BYTES = 16 * 1024
+_HOST_KEY_PREFERENCE = (
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ssh-rsa",
+)
+_SSH_PERMISSION_DENIED = re.compile(
+    r"(?:^|:\s)Permission denied(?:\s+\([^()\r\n]+\))?\.?$"
+)
+
+
+class SSHAuthenticationError(InstallerError):
+    """The remote endpoint was reached but rejected the supplied credential."""
 
 
 @contextlib.contextmanager
@@ -53,6 +77,8 @@ def _password_askpass(password: str) -> Iterator[dict[str, str]]:
                     "SSH_ASKPASS": str(helper),
                     "SSH_ASKPASS_REQUIRE": "force",
                     "XHTTP_ASKPASS_FIFO": str(fifo),
+                    "LC_ALL": "C",
+                    "LANG": "C",
                 }
             )
             yield env
@@ -136,6 +162,289 @@ class SSHAuth:
                 )
             return self
         raise InstallerError("Поддерживаются методы SSH key и password")
+
+
+@dataclass(frozen=True)
+class _ObservedHostKey:
+    key_type: str
+    key_blob: str
+
+
+def tofu_known_hosts_path(*, trust_dir: Path, host: str, port: int) -> Path:
+    """Return the global trust file dedicated to one normalized SSH endpoint."""
+    normalized_host = validate_host(host)
+    normalized_port = validate_port(port)
+    endpoint = f"{normalized_host}\0{normalized_port}".encode("utf-8")
+    digest = hashlib.sha256(endpoint).hexdigest()
+    return Path(trust_dir) / f"{digest}.known_hosts"
+
+
+def _known_hosts_token(host: str, port: int) -> str:
+    return host if port == 22 else f"[{host}]:{port}"
+
+
+def _canonical_host_key_line(
+    *, host: str, port: int, observed: _ObservedHostKey
+) -> str:
+    return f"{_known_hosts_token(host, port)} {observed.key_type} {observed.key_blob}"
+
+
+def _parse_host_key_fields(
+    line: str, *, host: str, port: int, source: str
+) -> _ObservedHostKey:
+    parts = line.split()
+    if len(parts) != 3:
+        raise VerificationError(f"Некорректная строка SSH host key в {source}")
+    host_token, key_type, key_blob = parts
+    accepted_tokens = {host, f"[{host}]:{port}"}
+    if host_token not in accepted_tokens:
+        raise VerificationError(
+            f"SSH host key в {source} относится к другому endpoint"
+        )
+    if key_type not in _HOST_KEY_PREFERENCE:
+        raise VerificationError(
+            f"Неподдерживаемый тип SSH host key в {source}: {key_type}"
+        )
+    try:
+        decoded = base64.b64decode(key_blob, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise VerificationError(
+            f"Некорректный SSH public key в {source}"
+        ) from exc
+    if not decoded:
+        raise VerificationError(f"Пустой SSH public key в {source}")
+    return _ObservedHostKey(key_type=key_type, key_blob=key_blob)
+
+
+def _fingerprint_host_key(line: str, *, source: str) -> str:
+    try:
+        result = run(
+            ["ssh-keygen", "-E", "sha256", "-lf", "-"],
+            input_text=line + "\n",
+        )
+    except InstallerError as exc:
+        raise VerificationError(
+            f"Не удалось проверить SSH host key из {source}: {exc}"
+        ) from exc
+    parts = result.stdout.strip().split()
+    if len(parts) < 2:
+        raise VerificationError(
+            f"ssh-keygen не вернул fingerprint для SSH host key из {source}"
+        )
+    try:
+        return validate_fingerprint(parts[1])
+    except InstallerError as exc:
+        raise VerificationError(
+            f"ssh-keygen вернул некорректный fingerprint для {source}"
+        ) from exc
+
+
+def _parse_existing_trust(
+    content: bytes, *, host: str, port: int, path: Path
+) -> tuple[str, str]:
+    if len(content) > _MAX_KNOWN_HOSTS_BYTES:
+        raise VerificationError(f"SSH trust-файл слишком велик: {path}")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise VerificationError(f"SSH trust-файл не является UTF-8: {path}") from exc
+    lines = text.splitlines()
+    if len(lines) != 1 or text != lines[0] + "\n":
+        raise VerificationError(
+            f"SSH trust-файл должен содержать ровно один host key: {path}"
+        )
+    observed = _parse_host_key_fields(
+        lines[0], host=host, port=port, source=str(path)
+    )
+    canonical = _canonical_host_key_line(host=host, port=port, observed=observed)
+    if lines[0] != canonical:
+        raise VerificationError(f"SSH trust-файл имеет неканоничный формат: {path}")
+    fingerprint = _fingerprint_host_key(canonical, source=str(path))
+    return canonical, fingerprint
+
+
+def _read_existing_trust(
+    path: Path, *, host: str, port: int
+) -> tuple[str, str] | None:
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallerError(f"Не удалось проверить SSH trust-файл {path}: {exc}") from exc
+    if stat.S_ISLNK(path_metadata.st_mode):
+        raise InstallerError(f"SSH trust-файл не может быть symlink: {path}")
+    if not stat.S_ISREG(path_metadata.st_mode):
+        raise InstallerError(f"SSH trust-файл должен быть обычным файлом: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise InstallerError(
+            f"Не удалось безопасно открыть SSH trust-файл {path}: {exc}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InstallerError(f"SSH trust-файл должен быть обычным файлом: {path}")
+        if os.name == "posix":
+            mode = stat.S_IMODE(metadata.st_mode)
+            if mode != 0o600:
+                raise InstallerError(
+                    f"Права SSH trust-файла {path}: {mode:04o}, ожидалось 0600"
+                )
+            if metadata.st_uid != os.geteuid():
+                raise InstallerError(
+                    f"SSH trust-файл {path} принадлежит другому пользователю"
+                )
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read(_MAX_KNOWN_HOSTS_BYTES + 1)
+    finally:
+        os.close(descriptor)
+
+    try:
+        current_metadata = path.lstat()
+    except OSError as exc:
+        raise InstallerError(
+            f"SSH trust-файл изменился во время безопасного чтения: {path}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(current_metadata.st_mode) or (
+        current_metadata.st_dev,
+        current_metadata.st_ino,
+    ) != (metadata.st_dev, metadata.st_ino):
+        raise InstallerError(
+            f"SSH trust-файл изменился во время безопасного чтения: {path}"
+        )
+    return _parse_existing_trust(content, host=host, port=port, path=path)
+
+
+def _scan_host_keys(*, host: str, port: int) -> dict[str, str]:
+    scan = run(
+        [
+            "ssh-keyscan",
+            "-T",
+            "10",
+            "-p",
+            str(port),
+            "-t",
+            "ed25519,ecdsa,rsa",
+            host,
+        ],
+        check=False,
+        timeout=20,
+    )
+    by_type: dict[str, set[str]] = {}
+    for raw_line in scan.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        observed = _parse_host_key_fields(
+            line, host=host, port=port, source="ssh-keyscan"
+        )
+        by_type.setdefault(observed.key_type, set()).add(observed.key_blob)
+    if not by_type:
+        raise VerificationError(
+            f"ssh-keyscan не получил SSH host key от {host}:{port}"
+        )
+    ambiguous = sorted(key_type for key_type, keys in by_type.items() if len(keys) != 1)
+    if ambiguous:
+        raise VerificationError(
+            "ssh-keyscan получил несколько разных ключей одного типа: "
+            + ", ".join(ambiguous)
+        )
+
+    canonical: dict[str, str] = {}
+    for key_type in _HOST_KEY_PREFERENCE:
+        keys = by_type.get(key_type)
+        if not keys:
+            continue
+        observed = _ObservedHostKey(key_type=key_type, key_blob=next(iter(keys)))
+        canonical[key_type] = _canonical_host_key_line(
+            host=host, port=port, observed=observed
+        )
+    if not canonical:
+        raise VerificationError(
+            f"ssh-keyscan не получил поддерживаемый SSH host key от {host}:{port}"
+        )
+    return canonical
+
+
+def _atomic_create_trust(path: Path, content: str) -> None:
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp_path, 0o600)
+        try:
+            # A same-directory hard-link publishes the complete file atomically and,
+            # unlike os.replace(), can never overwrite an existing trust decision.
+            os.link(temp_path, path)
+        except FileExistsError as exc:
+            raise VerificationError(
+                f"SSH trust-файл появился параллельно и не был перезаписан: {path}"
+            ) from exc
+        except OSError as exc:
+            raise InstallerError(
+                f"Не удалось атомарно сохранить SSH trust-файл {path}: {exc}"
+            ) from exc
+        if os.name == "posix":
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_fd = os.open(path.parent, directory_flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def trust_host_key_tofu(
+    *, host: str, port: int, trust_dir: Path
+) -> tuple[Path, str]:
+    """Trust the first network-observed key, then reject every key change.
+
+    This is endpoint-scoped TOFU, not independent host authentication: the first
+    key is obtained from the network before SSH authentication.  Later calls scan
+    again and require an exact match with the private, persistent trust file.
+    """
+    normalized_host = validate_host(host)
+    normalized_port = validate_port(port)
+    trust_root = Path(trust_dir)
+    ensure_dir(trust_root, 0o700)
+    known_hosts = tofu_known_hosts_path(
+        trust_dir=trust_root, host=normalized_host, port=normalized_port
+    )
+    existing = _read_existing_trust(
+        known_hosts, host=normalized_host, port=normalized_port
+    )
+    observed = _scan_host_keys(
+        host=normalized_host, port=normalized_port
+    )
+    if existing is not None:
+        existing_line, existing_fingerprint = existing
+        if existing_line not in observed.values():
+            raise VerificationError(
+                f"SSH host key {normalized_host}:{normalized_port} изменился; "
+                f"trust-файл {known_hosts} оставлен без изменений"
+            )
+        return known_hosts, existing_fingerprint
+
+    observed_line = next(
+        observed[key_type]
+        for key_type in _HOST_KEY_PREFERENCE
+        if key_type in observed
+    )
+    observed_fingerprint = _fingerprint_host_key(
+        observed_line, source="ssh-keyscan"
+    )
+    _atomic_create_trust(known_hosts, observed_line + "\n")
+    return known_hosts, observed_fingerprint
 
 
 def pin_host_key(
@@ -223,6 +532,8 @@ class SFTPClient:
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
+            "UpdateHostKeys=no",
+            "-o",
             "ConnectTimeout=15",
             "-o",
             "NumberOfPasswordPrompts=1",
@@ -286,6 +597,8 @@ class SFTPClient:
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
+            "UpdateHostKeys=no",
+            "-o",
             "ConnectTimeout=15",
             "-o",
             "NumberOfPasswordPrompts=1",
@@ -328,6 +641,10 @@ class SFTPClient:
                 stderr = master.stderr.read() if master.stderr is not None else ""
                 lines = stderr.strip().splitlines()
                 detail = lines[-1] if lines else f"код {returncode}"
+                if _SSH_PERMISSION_DENIED.search(detail):
+                    raise SSHAuthenticationError(
+                        f"SFTP SSH-аутентификация не удалась: {detail}"
+                    )
                 raise InstallerError(f"SFTP SSH-аутентификация не удалась: {detail}")
             try:
                 check = subprocess.run(
@@ -490,6 +807,8 @@ class SSHClient:
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
+            "UpdateHostKeys=no",
+            "-o",
             "ConnectTimeout=15",
             "-o",
             "NumberOfPasswordPrompts=1",
@@ -605,6 +924,12 @@ class SSHClient:
                 if input_text is None:
                     raise error from exc
                 raise error from None
+        if result.returncode != 0:
+            detail = _last_process_line(result, input_text=input_text)
+            if _SSH_PERMISSION_DENIED.search(detail):
+                raise SSHAuthenticationError(
+                    f"SSH-аутентификация не удалась: {detail}"
+                )
         if check and result.returncode != 0:
             raise InstallerError(
                 "SSH завершился с ошибкой: "

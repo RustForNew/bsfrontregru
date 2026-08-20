@@ -134,10 +134,35 @@ class WindowsBundleTests(unittest.TestCase):
                     f"sha256sum -c xhttp-setup-{release}.pyz.sha256",
                     instruction_text,
                 )
-                self.assertIn("xhttp-setup-egress-probe", instruction_text)
-                self.assertIn("EXIT_EGRESS_IP", instruction_text)
-                self.assertGreaterEqual(instruction_text.count("--noproxy '*'"), 3)
-                self.assertIn("APPLY PC", instruction_text)
+                for user_field in (
+                    "IPv4 выходного сервера",
+                    "SSH port выхода",
+                    "SSH login выхода",
+                    "SSH password выхода",
+                    "HTTPS-адрес панели REG.RU",
+                    "основной логин REG.RU",
+                    "пароль панели REG.RU",
+                    "IPv4 подключения REG.RU",
+                    "домен frontend",
+                ):
+                    self.assertIn(user_field, instruction_text)
+                for automatic_invariant in (
+                    "TOFU",
+                    "client.vless",
+                    "E2E",
+                    "мастер сайт не создаёт",
+                    "не трогает index.html",
+                ):
+                    self.assertIn(automatic_invariant, instruction_text)
+                for obsolete_manual_token in (
+                    "xhttp-setup-egress-probe",
+                    "EXIT_EGRESS_IP",
+                    "FRONT_EGRESS_IP",
+                    "Для применения введите APPLY PC",
+                    "Проверенный SSH host-key fingerprint выхода SHA256",
+                    "отдельной строкой ГОТОВО",
+                ):
+                    self.assertNotIn(obsolete_manual_token, instruction_text)
                 self.assertNotIn("@@", instruction_text)
                 self.assertEqual(
                     [name for name in archive.namelist() if name.endswith(".txt")],

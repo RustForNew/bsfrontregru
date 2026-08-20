@@ -1,4 +1,7 @@
-Pinned public release download. Keep the release tag pinned.
+Pinned public legacy release download (v0.4.1). Keep the release tag pinned.
+This file intentionally does not point at the unreleased local v0.5.0 build.
+For the current minimal PC wizard use README.md or the locally built v0.5.0
+INSTRUCTION.txt; update this pin only after v0.5.0 is actually published.
 
 (
   set -Eeuo pipefail

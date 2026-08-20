@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from xhttp_setup.errors import InstallerError
-from xhttp_setup.ssh_transport import SSHAuth, SSHClient
+from xhttp_setup.ssh_transport import SSHAuth, SSHAuthenticationError, SSHClient
 
 
 class SSHClientTests(unittest.TestCase):
@@ -189,6 +189,31 @@ class SSHClientTests(unittest.TestCase):
         self.assertNotIn(secret_line, str(raised.exception))
         self.assertNotIn(bridge_secret, str(raised.exception))
         self.assertIn("[REDACTED]", str(raised.exception))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO")
+    def test_password_permission_denied_is_a_typed_auth_failure_even_without_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SSHClient(
+                host="exit.example.org",
+                port=22,
+                user="root",
+                known_hosts=root / "known_hosts",
+                auth=SSHAuth("password", password="wrong-secret"),
+            )
+            failure = subprocess.CompletedProcess(
+                ["ssh"],
+                255,
+                "",
+                "root@exit.example.org: Permission denied (publickey,password).\n",
+            )
+            with (
+                mock.patch(
+                    "xhttp_setup.ssh_transport.subprocess.run", return_value=failure
+                ),
+                self.assertRaises(SSHAuthenticationError),
+            ):
+                client.command(["id", "-u"], check=False)
 
 
 if __name__ == "__main__":

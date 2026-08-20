@@ -260,7 +260,7 @@ def _normalized_regru_panel_url(parsed: SplitResult) -> str:
     return urlunsplit(("https", f"{host}:1500", path, "", ""))
 
 
-def _validate_panel_url(value: str) -> str:
+def validate_regru_panel_url(value: str) -> str:
     candidate = value.strip()
     markdown = _MARKDOWN_LINK.fullmatch(candidate)
     if markdown:
@@ -361,7 +361,7 @@ def parse_regru_credentials(value: str) -> RegRuCredentials:
         panel_password=_validate_password(
             values["panel_password"], field_name="пароль панели"
         ),
-        panel_url=_validate_panel_url(values["panel_url"]),
+        panel_url=validate_regru_panel_url(values["panel_url"]),
         ftp_login=_validate_login(values["ftp_login"], field_name="логин FTP"),
         ftp_server_ip=validate_ipv4(values["ftp_server_ip"]),
     )

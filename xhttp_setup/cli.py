@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import datetime
 import getpass
+import json
 import os
 import platform
 import re
 import secrets
+import stat
 import sys
 import urllib.parse
 import uuid
@@ -19,11 +21,13 @@ from .credential_parser import (
     RegRuCredentials,
     parse_exit_credentials,
     parse_regru_credentials,
+    validate_regru_panel_url,
 )
 from .doctor import Check, doctor_exit, doctor_front, e2e_probe
 from .errors import InstallerError, ValidationError
 from .exit_installer import Layout, apply_exit, build_exit_plan
 from .front import (
+    FrontRollbackError,
     FrontResult,
     apply_front,
     build_front_plan,
@@ -45,14 +49,20 @@ from .models import (
     validate_front_tls,
     validate_tls_fingerprint,
 )
-from .osutil import atomic_write_text, load_json
+from .osutil import atomic_write_text, exclusive_lock, load_json
 from .pc_orchestrator import (
     apply_pc_exit,
     front_for_handoff,
-    preflight_remote_front_bridge,
+)
+from .pc_autosetup import (
+    PcUserInputs,
+    clear_pending_pc_exit,
+    prepare_pc_install,
+    validate_pc_secret,
+    write_pending_pc_exit,
 )
 from .remote_exit import RemoteExitTarget
-from .remote_front import RemoteFrontTarget, apply_remote_front
+from .remote_front import RemoteFrontTarget
 from .render import render_vless_uri
 from .ssh_transport import SSHAuth
 from .validate import (
@@ -69,6 +79,16 @@ from .validate import (
 
 T = TypeVar("T")
 _MAX_STDIN_SECRET_BYTES = 4095  # SSH transport adds one trailing LF.
+_PC_PHASES = frozenset(
+    {
+        "preparing",
+        "front_probe_in_progress",
+        "exit_applying",
+        "exit_ready",
+        "front_in_progress",
+        "complete",
+    }
+)
 PROVIDER_WARNING = """ВАЖНО: правила REG.RU прямо относят proxy-сервисы на виртуальном
 хостинге к запрещённым. Техническая аккуратность не делает использование
 разрешённым и не гарантирует отсутствие блокировки. Получите письменное
@@ -440,6 +460,51 @@ def _collect_pc_exit_access() -> tuple[RemoteExitTarget, SSHAuth | None]:
     return target, auth
 
 
+def _collect_pc_minimal_inputs() -> PcUserInputs:
+    """Collect only credentials and the domain; everything else is discovered."""
+
+    print(
+        "\nВведите только данные доступа. Пароли вводятся скрыто и не сохраняются."
+    )
+    exit_host = _validated_prompt("IPv4 выходного сервера", validate_ipv4)
+    exit_port = _validated_prompt("SSH port выхода", validate_port, "22")
+    exit_user = _validated_prompt("SSH login выхода", validate_ssh_user, "root")
+    exit_password = _validated_secret_prompt(
+        "SSH password выхода: ", "SSH password выхода"
+    )
+    panel_url = _validated_prompt(
+        "HTTPS-адрес панели REG.RU (например https://vip123.hosting.reg.ru:1500/)",
+        validate_regru_panel_url,
+    )
+    panel_user = _validated_prompt("Логин REG.RU", validate_ssh_user)
+    panel_password = _validated_secret_prompt(
+        "Пароль панели REG.RU: ", "Пароль панели REG.RU"
+    )
+    front_connect_ip = _validated_prompt(
+        "IPv4 подключения REG.RU (поле «IP-адрес сервера»)", validate_ipv4
+    )
+    domain = _validated_prompt("Домен frontend", normalize_domain)
+    return PcUserInputs(
+        exit_host=exit_host,
+        exit_port=exit_port,
+        exit_user=exit_user,
+        exit_password=exit_password,
+        panel_url=panel_url,
+        panel_user=panel_user,
+        panel_password=panel_password,
+        front_connect_ip=front_connect_ip,
+        domain=domain,
+    ).validate()
+
+
+def _validated_secret_prompt(prompt: str, label: str) -> str:
+    while True:
+        try:
+            return validate_pc_secret(getpass.getpass(prompt), label)
+        except InstallerError as exc:
+            print(f"Ошибка: {exc}", file=sys.stderr)
+
+
 def _collect_pc_bridge_access() -> tuple[RemoteFrontTarget, SSHAuth | None]:
     if not _yes_no(
         "Вставить готовый блок российского bridge (IPv4, root, password)?",
@@ -508,6 +573,64 @@ def _installer_pyz_from_runtime() -> Path:
 
 def _pc_output_dir(domain: str) -> Path:
     return Path.home() / ".local/state/xhttp-setup/pc" / domain
+
+
+def _read_pc_phase(output_dir: Path) -> str | None:
+    if output_dir.is_symlink():
+        raise InstallerError("Каталог PC state не может быть symlink")
+    path = output_dir / "pc-phase.json"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallerError("Не удалось проверить PC phase marker") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise InstallerError("PC phase marker должен быть обычным файлом")
+    if metadata.st_size <= 0 or metadata.st_size > 1024:
+        raise InstallerError("PC phase marker имеет недопустимый размер")
+    if os.name == "posix" and (
+        stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid()
+    ):
+        raise InstallerError("PC phase marker должен иметь owner и mode 0600")
+    try:
+        value = json.loads(path.read_text("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InstallerError("PC phase marker повреждён") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "phase"}
+        or value.get("schema_version") != 1
+        or value.get("phase") not in _PC_PHASES
+    ):
+        raise InstallerError("PC phase marker имеет неожиданную структуру")
+    return str(value["phase"])
+
+
+def _write_pc_phase(output_dir: Path, phase: str) -> None:
+    if phase not in _PC_PHASES:
+        raise InstallerError("Неизвестная фаза PC wizard")
+    atomic_write_text(
+        output_dir / "pc-phase.json",
+        json.dumps(
+            {"schema_version": 1, "phase": phase},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        0o600,
+    )
+
+
+def _has_front_rollback_error(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, FrontRollbackError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _save_verified_link(
@@ -785,205 +908,119 @@ def wizard_front() -> int:
     return 0
 
 
+def _run_pc_install(
+    *, inputs: PcUserInputs, output_dir: Path, installer_pyz: Path
+) -> int:
+    initial_phase = _read_pc_phase(output_dir)
+    if initial_phase in {
+        "front_probe_in_progress",
+        "front_in_progress",
+    }:
+        raise InstallerError(
+            "Предыдущий frontend apply был жёстко прерван или его rollback неполон; "
+            "автоматическое продолжение остановлено, чтобы не потерять исходный .htaccess"
+        )
+    prepared = None
+    try:
+        prepared = prepare_pc_install(
+            inputs,
+            output_dir=output_dir,
+            progress=lambda message: print(f"\n→ {message}"),
+            phase_callback=lambda phase: _write_pc_phase(output_dir, phase),
+            exit_password_prompt=lambda: _validated_secret_prompt(
+                "SSH password выхода не подошёл. Повторите: ",
+                "SSH password выхода",
+            ),
+            panel_password_prompt=lambda: _validated_secret_prompt(
+                "Пароль панели REG.RU не подошёл. Повторите: ",
+                "Пароль панели REG.RU",
+            ),
+            sftp_password_prompt=lambda: _validated_secret_prompt(
+                "Пароль SFTP REG.RU (пароль панели не подошёл): ",
+                "Пароль SFTP REG.RU",
+            ),
+            require_exit_recovery=initial_phase
+            in {"exit_applying", "exit_ready", "complete"},
+        )
+        inputs = None
+        if prepared.existing_handoff is None:
+            print("\n→ Настраиваю защищённый выход")
+            write_pending_pc_exit(
+                output_dir=output_dir,
+                prepared=prepared,
+                domain=prepared.desired_front.domain,
+            )
+            _write_pc_phase(output_dir, "exit_applying")
+            exit_result = apply_pc_exit(
+                installer_pyz=installer_pyz,
+                desired=prepared.desired_exit,
+                target=prepared.exit_target,
+                auth=prepared.exit_auth,
+                output_dir=output_dir,
+            )
+            handoff = Handoff.from_dict(load_json(exit_result.remote.handoff_path))
+        else:
+            print("\n→ Использую ранее подтверждённый защищённый выход")
+            handoff = prepared.existing_handoff
+        _write_pc_phase(output_dir, "exit_ready")
+        clear_pending_pc_exit(output_dir)
+        desired_front = front_for_handoff(prepared.desired_front, handoff)
+        client_handoff = handoff.with_pinned_peer_cert(
+            desired_front.pinned_peer_cert_sha256
+        )
+        print("\n→ Настраиваю frontend и выполняю обязательный E2E")
+        front_state = output_dir / "front"
+        _write_pc_phase(output_dir, "front_in_progress")
+        try:
+            _apply_front_and_issue(
+                desired=desired_front,
+                auth=prepared.front_auth,
+                state_dir=front_state,
+                handoff=client_handoff,
+                layout=Layout(root=front_state / "probe-runtime"),
+            )
+        except BaseException as exc:
+            rollback_incomplete = _has_front_rollback_error(exc)
+            if not rollback_incomplete:
+                _write_pc_phase(output_dir, "exit_ready")
+            print(
+                "\nВыход уже защищён UFW, но frontend/E2E не завершён; "
+                "client.vless не выдан. Диагностика сохранена в "
+                f"{output_dir}",
+                file=sys.stderr,
+            )
+            raise
+        _write_pc_phase(output_dir, "complete")
+        print("\nГотово: установка и сквозная E2E-проверка завершены.")
+    finally:
+        inputs = None
+        prepared = None
+    return 0
+
+
 def wizard_pc() -> int:
-    """Run both existing server transactions from one Linux/WSL controller."""
+    """Install both nodes from credentials only; derive every technical value."""
 
     _require_linux_apply()
     _disable_pc_core_dumps()
     installer_pyz = _installer_pyz_from_runtime()
-    exit_target, imported_exit_auth = _collect_pc_exit_access()
+    print("\nАвтоматическая установка XHTTP с персонального компьютера")
+    print(
+        "Первый SSH/SFTP-ключ будет принят по TOFU и закреплён. "
+        "При последующей смене ключа установка остановится."
+    )
+    print(PROVIDER_WARNING.rstrip())
+    inputs = _collect_pc_minimal_inputs()
+    output_dir = _pc_output_dir(inputs.domain)
     try:
-        public_address_default = validate_ipv4(exit_target.host)
-    except ValidationError:
-        public_address_default = None
-    desired_exit = _collect_exit(
-        remote=True,
-        public_address_default=public_address_default,
-    )
-    if (
-        imported_exit_auth is not None
-        and desired_exit.public_address != exit_target.host
-    ):
-        raise InstallerError(
-            "Публичный IPv4 выхода должен совпадать с первой строкой "
-            "импортированного блока"
-        )
-    if desired_exit.listen_port == exit_target.port:
-        raise InstallerError("Backend-порт не должен совпадать с SSH-портом выхода")
-    preview_handoff = Handoff(
-        exit_address=desired_exit.public_address,
-        exit_port=desired_exit.listen_port,
-        client_id=desired_exit.client_id,
-        xhttp_path=desired_exit.xhttp_path,
-        encryption="pending-vless-encryption-material-xxxxxxxx",
-        label=desired_exit.label,
-        expected_egress_ip=desired_exit.expected_egress_ip,
-        tls_fingerprint=desired_exit.tls_fingerprint,
-    ).validate()
-
-    use_bridge = _yes_no(
-        "Frontend доступен только с российского IP и нужен доверенный SSH bridge?"
-    )
-    if use_bridge:
-        print(
-            "Bridge должен быть доверенным: root этого VPS участвует только в настройке, "
-            "но видит handoff и выполняет frontend/E2E. В рабочем трафике он не участвует."
-        )
-    regru_credentials = _collect_regru_credentials_import()
-    desired_front = _collect_front(
-        preview_handoff,
-        allow_panel_inspection=not use_bridge,
-        regru_credentials=regru_credentials,
-    )
-    imported_panel_password = (
-        regru_credentials.panel_password if regru_credentials is not None else None
-    )
-    regru_credentials = None
-    if use_bridge:
-        bridge_target, imported_bridge_auth = _collect_pc_bridge_access()
-    else:
-        bridge_target = None
-        imported_bridge_auth = None
-
-    pc_steps = [
-        (
-            f"Закрепить SSH host key выхода {exit_target.host}:{exit_target.port} "
-            "и подтвердить UID 0"
-        ),
-        (
-            "Проверить clean Debian/Ubuntu с уже активным UFW; добавить только "
-            f"allow {desired_exit.front_egress_ip}/32 и deny TCP/{desired_exit.listen_port}"
-        ),
-        "Запустить на выходе тот же транзакционный exit installer без ускорений",
-    ]
-    if bridge_target is None:
-        pc_steps.append("Запустить тот же frontend installer напрямую с этого ПК")
-    else:
-        pc_steps.append(
-            f"Запустить тот же frontend installer на bridge "
-            f"{bridge_target.host}:{bridge_target.port}"
-        )
-    pc_steps.append(
-        "Выдать client.vless только после обязательной сквозной E2E-проверки"
-    )
-    _show_plan(
-        "План установки с персонального компьютера",
-        pc_steps
-        + build_exit_plan(desired_exit, Layout())
-        + build_front_plan(desired_front),
-    )
-    if bridge_target is None:
-        check_front_dns(desired_front.domain, desired_front.dns_ipv4)
-        check_public_tls(
-            desired_front.domain,
-            connect_ip=desired_front.client_connect_ip,
-            pinned_peer_cert_sha256=desired_front.pinned_peer_cert_sha256,
-        )
-    else:
-        print("\nDNS, TLS, SFTP и E2E frontend будут проверены с российского bridge.")
-    _ack_provider()
-    _confirm_apply("PC")
-
-    exit_auth = imported_exit_auth or _collect_auth("Exit root SSH")
-    if bridge_target is None:
-        if imported_panel_password is not None and _yes_no(
-            "Использовать импортированный пароль панели как SFTP password?"
-        ):
-            front_auth = SSHAuth(
-                method="password", password=imported_panel_password
-            ).validate()
-        else:
-            front_auth = _collect_auth("Frontend SFTP")
-        bridge_auth = None
-        sftp_password = None
-    else:
-        front_auth = None
-        bridge_auth = imported_bridge_auth or _collect_auth("Bridge root SSH")
-        if imported_panel_password is not None:
-            print(
-                "При использовании пароля панели для SFTP доверенный root bridge "
-                "сможет увидеть его во время настройки."
-            )
-        if imported_panel_password is not None and _yes_no(
-            "Передать импортированный пароль панели как SFTP password через bridge?"
-        ):
-            sftp_password = _validate_bridge_sftp_password(imported_panel_password)
-        else:
-            sftp_password = _collect_bridge_sftp_password()
-    imported_exit_auth = None
-    imported_bridge_auth = None
-    imported_panel_password = None
-
-    output_dir = _pc_output_dir(desired_front.domain)
-    try:
-        if bridge_target is not None:
-            if bridge_auth is None:
-                raise InstallerError("Не получена SSH-аутентификация bridge")
-            preflight_remote_front_bridge(
-                target=bridge_target,
-                auth=bridge_auth,
+        with exclusive_lock(output_dir / "wizard.lock"):
+            return _run_pc_install(
+                inputs=inputs,
                 output_dir=output_dir,
+                installer_pyz=installer_pyz,
             )
-
-        exit_result = apply_pc_exit(
-            installer_pyz=installer_pyz,
-            desired=desired_exit,
-            target=exit_target,
-            auth=exit_auth,
-            output_dir=output_dir,
-        )
-        exit_auth = None
-        handoff = Handoff.from_dict(load_json(exit_result.remote.handoff_path))
-        desired_front = front_for_handoff(desired_front, handoff)
-        client_handoff = handoff.with_pinned_peer_cert(
-            desired_front.pinned_peer_cert_sha256
-        )
-        try:
-            if bridge_target is not None:
-                if bridge_auth is None or sftp_password is None:
-                    raise InstallerError(
-                        "Не получены учётные данные frontend через bridge"
-                    )
-                result = apply_remote_front(
-                    installer_pyz=installer_pyz,
-                    handoff_path=exit_result.remote.handoff_path,
-                    desired=desired_front,
-                    target=bridge_target,
-                    bridge_auth=bridge_auth,
-                    sftp_password=sftp_password,
-                    output_dir=output_dir,
-                    firewall_verified=True,
-                )
-                print("\nE2E пройден. Клиентская ссылка сохранена с правами 0600:")
-                print(result.client_path)
-            else:
-                if front_auth is None:
-                    raise InstallerError("Не получена SFTP-аутентификация frontend")
-                front_state = output_dir / "front"
-                result = _apply_front_and_issue(
-                    desired=desired_front,
-                    auth=front_auth,
-                    state_dir=front_state,
-                    handoff=client_handoff,
-                    layout=Layout(root=front_state / "probe-runtime"),
-                    firewall_plan_path=exit_result.remote.firewall_plan_path,
-                    firewall_supplied=True,
-                )
-                _print_front_result(result)
-        except Exception:
-            print(
-                "\nВыход уже настроен, а backend ограничен UFW. Frontend/E2E не "
-                "завершён, ссылка не выдана. Не удаляйте локальный handoff: "
-                f"{exit_result.remote.handoff_path}",
-                file=sys.stderr,
-            )
-            raise
     finally:
-        exit_auth = None
-        front_auth = None
-        bridge_auth = None
-        sftp_password = None
-    return 0
+        inputs = None
 
 
 def wizard_full() -> int:

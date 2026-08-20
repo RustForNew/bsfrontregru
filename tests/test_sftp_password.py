@@ -12,6 +12,7 @@ from xhttp_setup.errors import InstallerError
 from xhttp_setup.ssh_transport import (
     SFTPClient,
     SSHAuth,
+    SSHAuthenticationError,
     _password_askpass,
 )
 
@@ -54,7 +55,9 @@ class _FakeMaster:
         self.pid = 90001
         self.returncode = returncode
         self.stderr = io.StringIO(
-            "Permission denied (publickey,password).\n" if returncode else ""
+            "operator@sftp.example.org: Permission denied (publickey,password).\n"
+            if returncode
+            else ""
         )
         self._socket: socket.socket | None = None
         self.control_path = control_path
@@ -174,7 +177,9 @@ class SFTPPasswordMuxTests(unittest.TestCase):
                 mock.patch(
                     "xhttp_setup.ssh_transport.subprocess.run", side_effect=fake_run
                 ),
-                self.assertRaisesRegex(InstallerError, "аутентификация не удалась"),
+                self.assertRaisesRegex(
+                    SSHAuthenticationError, "аутентификация не удалась"
+                ),
             ):
                 client.batch(["ls"], check=False)
 

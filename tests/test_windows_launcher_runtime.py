@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -22,6 +23,32 @@ def _windows_powershell() -> str | None:
         if executable.is_file():
             return str(executable)
     return shutil.which("powershell.exe")
+
+
+def _has_usable_wsl2_distribution() -> bool:
+    executable = shutil.which("wsl.exe")
+    if not executable:
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "--list", "--verbose"],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    # Windows PowerShell exposes wsl.exe's UTF-16 output with NULs.  Only the
+    # ASCII version column matters for deciding whether this integration test
+    # can run on the current machine.
+    normalized = result.stdout.replace(b"\x00", b"").decode("ascii", "ignore")
+    for line in normalized.splitlines():
+        match = re.match(r"^\s*\*?\s*(?P<name>.+?)\s{2,}.+?\s{2,}2\s*$", line)
+        if match and match.group("name").lower().startswith(("ubuntu", "debian")):
+            return True
+    return False
 
 
 @unittest.skipUnless(_windows_powershell(), "Windows PowerShell is not available")
@@ -102,6 +129,42 @@ class WindowsLauncherRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertNotIn("Get-FileHash", LAUNCHER.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(
+        _has_usable_wsl2_distribution(),
+        "an installed WSL2 distribution is not available",
+    )
+    def test_root_script_is_transmitted_intact_to_real_wsl(self) -> None:
+        path = str(LAUNCHER).replace("'", "''")
+        result = self._run_windows_powershell(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$source = [IO.File]::ReadAllText('{path}')\n"
+            "$tokens = $null\n"
+            "$errors = $null\n"
+            "$ast = [Management.Automation.Language.Parser]::ParseInput("
+            "$source, [ref]$tokens, [ref]$errors)\n"
+            "if ($errors.Count -ne 0) { throw $errors[0] }\n"
+            "foreach ($name in @('Get-XhttpWsl2Distribution', "
+            "'Invoke-XhttpWslRootScript')) {\n"
+            "  $functionAst = $ast.Find({ param($node) "
+            "$node -is [Management.Automation.Language.FunctionDefinitionAst] -and "
+            "$node.Name -eq $name }, $true)\n"
+            "  if ($null -eq $functionAst) { throw \"Function not found: $name\" }\n"
+            "  Invoke-Expression $functionAst.Extent.Text\n"
+            "}\n"
+            "$wsl = Join-Path $env:SystemRoot 'System32\\wsl.exe'\n"
+            "$distro = Get-XhttpWsl2Distribution -WslExe $wsl\n"
+            "$scriptText = \"set -eu`r`ntest `\"`$(id -u)`\" = 0`r`n\" + "
+            "\"case `\"`$-`\" in *e*) ;; *) exit 91;; esac`r`n\" + "
+            "\"case `\"`$-`\" in *u*) ;; *) exit 92;; esac`r`n\" + "
+            "\"for tool in sh python3; do command -v `\"`$tool`\" >/dev/null; done\"\n"
+            "$output = @(Invoke-XhttpWslRootScript -WslExe $wsl "
+            "-Distribution $distro -ScriptText $scriptText)\n"
+            "if ($script:XhttpWslLastExitCode -ne 0) { "
+            "throw \"WSL script failed: $script:XhttpWslLastExitCode / $output\" }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertNotIn("not found", result.stderr)
 
 
 if __name__ == "__main__":

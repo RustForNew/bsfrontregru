@@ -11,8 +11,10 @@
 - A leaf certificate pin is public but operationally short-lived. Certificate
   renewal requires re-verification and reissuing the client URI. Root and
   intermediate CA hashes must not be used as the pin, and the client must
-  actually support Xray's `pinnedPeerCertSha256` / URI `pcs` parameter. Pins are
-  never refreshed automatically.
+  actually support Xray's `pinnedPeerCertSha256` / URI `pcs` parameter. A
+  different explicitly pinned leaf is never accepted automatically. Migration to a
+  public-CA certificate is allowed only after normal CA and hostname
+  verification succeeds.
 - Pin verification authenticates a certificate, not an Apache virtual-host
   mapping. Enable the site's SSL/443 vhost and verify that SNI/Host reaches that
   site before capturing a pin; never pin a provider's unrelated default vhost.
@@ -26,40 +28,58 @@
   fail-on-command semantics by running `sftp -b` only through its private
   control socket. Passwords are not placed in argv, regular files, config files,
   or environment values.
-- The PC wizard pins exit and optional bridge host keys before password
-  authentication. Root passwords use the same private FIFO transport.
-- Ready-made credential blocks are read only from the controlling Linux/WSL
-  terminal with echo disabled for the whole bounded paste. The exact terminator
-  is removed, queued suffix input is flushed, terminal settings are restored in
-  `finally`, and PC mode disables core dumps before reading credentials. The
-  program cannot clear the host clipboard or its history.
-- REG.RU import accepts only ISPmanager login URLs on
-  `vip<digits>.hosting.reg.ru:1500` with a known path. FTP and MySQL passwords
-  are recognized for section boundaries but are not retained or used. Reusing
-  the panel password for SFTP requires a separate explicit confirmation; there
-  is no password fallback or retry list.
-- Imported panel credentials may be sent only after explicit consent to the
-  provider HTTPS endpoint for the existing read-only site lookup. The endpoint
-  uses the system CA store, rejects redirects and has no userinfo, query or
-  fragment. Reflected remote errors are redacted without a secret-bearing
-  exception chain.
-- In bridge mode the SFTP password is sent as one bounded stdin line inside an
+- The PC wizard discovers exit and SFTP host keys before password
+  authentication, accepts the first supported key as TOFU, and persists it in
+  an endpoint-scoped private store. Later disappearance or change of that exact
+  key is rejected; adding another key type does not silently replace it. This
+  removes manual fingerprints but does not independently authenticate the
+  first network contact. Root passwords use the same private FIFO transport.
+- Ready-made credential blocks remain available only in advanced modes. They
+  are read from the controlling Linux/WSL terminal with echo disabled for the
+  whole bounded paste. The minimal PC wizard instead asks for each credential
+  separately with hidden password input. PC mode disables core dumps before
+  reading credentials. The program cannot clear the host clipboard or its
+  history.
+- REG.RU endpoints are restricted to ISPmanager login URLs on
+  `vip<digits>.hosting.reg.ru:1500` with a known path before the panel secret is
+  requested or sent. The endpoint uses the system CA store, rejects redirects
+  and has no userinfo, query or fragment. The PC flow performs only login and a
+  read-only exact site lookup; it never creates or edits a site.
+- The panel password is tried once as the primary-account SFTP password. A
+  separate hidden SFTP password is requested, up to three total authentication
+  attempts, only after
+  a structured OpenSSH authentication failure. Network, TLS and document-root
+  errors never trigger credential guessing. Reflected remote errors are
+  redacted without a secret-bearing exception chain.
+- In advanced bridge mode the SFTP password is sent as one bounded stdin line inside an
   already host-key-pinned SSH command. It is not placed in argv, environment,
   regular files, or relayed command output.
-- The optional bridge is a trusted operator host, not an anonymous proxy. Its
+- The advanced optional bridge is a trusted operator host, not an anonymous proxy. Its
   root can observe the handoff, frontend credentials and managed client
   material; compromise of bridge root defeats these protections.
-- Remote firewall automation is fail-closed and restricted to already-active
-  UFW on clean Debian/Ubuntu. It never changes UFW state, defaults, SSH access,
-  or cloud firewall.
+- Remote firewall automation is fail-closed and restricted to clean supported
+  Debian/Ubuntu hosts. An already-active compatible UFW is preserved. For a
+  pristine inactive UFW, the PC flow installs only allowlisted prerequisites,
+  adds the actual SSH-port allow before enabling UFW, arms a bounded systemd
+  rollback guard, and verifies a fresh SSH connection both before and after
+  quiescing its timer and service. A later run detects and reconciles an owned
+  stale guard or the single exact pre-guard SSH rule; unexpected/additional
+  rules remain fail-closed.
+  It never edits provider cloud firewalls, merges custom nftables/iptables, or
+  disables a standalone firewall service.
 - The Windows bundle does not implement a second SSH stack. Its PowerShell
-  launcher verifies the bundled runner and Linux zipapp SHA-256 and starts that
-  same controller inside one selected WSL2 distribution. Native Windows
-  execution without WSL is rejected.
+  launcher verifies the bundled runner and Linux zipapp SHA-256, prepares the
+  allowlisted Ubuntu/Debian dependencies when needed, and starts that same
+  controller inside one selected WSL2 distribution. Enabling WSL itself may
+  still require Windows administrator rights and a reboot.
 - UUID, VLESS Encryption material, handoff, backups and client URI are secrets.
 - Xray runs as a dedicated unprivileged user and does not replace another Xray
   service.
 - Managed state/lock paths reject symlinks and unexpected ownership or modes.
+  The complete PC flow holds one nonblocking private lock. Phase and write-once
+  pending markers bind interrupted work to the exact endpoint, UUID, XHTTP path
+  and egress values without storing passwords or VLESS Encryption material.
+  Incomplete frontend rollback phases refuse automatic continuation.
 - Release and Xray versions are pinned. Checksums, regular-file type, ownership
   and modes are verified by installer install/re-apply. Subsequent systemd
   restarts rely on the root-owned managed directory; they do not re-hash the
@@ -87,9 +107,10 @@ Threats not solved by this project:
 - a compromised operator host or GitHub account;
 - metadata visible to shared hosting (IP addresses, XHTTP path, timing, sizes);
 - hosting-provider policy enforcement or traffic limits;
-- an SSH key fingerprint accepted without independent verification;
-- a backend firewall incorrectly confirmed by the operator;
-- an incorrect or later-changed frontend egress IPv4 supplied by the operator;
+- a first-use SSH/SFTP key or explicitly pinned leaf accepted without independent
+  verification;
+- a missing or incorrectly configured provider cloud firewall;
+- a later change of frontend egress IPv4 (automatic `/32` migration is refused);
 - compromise of the optional trusted bridge;
 - traffic analysis by network operators;
 - client applications that silently discard the VLESS Encryption parameter.
