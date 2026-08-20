@@ -1,6 +1,12 @@
 XHTTP-SETUP: REG.RU FRONTEND + BARE XRAY EXIT
 Пошаговая установка с pinned TLS
 
+ВАЖНО: это проверенный ручной runbook. Для автоматизированного запуска с одного
+Linux/WSL-компьютера используйте режим pc из README. Не смешивайте способы:
+pc требует уже активный clean UFW и не выполняет раздел 7, который включает и
+меняет defaults UFW. Подготовка сайта, DNS, TLS и измерение FRONT_EGRESS_IP ниже
+остаются актуальны.
+
 Схема после настройки:
 
   клиент -- VLESS Encryption + XHTTP packet-up + TLS:443 --> сайт REG.RU
@@ -16,7 +22,7 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
   - чистый Ubuntu/Debian exit с systemd, root и UFW;
   - Linux/WSL с обычным IP для управления exit;
   - Linux-сервер с российским IP для обращения к REG.RU;
-  - опубликованный GitHub Release xhttp-setup v0.1.0.
+  - опубликованный GitHub Release xhttp-setup v0.2.0.
 
 Не используйте раздел UFW на сервере с Docker, собственными nftables/iptables
 или другими сервисами. Для такого сервера правила нужно объединять вручную.
@@ -46,14 +52,14 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
   fi
 
   git push -u publish main
-  git tag -a v0.1.0 -m 'xhttp-setup v0.1.0'
-  git push publish v0.1.0
+  git tag -a v0.2.0 -m 'xhttp-setup v0.2.0'
+  git push publish v0.2.0
 
 Открыть GitHub -> Actions -> Release. Дождаться зелёного результата. В Releases
 должны появиться два файла:
 
-  xhttp-setup-0.1.0.pyz
-  xhttp-setup-0.1.0.pyz.sha256
+  xhttp-setup-0.2.0.pyz
+  xhttp-setup-0.2.0.pyz.sha256
 
 На странице release должна быть отметка Immutable. Если её нет, не
 устанавливать этот release: включить immutable releases и выпустить новый
@@ -67,8 +73,8 @@ OWNER/REPOSITORY:
     set -Eeuo pipefail
 
     XH_REPO='OWNER/REPOSITORY'
-    XH_TAG='v0.1.0'
-    XH_ASSET='xhttp-setup-0.1.0.pyz'
+    XH_TAG='v0.2.0'
+    XH_ASSET='xhttp-setup-0.2.0.pyz'
     XH_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$XH_TMP"' EXIT
     XH_BASE="https://github.com/$XH_REPO/releases/download/$XH_TAG"
@@ -106,7 +112,7 @@ OWNER/REPOSITORY:
 
 Ожидаемый вывод версии:
 
-  xhttp-setup 0.1.0
+  xhttp-setup 0.2.0
 
 
 1. Записать исходные данные

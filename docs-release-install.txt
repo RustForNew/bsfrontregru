@@ -4,8 +4,8 @@ Replace OWNER/REPOSITORY once before publishing. Keep the release tag pinned.
   set -Eeuo pipefail
 
   repo="OWNER/REPOSITORY"
-  tag="v0.1.0"
-  asset="xhttp-setup-0.1.0.pyz"
+  tag="v0.2.0"
+  asset="xhttp-setup-0.2.0.pyz"
 
   command -v curl >/dev/null
   command -v python3 >/dev/null

@@ -5,8 +5,14 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from xhttp_setup.cli import _ack_provider, _managed_exit_present, main
+from xhttp_setup.cli import (
+    _ack_provider,
+    _managed_exit_present,
+    _read_password_stdin,
+    main,
+)
 from xhttp_setup.doctor import _parse_cloudflare_trace_ip
 from xhttp_setup.errors import InstallerError, VerificationError
 from xhttp_setup.exit_installer import Layout, _parse_vlessenc, build_exit_plan
@@ -129,6 +135,22 @@ Authentication: ML-KEM
         with contextlib.redirect_stdout(output):
             _ack_provider()
         self.assertIn("не блокирует", output.getvalue())
+
+    def test_password_stdin_accepts_exactly_one_bounded_line(self):
+        with patch("xhttp_setup.cli.sys.stdin", io.StringIO("secret\n")):
+            self.assertEqual(_read_password_stdin(), "secret")
+        for value in ("\n", "secret\nextra", ("a" * 4096) + "\n"):
+            with (
+                self.subTest(length=len(value)),
+                patch("xhttp_setup.cli.sys.stdin", io.StringIO(value)),
+            ):
+                with self.assertRaises(InstallerError):
+                    _read_password_stdin()
+
+    def test_pc_subcommand_dispatches_to_interactive_pc_wizard(self):
+        with patch("xhttp_setup.cli.wizard_pc", return_value=0) as wizard:
+            self.assertEqual(main(["pc"]), 0)
+        wizard.assert_called_once_with()
 
     def test_front_state_alone_does_not_trigger_local_exit_doctor(self):
         with tempfile.TemporaryDirectory() as temp:

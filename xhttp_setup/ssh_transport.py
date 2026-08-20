@@ -17,6 +17,9 @@ from .osutil import atomic_write_text, ensure_dir, run
 from .validate import validate_host, validate_port, validate_ssh_user
 
 
+_MAX_SSH_INPUT_BYTES = 4096
+
+
 @contextlib.contextmanager
 def _password_askpass(password: str) -> Iterator[dict[str, str]]:
     """Expose one password prompt through a private, kernel-backed FIFO."""
@@ -70,9 +73,42 @@ def _without_askpass_env() -> dict[str, str]:
     return env
 
 
-def _last_process_line(result: subprocess.CompletedProcess[str]) -> str:
+def _redact_input_text(value: str, input_text: str | None) -> str:
+    if input_text is None:
+        return value
+    secret = input_text[:-1] if input_text.endswith("\n") else input_text
+    return value.replace(secret, "[REDACTED]") if secret else value
+
+
+def _last_process_line(
+    result: subprocess.CompletedProcess[str], *, input_text: str | None = None
+) -> str:
     lines = (result.stderr or result.stdout).strip().splitlines()
-    return lines[-1] if lines else f"код {result.returncode}"
+    detail = lines[-1] if lines else f"код {result.returncode}"
+    return _redact_input_text(detail, input_text)
+
+
+def _validate_input_text(input_text: str | None) -> str | None:
+    if input_text is None:
+        return None
+    if not isinstance(input_text, str):
+        raise InstallerError("SSH stdin должен быть UTF-8 текстом")
+    if "\x00" in input_text or "\r" in input_text:
+        raise InstallerError("SSH stdin не может содержать NUL или CR")
+    line = input_text[:-1] if input_text.endswith("\n") else input_text
+    if "\n" in line:
+        raise InstallerError(
+            "SSH stdin должен содержать одну строку с необязательным завершающим LF"
+        )
+    try:
+        input_size = len(input_text.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise InstallerError("SSH stdin должен быть корректным UTF-8 текстом") from None
+    if input_size > _MAX_SSH_INPUT_BYTES:
+        raise InstallerError(
+            f"SSH stdin превышает лимит {_MAX_SSH_INPUT_BYTES} UTF-8 bytes"
+        )
+    return input_text
 
 
 @dataclass(frozen=True)
@@ -492,6 +528,7 @@ class SSHClient:
         *,
         check: bool = True,
         timeout: int = 300,
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if not remote_argv:
             raise InstallerError("Пустая удалённая SSH-команда")
@@ -499,33 +536,79 @@ class SSHClient:
             "\n" in value or "\r" in value or "\x00" in value for value in remote_argv
         ):
             raise InstallerError("Недопустимый перевод строки в SSH-команде")
+        input_text = _validate_input_text(input_text)
         command_text = shlex.join(remote_argv)
         argv = self._argv() + [command_text]
         if self.auth.method == "key":
-            return run(argv, check=check, timeout=timeout)
-        return self._command_password(argv, check=check, timeout=timeout)
+            if input_text is None:
+                return run(argv, check=check, timeout=timeout)
+            try:
+                result = run(
+                    argv,
+                    input_text=input_text,
+                    check=False,
+                    timeout=timeout,
+                )
+            except InstallerError as exc:
+                detail = _redact_input_text(str(exc), input_text)
+                raise InstallerError(detail) from None
+            if check and result.returncode != 0:
+                raise InstallerError(
+                    "SSH завершился с ошибкой: "
+                    f"{_last_process_line(result, input_text=input_text)}"
+                )
+            return result
+        return self._command_password(
+            argv,
+            check=check,
+            timeout=timeout,
+            input_text=input_text,
+        )
 
     def _command_password(
-        self, argv: list[str], *, check: bool, timeout: int
+        self,
+        argv: list[str],
+        *,
+        check: bool,
+        timeout: int,
+        input_text: str | None,
     ) -> subprocess.CompletedProcess[str]:
         with _password_askpass(self.auth.password) as env:
             try:
-                result = subprocess.run(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=env,
-                    start_new_session=True,
-                    timeout=timeout,
-                    check=False,
-                )
+                if input_text is None:
+                    result = subprocess.run(
+                        argv,
+                        stdin=subprocess.DEVNULL,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=env,
+                        start_new_session=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                else:
+                    result = subprocess.run(
+                        argv,
+                        input=input_text,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=env,
+                        start_new_session=True,
+                        timeout=timeout,
+                        check=False,
+                    )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                raise InstallerError(f"SSH не запустился: {exc}") from exc
+                detail = _redact_input_text(str(exc), input_text)
+                error = InstallerError(f"SSH не запустился: {detail}")
+                if input_text is None:
+                    raise error from exc
+                raise error from None
         if check and result.returncode != 0:
             raise InstallerError(
-                f"SSH завершился с ошибкой: {_last_process_line(result)}"
+                "SSH завершился с ошибкой: "
+                f"{_last_process_line(result, input_text=input_text)}"
             )
         return result
 

@@ -26,6 +26,17 @@
   fail-on-command semantics by running `sftp -b` only through its private
   control socket. Passwords are not placed in argv, regular files, config files,
   or environment values.
+- The PC wizard pins exit and optional bridge host keys before password
+  authentication. Root passwords use the same private FIFO transport.
+- In bridge mode the SFTP password is sent as one bounded stdin line inside an
+  already host-key-pinned SSH command. It is not placed in argv, environment,
+  regular files, or relayed command output.
+- The optional bridge is a trusted operator host, not an anonymous proxy. Its
+  root can observe the handoff, frontend credentials and managed client
+  material; compromise of bridge root defeats these protections.
+- Remote firewall automation is fail-closed and restricted to already-active
+  UFW on clean Debian/Ubuntu. It never changes UFW state, defaults, SSH access,
+  or cloud firewall.
 - UUID, VLESS Encryption material, handoff, backups and client URI are secrets.
 - Xray runs as a dedicated unprivileged user and does not replace another Xray
   service.
@@ -59,6 +70,8 @@ Threats not solved by this project:
 - hosting-provider policy enforcement or traffic limits;
 - an SSH key fingerprint accepted without independent verification;
 - a backend firewall incorrectly confirmed by the operator;
+- an incorrect or later-changed frontend egress IPv4 supplied by the operator;
+- compromise of the optional trusted bridge;
 - traffic analysis by network operators;
 - client applications that silently discard the VLESS Encryption parameter.
 - client applications that discard `pcs` (causing failure for an otherwise
