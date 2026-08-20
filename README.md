@@ -11,11 +11,10 @@ Apache frontend -- HTTP/XHTTP --> зарубежный bare Xray exit :8083 --> 
 завершается на существующем сайте, а Xray работает отдельным
 непривилегированным systemd-сервисом только на зарубежном exit.
 
-Текущий публичный Release — `v0.5.0`; его PC-сценарий подключается к REG.RU
-напрямую. Текущий исходный код `0.6.0` добавляет необязательный доверенный
-SSH-мост для setup-доступа к REG.RU. Публичного артефакта `v0.6.0` пока нет.
-Ветка с мостом подтверждена локальными и mocked-тестами, но ещё не проходила
-отдельное live-развёртывание через реальный мост.
+Текущий публичный Release — `v0.6.0`. Его PC-сценарий добавляет необязательный
+доверенный SSH-мост для setup-доступа к REG.RU. Ветка с мостом подтверждена
+локальными и mocked-тестами, но ещё не проходила отдельное live-развёртывание
+через реальный мост.
 
 ## Быстрый запуск на Windows
 
@@ -32,12 +31,12 @@ SSH-мост для setup-доступа к REG.RU. Публичного арт�
 2. В ISPmanager заранее вручную создайте сайт и настройте DNS/TLS по
    [короткому списку](docs/reg-ru-ispmanager-setup.txt). Мастер сайт не создаёт.
 3. Скачайте
-   [`xhttp-setup-0.5.0-windows-wsl.zip`](https://github.com/RustForNew/bsfrontregru/releases/download/v0.5.0/xhttp-setup-0.5.0-windows-wsl.zip),
+   [`xhttp-setup-0.6.0-windows-wsl.zip`](https://github.com/RustForNew/bsfrontregru/releases/download/v0.6.0/xhttp-setup-0.6.0-windows-wsl.zip),
    выберите в Проводнике «Извлечь все» и дважды нажмите
    `START-WINDOWS.cmd`.
-4. Отвечайте на вопросы по одному. Опубликованный `v0.5.0` использует прямое
-   подключение к REG.RU. Никакие SHA-256, host-key fingerprint, UUID, XHTTP
-   path, egress-IP, UFW-команды или `APPLY PC` вводить не нужно.
+4. Отвечайте на вопросы по одному. `v0.6.0` предложит прямое подключение к
+   REG.RU или необязательный SSH-мост. Никакие SHA-256, host-key fingerprint,
+   UUID, XHTTP path, egress-IP, UFW-команды или `APPLY PC` вводить не нужно.
 5. Не закрывайте окно до сообщения об успешной сквозной проверке. Только после
    неё мастер создаст `client.vless` и покажет клиентскую ссылку.
 
@@ -47,7 +46,7 @@ SSH-мост для setup-доступа к REG.RU. Публичного арт�
 
 ## Что нужно ввести
 
-В текущем исходном коде `0.6.0` PC-мастер спрашивает:
+В `v0.6.0` PC-мастер спрашивает:
 
 1. IPv4 выходного сервера;
 2. SSH port выхода, обычно `22`;
@@ -102,7 +101,7 @@ SSH-мост для setup-доступа к REG.RU. Публичного арт�
 `index.html` и содержимое главной страницы остаются без изменений
 (`placeholder_mode=keep`).
 
-## Необязательный SSH-мост в исходном коде 0.6.0
+## Необязательный SSH-мост в 0.6.0
 
 Мост нужен только когда контроллер не может надёжно обратиться к REG.RU
 напрямую. Мастер принимает первый ключ моста по TOFU, открывает один SSH-сеанс
@@ -216,11 +215,11 @@ first-contact pin: мастер выполняет две независимые
 ```bash
 (
   set -Eeuo pipefail
-  HASH="$(tr -d '\r\n' < xhttp-setup-0.5.0.pyz.sha256)"
+  HASH="$(tr -d '\r\n' < xhttp-setup-0.6.0.pyz.sha256)"
   test "${#HASH}" -eq 64
-  printf '%s  xhttp-setup-0.5.0.pyz\n' "$HASH" | sha256sum -c -
-  python3 xhttp-setup-0.5.0.pyz --version
-  exec python3 xhttp-setup-0.5.0.pyz pc
+  printf '%s  xhttp-setup-0.6.0.pyz\n' "$HASH" | sha256sum -c -
+  python3 xhttp-setup-0.6.0.pyz --version
+  exec python3 xhttp-setup-0.6.0.pyz pc
 )
 ```
 
@@ -276,7 +275,7 @@ Frontend меняется через SFTP-транзакцию:
 - один стабильный frontend egress IPv4 `/32`;
 - bare Xray exit; существующие Docker/Remnawave/custom firewall не мигрируются;
 - мастер не управляет DNS, ISPmanager site creation и provider cloud firewall;
-- необязательный мост текущего исходного кода проверен локальными/mocked-
+- необязательный мост `v0.6.0` проверен локальными/mocked-
   тестами, но не отдельным live-развёртыванием;
 - публичный CA и стабильный exact-pinned leaf поддерживаются, произвольная смена
   закреплённого сертификата требует явного восстановления доверия;
@@ -302,13 +301,13 @@ python3 scripts/build_windows_bundle.py
 python3 -m unittest discover -s tests -v
 ```
 
-Опубликованный Release `v0.5.0` содержит:
+Опубликованный Release `v0.6.0` содержит:
 
 ```text
-xhttp-setup-0.5.0.pyz
-xhttp-setup-0.5.0.pyz.sha256
-xhttp-setup-0.5.0-windows-wsl.zip
-xhttp-setup-0.5.0-windows-wsl.zip.sha256
+xhttp-setup-0.6.0.pyz
+xhttp-setup-0.6.0.pyz.sha256
+xhttp-setup-0.6.0-windows-wsl.zip
+xhttp-setup-0.6.0-windows-wsl.zip.sha256
 INSTRUCTION.txt
 ```
 
