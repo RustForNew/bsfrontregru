@@ -37,6 +37,9 @@
 - Remote firewall automation is fail-closed and restricted to already-active
   UFW on clean Debian/Ubuntu. It never changes UFW state, defaults, SSH access,
   or cloud firewall.
+- The Windows bundle does not implement a second SSH stack. Its PowerShell
+  launcher verifies the bundled Linux zipapp SHA-256 and starts that same
+  controller inside WSL2. Native Windows execution without WSL is rejected.
 - UUID, VLESS Encryption material, handoff, backups and client URI are secrets.
 - Xray runs as a dedicated unprivileged user and does not replace another Xray
   service.

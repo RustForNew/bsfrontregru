@@ -22,7 +22,7 @@ HTTP, потому что обычный пользователь shared-hosting
 hostname. Для подтверждённого рабочего случая с чужим/неподходящим сертификатом
 есть отдельный явный режим закрепления SHA-256 именно текущего leaf-сертификата.
 
-## Что делает версия 0.2.0
+## Что делает версия 0.3.0
 
 - `pc`: с Linux/WSL-компьютера настраивает exit по закреплённому root SSH,
   затем применяет тот же frontend-процесс напрямую либо через доверенный
@@ -70,7 +70,7 @@ hostname. Для подтверждённого рабочего случая с
 
 Последний пункт принципиален: поля изменения ISPmanager зависят от версии, тарифа и
 плагинов провайдера. Неправильный универсальный запрос может изменить не тот
-сайт. В 0.2.0 сайт, SSL-vhost и сертификат создаются заранее через ISPmanager.
+сайт. В 0.3.0 сайт, SSL-vhost и сертификат создаются заранее через ISPmanager.
 В режиме `public` нужен сертификат публичного CA; в режиме `pinned` допускается
 проверенный self-signed leaf. Мастер получает `document root` из списка сайтов
 панели или принимает точное значение оператора.
@@ -126,15 +126,26 @@ Apache egress, UFW до запуска Xray, перенос `handoff.json`, от
 - `--front-egress-ip` — source IPv4 Apache, измеренный на exit и разрешённый в
   firewall. Его нельзя выводить из первых двух адресов.
 
-## Запуск с персонального компьютера
+## Запуск с домашнего компьютера
 
 Заранее подготовьте существующий сайт, DNS A-запись, TLS/443, SFTP и точный
-document root. Нужен Linux или WSL; native Windows для применения не
-поддерживается.
+document root. Серверы вручную открывать не нужно.
+
+Linux:
 
 ```bash
-python3 xhttp-setup-0.2.0.pyz pc
+python3 xhttp-setup-0.3.0.pyz pc
 ```
+
+Windows 10/11:
+
+1. Один раз установите WSL2: `wsl --install -d Ubuntu`, затем перезагрузитесь.
+2. Распакуйте `xhttp-setup-0.3.0-windows-wsl.zip`.
+3. Запустите `START-WINDOWS.cmd` двойным кликом.
+
+Windows-пакет сверяет SHA-256 вложенного `.pyz` и запускает тот же мастер внутри
+WSL2. Native Windows без WSL не поддерживается: отдельный SSH-транспорт для него
+не подменяет проверенный Linux-путь.
 
 Мастер запросит root SSH выхода, независимо проверенный host-key fingerprint,
 публичный/исходящий IP выхода, backend-порт и фактически измеренный egress IPv4
@@ -250,14 +261,17 @@ xhttp-setup front \
 
 ```bash
 python3 scripts/build.py
+python3 scripts/build_windows_bundle.py
 python3 -m unittest discover -s tests -v
 ```
 
 Артефакты появятся в `dist/`:
 
 ```text
-xhttp-setup-0.2.0.pyz
-xhttp-setup-0.2.0.pyz.sha256
+xhttp-setup-0.3.0.pyz
+xhttp-setup-0.3.0.pyz.sha256
+xhttp-setup-0.3.0-windows-wsl.zip
+xhttp-setup-0.3.0-windows-wsl.zip.sha256
 ```
 
 GitHub workflow публикует только tag вида `vX.Y.Z`. В репозитории включите
@@ -294,11 +308,10 @@ journalctl -u xhttp-setup-xray --since today
 
 - автоматический rollback покрывает неуспешный запуск managed systemd-сервиса и
   frontend-транзакцию вплоть до подтверждения firewall, E2E и записи профиля;
-  отдельной команды rollback после уже успешной установки в 0.2.0 ещё нет;
+  отдельной команды rollback после уже успешной установки в 0.3.0 ещё нет;
 - выдача Let's Encrypt, DNS propagation и capability-driven ISPmanager adapter
   оставлены для следующей версии;
-- Windows без WSL не поддерживается для применения, хотя pure plan/help и тесты
-  собираются;
+- Windows-пакет требует WSL2; native Windows без WSL не поддерживается;
 - `full` не может технически доказать внешний firewall с того же exit VPS,
   поэтому требует операторскую проверку из другой сети;
 - успешный HTTP-код XHTTP path не доказывает туннель; финальная проверка запускает

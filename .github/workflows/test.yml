@@ -38,15 +38,29 @@ jobs:
         env:
           XRAY_TEST_BINARY: ${{ github.workspace }}/.ci-xray/unpacked/xray
         run: python -m unittest discover -s tests -v
-      - name: Build zipapp twice
+      - name: Build Linux and Windows-WSL artifacts twice
         shell: bash
         run: |
           set -Eeuo pipefail
-          python scripts/build.py
-          first="$(sha256sum dist/xhttp-setup-*.pyz | awk '{print $1}')"
+          version="$(python -c 'from xhttp_setup import __version__; print(__version__)')"
+          linux_asset="dist/xhttp-setup-$version.pyz"
+          windows_asset="dist/xhttp-setup-$version-windows-wsl.zip"
           rm -rf dist
           python scripts/build.py
-          second="$(sha256sum dist/xhttp-setup-*.pyz | awk '{print $1}')"
-          test "$first" = "$second"
-          python dist/xhttp-setup-*.pyz --version
-          python dist/xhttp-setup-*.pyz --help >/dev/null
+          python scripts/build_windows_bundle.py
+          python "$linux_asset" --version
+          python "$linux_asset" --help >/dev/null
+          unzip -tq "$windows_asset"
+          first_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
+          first_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
+          test "$first_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
+          test "$first_windows" = "$(tr -d '\r\n' < "$windows_asset.sha256")"
+          rm -rf dist
+          python scripts/build.py
+          python scripts/build_windows_bundle.py
+          second_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
+          second_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
+          test "$first_linux" = "$second_linux"
+          test "$first_windows" = "$second_windows"
+          test "$second_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
+          test "$second_windows" = "$(tr -d '\r\n' < "$windows_asset.sha256")"
