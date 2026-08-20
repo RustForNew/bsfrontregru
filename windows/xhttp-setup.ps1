@@ -2,7 +2,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $InstallerName = "@@PYZ_NAME@@"
-$ChecksumName = "@@PYZ_SHA_NAME@@"
 $ExpectedSha256 = "@@PYZ_SHA256@@"
 $RunnerName = "run-wsl.sh"
 $ExpectedRunnerSha256 = "@@RUNNER_SHA256@@"
@@ -11,6 +10,25 @@ function Stop-XhttpSetup {
     param([string]$Message)
     [Console]::Error.WriteLine("ERROR: " + $Message)
     exit 1
+}
+
+function Get-XhttpFileSha256 {
+    param([string]$LiteralPath)
+
+    $Stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $Digest = $Sha256.ComputeHash($Stream)
+        }
+        finally {
+            $Sha256.Dispose()
+        }
+    }
+    finally {
+        $Stream.Dispose()
+    }
+    return ([System.BitConverter]::ToString($Digest)).Replace("-", "").ToLowerInvariant()
 }
 
 function Get-XhttpWsl2Distribution {
@@ -23,7 +41,7 @@ function Get-XhttpWsl2Distribution {
 
     $Candidates = [System.Collections.Generic.List[string]]::new()
     foreach ($RawLine in $ListOutput) {
-        $Line = ([string]$RawLine).Replace([char]0, "").Trim()
+        $Line = ([string]$RawLine).Replace(([char]0).ToString(), [string]::Empty).Trim()
         if ($Line.StartsWith("*")) {
             $Line = $Line.Substring(1).TrimStart()
         }
@@ -60,33 +78,21 @@ function Get-XhttpWsl2Distribution {
 
 try {
     $InstallerPath = Join-Path -Path $PSScriptRoot -ChildPath $InstallerName
-    $ChecksumPath = Join-Path -Path $PSScriptRoot -ChildPath $ChecksumName
     $RunnerPath = Join-Path -Path $PSScriptRoot -ChildPath $RunnerName
 
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
-        Stop-XhttpSetup "Release bundle is incomplete. Use File Explorer 'Extract All', then retry."
-    }
-    if (-not (Test-Path -LiteralPath $ChecksumPath -PathType Leaf)) {
         Stop-XhttpSetup "Release bundle is incomplete. Use File Explorer 'Extract All', then retry."
     }
     if (-not (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) {
         Stop-XhttpSetup "Release bundle is incomplete. Use File Explorer 'Extract All', then retry."
     }
 
-    $ManifestSha256 = (Get-Content -LiteralPath $ChecksumPath -Raw -Encoding ASCII).Trim()
-    if ($ManifestSha256 -notmatch '\A[0-9a-fA-F]{64}\z') {
-        Stop-XhttpSetup "Invalid installer checksum file. Extract the ZIP again."
-    }
-    if ($ManifestSha256.ToLowerInvariant() -cne $ExpectedSha256) {
-        Stop-XhttpSetup "Installer checksum manifest does not match this launcher."
-    }
-
-    $ActualSha256 = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ActualSha256 = Get-XhttpFileSha256 -LiteralPath $InstallerPath
     if ($ActualSha256 -cne $ExpectedSha256) {
         Stop-XhttpSetup "Installer SHA-256 mismatch. Extract a fresh release ZIP."
     }
 
-    $ActualRunnerSha256 = (Get-FileHash -LiteralPath $RunnerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ActualRunnerSha256 = Get-XhttpFileSha256 -LiteralPath $RunnerPath
     if ($ActualRunnerSha256 -cne $ExpectedRunnerSha256) {
         Stop-XhttpSetup "WSL runner SHA-256 mismatch. Extract a fresh release ZIP."
     }

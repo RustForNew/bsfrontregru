@@ -15,10 +15,6 @@ _VERSION_RE = re.compile(
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
-_GUIDES = (
-    ("home-pc-linux-windows.txt", "INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt"),
-    ("reg-ru-ispmanager-setup.txt", "INSTRUCTION-REG-RU-ISPMANAGER.txt"),
-)
 
 
 def version(root: Path = ROOT) -> str:
@@ -78,15 +74,14 @@ def build(*, root: Path = ROOT, output_dir: Path | None = None) -> Path:
     release = version(root)
     pyz, pyz_payload, pyz_sha256 = _read_verified_pyz(root, release)
     pyz_name = pyz.name
-    pyz_sha_name = f"{pyz_name}.sha256"
     replacements = {
         "@@VERSION@@": release,
         "@@PYZ_NAME@@": pyz_name,
-        "@@PYZ_SHA_NAME@@": pyz_sha_name,
         "@@PYZ_SHA256@@": pyz_sha256,
     }
 
     source_dir = root / "windows"
+    instruction_payload = _render_template(source_dir / "INSTRUCTION.txt", replacements)
     runner_payload = _render_template(source_dir / "run-wsl.sh", replacements)
     runner_sha256 = hashlib.sha256(runner_payload).hexdigest()
     launcher_replacements = {
@@ -94,27 +89,21 @@ def build(*, root: Path = ROOT, output_dir: Path | None = None) -> Path:
         "@@RUNNER_SHA256@@": runner_sha256,
     }
     entries: dict[str, tuple[bytes, int]] = {
-        "README-WINDOWS.txt": (
-            _render_template(source_dir / "README-WINDOWS.txt", replacements),
+        "INSTRUCTION.txt": (
+            instruction_payload,
             0o644,
         ),
         "START-WINDOWS.cmd": (
             _render_template(source_dir / "START-WINDOWS.cmd", replacements),
             0o644,
         ),
-        "run-wsl.sh": (runner_payload, 0o755),
-        pyz_name: (pyz_payload, 0o755),
-        pyz_sha_name: ((pyz_sha256 + "\n").encode("ascii"), 0o644),
-        "xhttp-setup.ps1": (
+        "_internal/run-wsl.sh": (runner_payload, 0o755),
+        f"_internal/{pyz_name}": (pyz_payload, 0o755),
+        "_internal/xhttp-setup.ps1": (
             _render_template(source_dir / "xhttp-setup.ps1", launcher_replacements),
             0o644,
         ),
     }
-    for source_name, archive_name in _GUIDES:
-        entries[archive_name] = (
-            _render_template(root / "docs" / source_name, replacements),
-            0o644,
-        )
 
     destination = output_dir if output_dir is not None else root / "dist"
     destination.mkdir(parents=True, exist_ok=True)
@@ -135,6 +124,7 @@ def build(*, root: Path = ROOT, output_dir: Path | None = None) -> Path:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
 
+    (destination / "INSTRUCTION.txt").write_bytes(instruction_payload)
     bundle_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     (destination / f"{output.name}.sha256").write_text(
         bundle_sha256 + "\n", encoding="ascii", newline="\n"

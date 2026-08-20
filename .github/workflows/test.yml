@@ -57,20 +57,13 @@ jobs:
           import zipfile
 
           archive_path = pathlib.Path(sys.argv[1])
-          expected = {
-              "INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt": pathlib.Path(
-                  "docs/home-pc-linux-windows.txt"
-              ),
-              "INSTRUCTION-REG-RU-ISPMANAGER.txt": pathlib.Path(
-                  "docs/reg-ru-ispmanager-setup.txt"
-              ),
-          }
+          standalone = pathlib.Path("dist/INSTRUCTION.txt").read_bytes()
           with zipfile.ZipFile(archive_path) as archive:
-              for name, source in expected.items():
-                  bundled = archive.read(name).replace(b"\r\n", b"\n")
-                  original = source.read_bytes().replace(b"\r\n", b"\n")
-                  if bundled != original:
-                      raise SystemExit(f"Bundled guide differs from {source}")
+              bundled = archive.read("INSTRUCTION.txt")
+          if bundled != standalone:
+              raise SystemExit("Bundled and standalone instructions differ")
+          if b"@@" in standalone:
+              raise SystemExit("Standalone instruction contains template tokens")
           PY
           first_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
           first_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
@@ -85,3 +78,20 @@ jobs:
           test "$first_windows" = "$second_windows"
           test "$second_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"
           test "$second_windows" = "$(tr -d '\r\n' < "$windows_asset.sha256")"
+
+  windows-launcher:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Execute launcher tests in Windows PowerShell 5.1
+        run: >-
+          python -m unittest
+          tests.test_windows_launcher_runtime
+          tests.test_windows_bundle -v
