@@ -33,6 +33,9 @@ class WindowsBundleTests(unittest.TestCase):
             '__version__ = "9.8.7"\n', encoding="utf-8"
         )
         shutil.copytree(ROOT / "windows", fake_root / "windows")
+        (fake_root / "docs").mkdir()
+        for source_name, _archive_name in self.builder._GUIDES:
+            shutil.copy2(ROOT / "docs" / source_name, fake_root / "docs" / source_name)
         (fake_root / "dist").mkdir()
         payload = b"deterministic fake pyz\n"
         (fake_root / "dist/xhttp-setup-9.8.7.pyz").write_bytes(payload)
@@ -42,10 +45,12 @@ class WindowsBundleTests(unittest.TestCase):
         )
         return fake_root
 
-    def test_bundle_is_deterministic_and_contains_only_runtime_files(self) -> None:
+    def test_bundle_is_deterministic_and_contains_only_expected_files(self) -> None:
         release = "9.8.7"
         pyz_name = f"xhttp-setup-{release}.pyz"
         expected_names = [
+            "INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt",
+            "INSTRUCTION-REG-RU-ISPMANAGER.txt",
             "README-WINDOWS.txt",
             "START-WINDOWS.cmd",
             "run-wsl.sh",
@@ -82,6 +87,8 @@ class WindowsBundleTests(unittest.TestCase):
                     (pyz_sha256 + "\n").encode("ascii"),
                 )
                 command_file = archive.read("START-WINDOWS.cmd")
+                home_guide = archive.read("INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt")
+                regru_guide = archive.read("INSTRUCTION-REG-RU-ISPMANAGER.txt")
                 powershell_payload = archive.read("xhttp-setup.ps1")
                 runner_payload = archive.read("run-wsl.sh")
                 powershell = powershell_payload.decode("utf-8")
@@ -89,6 +96,8 @@ class WindowsBundleTests(unittest.TestCase):
                 command_text = command_file.decode("utf-8")
                 runner_sha256 = hashlib.sha256(runner_payload).hexdigest()
                 self.assertNotIn(b"\n", command_file.replace(b"\r\n", b""))
+                self.assertNotIn(b"\n", home_guide.replace(b"\r\n", b""))
+                self.assertNotIn(b"\n", regru_guide.replace(b"\r\n", b""))
                 self.assertNotIn(b"\n", powershell_payload.replace(b"\r\n", b""))
                 self.assertNotIn(b"\r", runner_payload)
                 self.assertIn(pyz_name, powershell)
@@ -117,6 +126,18 @@ class WindowsBundleTests(unittest.TestCase):
                 )
                 self.assertNotIn("%*", command_text)
                 self.assertNotIn("@@", powershell + runner)
+                self.assertEqual(
+                    home_guide.replace(b"\r\n", b"\n"),
+                    (ROOT / "docs/home-pc-linux-windows.txt")
+                    .read_bytes()
+                    .replace(b"\r\n", b"\n"),
+                )
+                self.assertEqual(
+                    regru_guide.replace(b"\r\n", b"\n"),
+                    (ROOT / "docs/reg-ru-ispmanager-setup.txt")
+                    .read_bytes()
+                    .replace(b"\r\n", b"\n"),
+                )
 
     def test_builder_rejects_mismatched_pyz_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

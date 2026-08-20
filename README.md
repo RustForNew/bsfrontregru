@@ -22,11 +22,14 @@ HTTP, потому что обычный пользователь shared-hosting
 hostname. Для подтверждённого рабочего случая с чужим/неподходящим сертификатом
 есть отдельный явный режим закрепления SHA-256 именно текущего leaf-сертификата.
 
-## Что делает версия 0.3.0
+## Что делает версия 0.4.0
 
 - `pc`: с Linux/WSL-компьютера настраивает exit по закреплённому root SSH,
   затем применяет тот же frontend-процесс напрямую либо через доверенный
   российский root SSH bridge;
+- в `pc` принимает скрытый блок выхода `IPv4 / root / password` и исходный блок
+  REG.RU «Логины и пароли»; FTP/MySQL-пароли не используются, а произвольный
+  адрес панели отклоняется;
 - `full`: настраивает изолированный Xray на текущем Linux VPS, затем существующий
   сайт frontend по SFTP и выполняет E2E-тест;
 - `exit`: настраивает только выход и создаёт защищённый `handoff.json`;
@@ -70,7 +73,7 @@ hostname. Для подтверждённого рабочего случая с
 
 Последний пункт принципиален: поля изменения ISPmanager зависят от версии, тарифа и
 плагинов провайдера. Неправильный универсальный запрос может изменить не тот
-сайт. В 0.3.0 сайт, SSL-vhost и сертификат создаются заранее через ISPmanager.
+сайт. В 0.4.0 сайт, SSL-vhost и сертификат создаются заранее через ISPmanager.
 В режиме `public` нужен сертификат публичного CA; в режиме `pinned` допускается
 проверенный self-signed leaf. Мастер получает `document root` из списка сайтов
 панели или принимает точное значение оператора.
@@ -112,12 +115,15 @@ hostname. Для подтверждённого рабочего случая с
 
 ## Пошаговая установка
 
-Полный порядок для проверенной split-схемы `exit напрямую → front с российского
-bridge` находится в
-[`docs/reg-ru-pinned-tls.txt`](docs/reg-ru-pinned-tls.txt). Там зафиксированы
-публикация release, поля ISPmanager, получение SNI leaf pin, измерение реального
-Apache egress, UFW до запуска Xray, перенос `handoff.json`, ответы мастеру и
-финальная E2E-проверка.
+Инструкции для пользователя:
+
+- [`docs/home-pc-linux-windows.txt`](docs/home-pc-linux-windows.txt) — скачать,
+  проверить, запустить и что вводить в Linux/Windows;
+- [`docs/reg-ru-ispmanager-setup.txt`](docs/reg-ru-ispmanager-setup.txt) — создать
+  сайт, настроить DNS/TLS, получить DOCROOT и измерить `FRONT_EGRESS_IP`.
+
+Технический проверенный runbook сохранён отдельно:
+[`docs/reg-ru-pinned-tls.txt`](docs/reg-ru-pinned-tls.txt).
 
 Три IPv4 вводятся раздельно:
 
@@ -128,31 +134,32 @@ Apache egress, UFW до запуска Xray, перенос `handoff.json`, от
 
 ## Запуск с домашнего компьютера
 
-Заранее подготовьте существующий сайт, DNS A-запись, TLS/443, SFTP и точный
-document root. Серверы вручную открывать не нужно.
+Заранее подготовьте существующий сайт, DNS A-запись, TLS/443, SFTP, точный
+document root и измеренный `FRONT_EGRESS_IP`. После этой подготовки сам
+установщик запускается только с домашнего компьютера.
 
 Linux:
 
 ```bash
-python3 xhttp-setup-0.3.0.pyz pc
+python3 xhttp-setup-0.4.0.pyz pc
 ```
 
 Windows 10/11:
 
 1. Один раз установите WSL2: `wsl --install -d Ubuntu`, затем перезагрузитесь.
-2. Распакуйте `xhttp-setup-0.3.0-windows-wsl.zip`.
+2. Распакуйте `xhttp-setup-0.4.0-windows-wsl.zip`.
 3. Запустите `START-WINDOWS.cmd` двойным кликом.
 
 Windows-пакет сверяет SHA-256 вложенного `.pyz` и запускает тот же мастер внутри
 WSL2. Native Windows без WSL не поддерживается: отдельный SSH-транспорт для него
 не подменяет проверенный Linux-путь.
 
-Мастер запросит root SSH выхода, независимо проверенный host-key fingerprint,
-публичный/исходящий IP выхода, backend-порт и фактически измеренный egress IPv4
-Apache frontend. Затем вводятся домен, IP сайта, TLS и SFTP. Frontend запускается
-прямо с этого компьютера или, если хостинг принимает подключения только из РФ,
-через доверенный российский root SSH bridge. Bridge участвует только в настройке,
-не в рабочем трафике.
+Мастер скрыто принимает готовые блоки выхода и REG.RU. После вставки блока нужно
+отдельной строкой ввести `ГОТОВО`. IP сервера из блока REG.RU предлагается как
+входной адрес, но проверяется по DNS/TLS; он не подменяет измеренный
+`FRONT_EGRESS_IP`. Frontend запускается прямо с этого компьютера или через
+доверенный российский root SSH bridge. Bridge участвует только в настройке, не
+в рабочем трафике.
 
 Порядок применения: remote UFW → неизменённый серверный `exit` → неизменённый
 серверный `front` → обязательный E2E. `FRONT_EGRESS_IP` нельзя угадывать по DNS
@@ -268,10 +275,12 @@ python3 -m unittest discover -s tests -v
 Артефакты появятся в `dist/`:
 
 ```text
-xhttp-setup-0.3.0.pyz
-xhttp-setup-0.3.0.pyz.sha256
-xhttp-setup-0.3.0-windows-wsl.zip
-xhttp-setup-0.3.0-windows-wsl.zip.sha256
+xhttp-setup-0.4.0.pyz
+xhttp-setup-0.4.0.pyz.sha256
+xhttp-setup-0.4.0-windows-wsl.zip
+xhttp-setup-0.4.0-windows-wsl.zip.sha256
+home-pc-linux-windows.txt
+reg-ru-ispmanager-setup.txt
 ```
 
 GitHub workflow публикует только tag вида `vX.Y.Z`. В репозитории включите
@@ -279,9 +288,9 @@ GitHub workflow публикует только tag вида `vX.Y.Z`. В реп
 изменение/удаление release tags.
 
 Безопасный download-блок для своего README приведён в
-[`docs-release-install.txt`](docs-release-install.txt). Перед публикацией
-замените `OWNER/REPOSITORY` на имя своего репозитория. Код из `main` через
-`curl | bash` проект не использует.
+[`docs-release-install.txt`](docs-release-install.txt). Он закреплён на публичном
+репозитории и версии release. Код из `main` через `curl | bash` проект не
+использует.
 
 ## Файлы на exit
 
@@ -308,7 +317,7 @@ journalctl -u xhttp-setup-xray --since today
 
 - автоматический rollback покрывает неуспешный запуск managed systemd-сервиса и
   frontend-транзакцию вплоть до подтверждения firewall, E2E и записи профиля;
-  отдельной команды rollback после уже успешной установки в 0.3.0 ещё нет;
+  отдельной команды rollback после уже успешной установки в 0.4.0 ещё нет;
 - выдача Let's Encrypt, DNS propagation и capability-driven ISPmanager adapter
   оставлены для следующей версии;
 - Windows-пакет требует WSL2; native Windows без WSL не поддерживается;

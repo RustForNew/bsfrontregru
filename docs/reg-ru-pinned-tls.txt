@@ -22,7 +22,7 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
   - чистый Ubuntu/Debian exit с systemd, root и UFW;
   - Linux/WSL с обычным IP для управления exit;
   - Linux-сервер с российским IP для обращения к REG.RU;
-  - опубликованный GitHub Release xhttp-setup v0.3.0.
+  - опубликованный GitHub Release xhttp-setup v0.4.0.
 
 Не используйте раздел UFW на сервере с Docker, собственными nftables/iptables
 или другими сервисами. Для такого сервера правила нужно объединять вручную.
@@ -33,7 +33,7 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
 
 Создать пустой репозиторий GitHub. Открыть Settings -> General -> Releases и
 включить immutable releases. Далее на компьютере владельца открыть корень
-проекта xhttp-setup, заменить OWNER/REPOSITORY и выполнить из Git Bash или WSL:
+проекта xhttp-setup и выполнить из Git Bash или WSL:
 
   test -z "$(git status --porcelain)" || {
     echo 'Есть незакоммиченные файлы'; exit 1;
@@ -42,7 +42,7 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
     echo 'Текущая ветка не main'; exit 1;
   }
 
-  XH_PUBLISH_URL='https://github.com/OWNER/REPOSITORY.git'
+  XH_PUBLISH_URL='https://github.com/RustForNew/bsfrontregru.git'
   if git remote get-url publish >/dev/null 2>&1; then
     test "$(git remote get-url publish)" = "$XH_PUBLISH_URL" || {
       echo 'Remote publish указывает на другой репозиторий'; exit 1;
@@ -52,16 +52,18 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
   fi
 
   git push -u publish main
-  git tag -a v0.3.0 -m 'xhttp-setup v0.3.0'
-  git push publish v0.3.0
+  git tag -a v0.4.0 -m 'xhttp-setup v0.4.0'
+  git push publish v0.4.0
 
 Открыть GitHub -> Actions -> Release. Дождаться зелёного результата. В Releases
-должны появиться четыре файла:
+должны появиться шесть файлов:
 
-  xhttp-setup-0.3.0.pyz
-  xhttp-setup-0.3.0.pyz.sha256
-  xhttp-setup-0.3.0-windows-wsl.zip
-  xhttp-setup-0.3.0-windows-wsl.zip.sha256
+  xhttp-setup-0.4.0.pyz
+  xhttp-setup-0.4.0.pyz.sha256
+  xhttp-setup-0.4.0-windows-wsl.zip
+  xhttp-setup-0.4.0-windows-wsl.zip.sha256
+  home-pc-linux-windows.txt
+  reg-ru-ispmanager-setup.txt
 
 На странице release должна быть отметка Immutable. Если её нет, не
 устанавливать этот release: включить immutable releases и выпустить новый
@@ -69,14 +71,14 @@ Docker или Remnawave. Домен exit в клиентской ссылке н
 
 После публикации подключиться по SSH к exit и один раз выполнить там следующий
 блок. Затем один раз выполнить его на российском bridge. Заменить
-OWNER/REPOSITORY:
+RustForNew/bsfrontregru:
 
   (
     set -Eeuo pipefail
 
-    XH_REPO='OWNER/REPOSITORY'
-    XH_TAG='v0.3.0'
-    XH_ASSET='xhttp-setup-0.3.0.pyz'
+    XH_REPO='RustForNew/bsfrontregru'
+    XH_TAG='v0.4.0'
+    XH_ASSET='xhttp-setup-0.4.0.pyz'
     XH_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$XH_TMP"' EXIT
     XH_BASE="https://github.com/$XH_REPO/releases/download/$XH_TAG"
@@ -114,7 +116,7 @@ OWNER/REPOSITORY:
 
 Ожидаемый вывод версии:
 
-  xhttp-setup 0.3.0
+  xhttp-setup 0.4.0
 
 
 1. Записать исходные данные

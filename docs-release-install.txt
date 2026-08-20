@@ -1,11 +1,11 @@
-Replace OWNER/REPOSITORY once before publishing. Keep the release tag pinned.
+Pinned public release download. Keep the release tag pinned.
 
 (
   set -Eeuo pipefail
 
-  repo="OWNER/REPOSITORY"
-  tag="v0.3.0"
-  asset="xhttp-setup-0.3.0.pyz"
+  repo="RustForNew/bsfrontregru"
+  tag="v0.4.0"
+  asset="xhttp-setup-0.4.0.pyz"
 
   command -v curl >/dev/null
   command -v python3 >/dev/null
@@ -43,6 +43,5 @@ Replace OWNER/REPOSITORY once before publishing. Keep the release tag pinned.
     echo "GitHub CLI unavailable: SHA-256 checked; attestation not checked." >&2
   fi
 
-  sudo install -m 0755 "$temp_dir/$asset" /usr/local/bin/xhttp-setup
-  sudo /usr/local/bin/xhttp-setup
+  python3 "$temp_dir/$asset" pc
 )

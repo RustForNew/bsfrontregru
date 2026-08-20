@@ -1,0 +1,269 @@
+XHTTP-SETUP: ПОДГОТОВКА САЙТА REG.RU В ISPMANAGER
+==================================================
+
+Эта инструкция описывает схему нового сайта на виртуальном хостинге REG.RU:
+TLS на 443 -> Apache/.htaccess -> Xray на отдельном exit VPS.
+
+ВАЖНО: справка REG.RU относит прокси к запрещённым вариантам использования
+виртуального хостинга. До установки получите письменное разрешение REG.RU или
+используйте хостинг, где такая схема явно разрешена.
+
+Никому не отправляйте пароли и не публикуйте блок «Логины и пароли». Если пароль
+уже попал в общий чат, issue, лог или скриншот, смените его в личном кабинете.
+После скрытой вставки и сообщения «Блок принят» сразу очистите текущий буфер
+обмена, его историю и облачную синхронизацию; команды приведены в
+docs/home-pc-linux-windows.txt.
+
+
+1. Что понадобится
+===================
+
+  FRONT_DOMAIN       полный домен нового сайта, например front.example.org
+  SITE_IP            IPv4 сайта из ISPmanager
+  CLIENT_CONNECT_IP  IPv4 подключения клиента; обычно равен SITE_IP
+  DNS_IPV4           единственная A-запись домена; обычно равна SITE_IP
+  TLS_PIN             SHA-256 точного leaf-сертификата сайта
+  FRONT_EGRESS_IP    IPv4, с которого Apache REG.RU выходит к exit
+  SFTP_HOST           узел хостинга вида vipNNN.hosting.reg.ru
+  SFTP_USER           основной пользователь хостинга
+  DOCROOT             точный корень сайта
+  SFTP_HOSTKEY_SHA256 fingerprint SFTP-узла, независимо полученный у REG.RU
+
+Для импорта нужен полный блок REG.RU с разделами панели и FTP. Поле FTP
+«IP-адрес сервера» в проверенном аккаунте совпало с IP сайта: мастер предложит
+его как CLIENT_CONNECT_IP, затем как DNS_IPV4, но обязательно проверит DNS/TLS.
+Оно никогда не используется как FRONT_EGRESS_IP или SFTP_HOST.
+
+FTP-пароль читается только для проверки структуры блока, после разбора не
+сохраняется и не используется. Данные MySQL также не сохраняются. Пароль панели
+можно применить для SFTP только после отдельного ответа «да» на вопрос [y/N]; по
+умолчанию ответ «нет», автоматического перехода к FTP-паролю нет.
+
+
+2. Создать новый сайт
+=====================
+
+1) На странице услуги REG.RU в строке «Панель управления — ispmanager» нажмите
+   «Войти в панель». Либо откройте HTTPS-адрес вида
+   vip<цифры>.hosting.reg.ru:1500 из письма и войдите под основным логином.
+   Импорт рассчитан только на ISPmanager.
+2) Уже внутри ISPmanager откройте «Сайты» -> «Создать сайт» или «Добавить сайт».
+3) Заполните:
+
+  Имя:                         FRONT_DOMAIN
+  Псевдонимы:                  пусто
+  Корневая директория:         предложенная для FRONT_DOMAIN
+  Источник IP-адреса:          получить автоматически
+  E-mail администратора:       адрес владельца
+  Кодировка:                   не указывать
+  Индексная страница:          index.php index.html
+  Редирект домена:             выключен
+  Автоподдомены:               выключены
+
+4) В разделе SSL задайте:
+
+  Защищённое соединение SSL:   включено
+  SSL-порт:                    443
+  SSL-сертификат:              новый самоподписанный
+  HSTS:                        выключено
+  HTTP -> HTTPS:               выключено
+
+5) Оставьте включёнными PHP и режим «FastCGI (Apache)». Журнал ошибок можно
+   оставить включённым. Выключите SSI, CGI, Python, журнал запросов, сжатие,
+   кеширование и генератор отчётов.
+6) Нажмите «Создать»/«OK».
+
+По проектному runbook FastCGI (Apache) нужен, чтобы неизвестный XHTTP path
+должен дойти через nginx до Apache, где работает .htaccess. PHP-код схема не
+запускает.
+
+Названия и расположение переключателей зависят от версии ISPmanager, темы,
+тарифа и подключённых модулей. Если какого-либо поля нет, не угадывайте его
+аналог: уточните настройку у поддержки REG.RU.
+
+
+3. Записать IP и корневую директорию
+====================================
+
+После создания откройте карточку сайта и запишите назначенный IPv4 как SITE_IP.
+Запишите также точную корневую директорию.
+
+Не составляйте DOCROOT по шаблону. При прямом запуске мастер может получить его
+read-only запросом к ISPmanager. При запуске через российский bridge введите
+точный абсолютный путь из панели/SFTP или запросите его у поддержки.
+
+
+4. Настроить DNS
+================
+
+У DNS-провайдера создайте одну запись:
+
+  Type:       A
+  Name:       поддомен из FRONT_DOMAIN
+  Content:    SITE_IP
+  CDN/proxy:  выключен; только DNS
+
+Удалите для FRONT_DOMAIN записи AAAA и CNAME. После обновления DNS обычно должны
+быть:
+
+  DNS_IPV4 = SITE_IP
+  CLIENT_CONNECT_IP = SITE_IP
+
+При импорте мастер предложит «IP-адрес сервера» из блока REG.RU как
+CLIENT_CONNECT_IP и затем предложит его как DNS_IPV4. Нажимайте Enter только если
+адрес совпадает с SITE_IP и реальной A-записью. Мастер требует ровно одну
+совпадающую A-запись, отсутствие AAAA и проверяет TLS/SNI на CLIENT_CONNECT_IP.
+
+
+5. Проверить vhost и получить TLS_PIN
+=====================================
+
+В Linux или WSL2 выполните, подставив свой домен и SITE_IP:
+
+  set -Eeuo pipefail
+  FRONT_DOMAIN='front.example.org'
+  CLIENT_CONNECT_IP='192.0.2.30'
+  HTTP_BODY="$(mktemp)"
+  HTTPS_BODY="$(mktemp)"
+  CERT_DER="$(mktemp)"
+  trap 'rm -f -- "$HTTP_BODY" "$HTTPS_BODY" "$CERT_DER"' EXIT
+
+  curl --fail --silent --show-error --noproxy '*' \
+    --connect-timeout 5 --max-time 20 \
+    --resolve "$FRONT_DOMAIN:80:$CLIENT_CONNECT_IP" \
+    "http://$FRONT_DOMAIN/" --output "$HTTP_BODY"
+
+  curl --insecure --fail --silent --show-error --noproxy '*' \
+    --connect-timeout 5 --max-time 20 \
+    --resolve "$FRONT_DOMAIN:443:$CLIENT_CONNECT_IP" \
+    "https://$FRONT_DOMAIN/" --output "$HTTPS_BODY"
+
+  test -s "$HTTP_BODY"
+  test -s "$HTTPS_BODY"
+  cmp -s "$HTTP_BODY" "$HTTPS_BODY"
+
+  timeout 20 openssl s_client \
+    -connect "$CLIENT_CONNECT_IP:443" \
+    -servername "$FRONT_DOMAIN" </dev/null 2>/dev/null \
+    | openssl x509 -outform DER > "$CERT_DER"
+
+  test -s "$CERT_DER"
+  sha256sum "$CERT_DER"
+
+Скопируйте 64 шестнадцатеричных символа из последней строки как TLS_PIN. Если
+любая команда завершилась ошибкой, исправьте DNS/SSL-vhost; pin не используйте.
+После замены сертификата получите новый TLS_PIN и выпустите новую ссылку.
+
+
+6. Измерить FRONT_EGRESS_IP
+===========================
+
+Этот адрес нельзя брать из DNS, SITE_IP или раздела FTP. Он измеряется один раз
+до установки. Шаг требует временного .htaccess в панели и SSH-доступа к exit.
+
+На Linux/WSL2 задайте значения и получите две строки для временного .htaccess:
+
+  FRONT_DOMAIN='front.example.org'
+  CLIENT_CONNECT_IP='192.0.2.30'
+  EXIT_IP='203.0.113.10'
+  PROBE_PORT='18083'
+  PROBE_TOKEN="xhttp-egress-$(openssl rand -hex 8)"
+  printf 'RewriteEngine On\nRewriteRule ^%s$ http://%s:%s/ [P,L]\n' \
+    "$PROBE_TOKEN" "$EXIT_IP" "$PROBE_PORT"
+
+В ISPmanager откройте «Файлы сайта»/«Менеджер файлов» и точный DOCROOT. На новом
+сайте .htaccess должен отсутствовать. Если он уже есть, остановитесь и не
+перезаписывайте его. Создайте временный .htaccess только с двумя напечатанными
+строками.
+
+На exit установите tcpdump, убедитесь, что TCP/18083 свободен, затем запустите
+захват. Если первая команда покажет слушающий процесс, остановитесь и выберите
+другой свободный пробный порт во всех командах:
+
+  sudo apt-get update
+  sudo apt-get install -y tcpdump
+  sudo ss -H -lnt 'sport = :18083'
+  sudo timeout 240 tcpdump -nn -l -i any -c 12 \
+    'tcp dst port 18083 and (tcp[tcpflags] & tcp-syn != 0)'
+
+Пока tcpdump ждёт, на Linux/WSL2 выполните:
+
+  for N in $(seq 1 12); do
+    curl --insecure --silent --show-error --noproxy '*' \
+      --connect-timeout 5 --max-time 10 \
+      --resolve "$FRONT_DOMAIN:443:$CLIENT_CONNECT_IP" \
+      "https://$FRONT_DOMAIN/$PROBE_TOKEN" --output /dev/null || true
+    sleep 5
+  done
+
+В 12 строках tcpdump должен быть один и тот же исходный публичный IPv4. Запишите
+его как FRONT_EGRESS_IP. Несколько исходных IPv4 не поддерживаются текущей
+схемой с одним правилом /32.
+
+Если пакетов нет, не угадывайте адрес: проверьте, что запрос дошёл до Apache, что
+включён FastCGI (Apache), и что внешний firewall VPS пропускает пробу. Если для
+проверки пришлось временно разрешить TCP/18083 во внешнем firewall, сразу после
+измерения удалите это правило. Подробная диагностика находится в разделе 5 файла
+docs/reg-ru-pinned-tls.txt.
+
+Сразу удалите временный .htaccess через ISPmanager и убедитесь, что его больше
+нет. Не запускайте установку, пока пробное правило остаётся на сайте.
+
+
+7. Подготовить SFTP
+===================
+
+Для поддерживаемого формата виртуального хостинга:
+
+  SFTP_HOST = имя узла из URL панели без https:// и :1500
+  SFTP_PORT = 22
+  SFTP_USER = основной логин хостинга
+
+Пример преобразования:
+
+  https://vipNNN.hosting.reg.ru:1500/ -> vipNNN.hosting.reg.ru
+
+Поле «IP-адрес сервера» из раздела FTP не является SFTP_HOST: мастер берёт
+SFTP_HOST только из URL панели. FTP-пароль после проверки формата блока не
+сохраняется и никогда не пробуется для SFTP.
+
+Официальная справка REG.RU указывает для SFTP виртуального хостинга основной
+аккаунт и порт 22. Мастер отдельно спросит, использовать ли импортированный
+пароль панели для SFTP; ответ по умолчанию «нет». Ответьте «да» только после
+проверки для своего аккаунта. Если выдан отдельный SSH/SFTP-пароль, введите его.
+После одной ошибки не перебирайте варианты, а уточните данные у поддержки.
+
+Получите SFTP_HOSTKEY_SHA256 независимо через панель или поддержку REG.RU. Нужен
+формат SHA256:<43 символа base64>. Вывод ssh-keyscan сам по себе не подтверждает
+подлинность ключа.
+
+
+8. Что должно быть готово перед запуском
+========================================
+
+  [ ] Новый сайт создан, PHP -> FastCGI (Apache) включён.
+  [ ] TLS работает на 443; HSTS и HTTP -> HTTPS выключены.
+  [ ] Есть ровно одна A-запись, CDN/proxy выключен, AAAA отсутствует.
+  [ ] Записаны SITE_IP, CLIENT_CONNECT_IP, DNS_IPV4 и точный DOCROOT.
+  [ ] Получены TLS_PIN, FRONT_EGRESS_IP и SFTP_HOSTKEY_SHA256.
+  [ ] Временный пробный .htaccess удалён.
+  [ ] Уточнены SFTP_HOST, SFTP_USER и правильный SFTP-пароль.
+
+Далее следуйте файлу docs/home-pc-linux-windows.txt.
+
+
+Источники и границы проверки
+============================
+
+Исходный подробный runbook проекта; он не подтверждает live E2E версии 0.4.0:
+  docs/reg-ru-pinned-tls.txt
+
+Официальная справка REG.RU:
+  https://help.reg.ru/support/hosting/privyazka-domena-k-hostingu/kak-privyazat-domen-k-hostingu
+  https://help.reg.ru/support/hosting/razmeshcheniye-sayta-otobrazheniye-v-brauzere/kornevaya-papka-sayta
+  https://help.reg.ru/support/hosting/dostupy-i-podklyucheniye-panel-upravleniya-ftp-ssh/protokol-peredachi-dannykh-sftp
+  https://help.reg.ru/support/hosting/zakaz-hostinga-rabota-s-uslugoy/sovety-po-vyboru-tarifa-hostinga
+
+Для парсера импорта, PC-компонентов и Windows-обёртки предусмотрены
+автоматические тесты. Полный путь v0.4.0 не подтверждён live E2E на реальных
+exit, REG.RU и Windows/WSL2. Интерфейс ISPmanager может отличаться от описанного.

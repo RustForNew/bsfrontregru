@@ -51,6 +51,27 @@ jobs:
           python "$linux_asset" --version
           python "$linux_asset" --help >/dev/null
           unzip -tq "$windows_asset"
+          python - "$windows_asset" <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          archive_path = pathlib.Path(sys.argv[1])
+          expected = {
+              "INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt": pathlib.Path(
+                  "docs/home-pc-linux-windows.txt"
+              ),
+              "INSTRUCTION-REG-RU-ISPMANAGER.txt": pathlib.Path(
+                  "docs/reg-ru-ispmanager-setup.txt"
+              ),
+          }
+          with zipfile.ZipFile(archive_path) as archive:
+              for name, source in expected.items():
+                  bundled = archive.read(name).replace(b"\r\n", b"\n")
+                  original = source.read_bytes().replace(b"\r\n", b"\n")
+                  if bundled != original:
+                      raise SystemExit(f"Bundled guide differs from {source}")
+          PY
           first_linux="$(sha256sum "$linux_asset" | awk '{print $1}')"
           first_windows="$(sha256sum "$windows_asset" | awk '{print $1}')"
           test "$first_linux" = "$(tr -d '\r\n' < "$linux_asset.sha256")"

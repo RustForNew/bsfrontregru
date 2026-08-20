@@ -15,6 +15,10 @@ _VERSION_RE = re.compile(
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_GUIDES = (
+    ("home-pc-linux-windows.txt", "INSTRUCTION-HOME-PC-LINUX-WINDOWS.txt"),
+    ("reg-ru-ispmanager-setup.txt", "INSTRUCTION-REG-RU-ISPMANAGER.txt"),
+)
 
 
 def version(root: Path = ROOT) -> str:
@@ -106,6 +110,11 @@ def build(*, root: Path = ROOT, output_dir: Path | None = None) -> Path:
             0o644,
         ),
     }
+    for source_name, archive_name in _GUIDES:
+        entries[archive_name] = (
+            _render_template(root / "docs" / source_name, replacements),
+            0o644,
+        )
 
     destination = output_dir if output_dir is not None else root / "dist"
     destination.mkdir(parents=True, exist_ok=True)
