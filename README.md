@@ -25,8 +25,10 @@ Apache frontend -- HTTP/XHTTP --> зарубежный bare Xray exit :8083 --> 
 
 2. В ISPmanager заранее вручную создайте сайт и настройте DNS/TLS по
    [короткому списку](docs/reg-ru-ispmanager-setup.txt). Мастер сайт не создаёт.
-3. Скачайте `xhttp-setup-0.5.0-windows-wsl.zip`, выберите в Проводнике
-   «Извлечь все» и дважды нажмите `START-WINDOWS.cmd`.
+3. Скачайте
+   [`xhttp-setup-0.5.0-windows-wsl.zip`](https://github.com/RustForNew/bsfrontregru/releases/download/v0.5.0/xhttp-setup-0.5.0-windows-wsl.zip),
+   выберите в Проводнике «Извлечь все» и дважды нажмите
+   `START-WINDOWS.cmd`.
 4. Отвечайте на вопросы по одному. Никакие SHA-256, host-key fingerprint,
    UUID, XHTTP path, egress-IP, UFW-команды или `APPLY PC` вводить не нужно.
 5. Не закрывайте окно до сообщения об успешной сквозной проверке. Только после
@@ -267,5 +269,5 @@ INSTRUCTION.txt
 ```
 
 GitHub workflow публикует только tag вида `vX.Y.Z`. Release tags и опубликованные
-артефакты должны быть immutable. Публикация и deployment автоматически не
-выполняются.
+артефакты должны быть immutable. Публикация выполняется только после явной
+отправки тега; deployment серверов workflow не выполняет.
