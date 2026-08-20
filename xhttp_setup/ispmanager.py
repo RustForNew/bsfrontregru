@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import http.client
+import socket
 import ssl
 import urllib.error
 import urllib.parse
@@ -9,6 +11,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from .errors import InstallerError, VerificationError
+from .ssh_transport import TCPRoute
 from .validate import normalize_domain, validate_remote_dir
 
 
@@ -26,6 +29,71 @@ class ISPmanagerAuthenticationError(VerificationError):
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _RoutedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        route: TCPRoute,
+        timeout: int,
+        context: ssl.SSLContext,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._xhttp_route = route.validate()
+
+    def connect(self) -> None:
+        endpoint = (
+            self._xhttp_route.connect_host,
+            self._xhttp_route.connect_port,
+        )
+        self.sock = socket.create_connection(
+            endpoint,
+            self.timeout,
+            source_address=self.source_address,
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+def _routed_post(
+    endpoint: str, data: bytes, *, timeout: int, route: TCPRoute
+) -> bytes:
+    parsed = urlsplit(endpoint)
+    if not parsed.hostname:
+        raise VerificationError("ISPmanager endpoint не содержит hostname")
+    connection = _RoutedHTTPSConnection(
+        parsed.hostname,
+        parsed.port or 443,
+        route=route,
+        timeout=timeout,
+        context=ssl.create_default_context(),
+    )
+    path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    try:
+        connection.request(
+            "POST",
+            path,
+            body=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "xhttp-setup/0.1",
+            },
+        )
+        response = connection.getresponse()
+        if response.status < 200 or response.status >= 300:
+            raise VerificationError(
+                f"ISPmanager API вернул неожиданный HTTP status {response.status}"
+            )
+        payload = response.read(2 * 1024 * 1024 + 1)
+        if len(payload) > 2 * 1024 * 1024:
+            raise VerificationError("Ответ ISPmanager API слишком велик")
+        return payload
+    finally:
+        connection.close()
 
 
 def validate_panel_endpoint(value: str) -> str:
@@ -83,6 +151,7 @@ def _xml_post(
     *,
     timeout: int = 20,
     authentication_request: bool = False,
+    route: TCPRoute | None = None,
 ) -> ET.Element:
     data = urllib.parse.urlencode(fields).encode("utf-8")
     request = urllib.request.Request(
@@ -95,13 +164,16 @@ def _xml_post(
         },
     )
     try:
-        opener = urllib.request.build_opener(
-            _NoRedirect(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        )
-        with opener.open(request, timeout=timeout) as response:
-            payload = response.read(2 * 1024 * 1024)
-    except (OSError, urllib.error.URLError) as exc:
+        if route is not None:
+            payload = _routed_post(endpoint, data, timeout=timeout, route=route)
+        else:
+            opener = urllib.request.build_opener(
+                _NoRedirect(),
+                urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            )
+            with opener.open(request, timeout=timeout) as response:
+                payload = response.read(2 * 1024 * 1024)
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
         raise VerificationError(
             f"ISPmanager API недоступен с валидным TLS: {exc}"
         ) from exc
@@ -153,7 +225,12 @@ def parse_site_list(root: ET.Element, domain: str) -> SiteInfo:
 
 
 def inspect_site(
-    *, endpoint: str, username: str, password: str, domain: str
+    *,
+    endpoint: str,
+    username: str,
+    password: str,
+    domain: str,
+    route: TCPRoute | None = None,
 ) -> SiteInfo:
     endpoint = validate_panel_endpoint(endpoint)
     if not username.strip() or not password:
@@ -169,6 +246,7 @@ def inspect_site(
                 "lang": "en",
             },
             authentication_request=True,
+            route=route,
         )
         auth = auth_root.find(".//auth")
         session_id = auth.attrib.get("id", "") if auth is not None else ""
@@ -182,6 +260,7 @@ def inspect_site(
                 "out": "xml",
                 "lang": "en",
             },
+            route=route,
         )
         return parse_site_list(sites, domain)
     except ISPmanagerAuthenticationError as exc:

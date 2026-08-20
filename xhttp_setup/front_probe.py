@@ -19,7 +19,7 @@ from .front import (
 from .models import FrontDesired
 from .osutil import atomic_write_text, ensure_dir, exclusive_lock
 from .render import merge_managed_block, render_htaccess_block
-from .ssh_transport import SFTPClient, SSHAuth, pin_host_key
+from .ssh_transport import SFTPClient, SSHAuth, SSHRoute, TCPRoute, pin_host_key
 
 
 T = TypeVar("T")
@@ -63,6 +63,8 @@ def run_with_temporary_front_route(
     auth: SSHAuth,
     state_dir: Path,
     operation: Callable[[], T],
+    sftp_route: SSHRoute | None = None,
+    https_route: TCPRoute | None = None,
 ) -> T:
     """Install one temporary managed route, run ``operation``, then restore bytes.
 
@@ -79,6 +81,7 @@ def run_with_temporary_front_route(
         desired.domain,
         connect_ip=desired.client_connect_ip,
         pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+        route=https_route,
     )
     known_hosts = state / "known_hosts"
     pin_host_key(
@@ -86,6 +89,7 @@ def run_with_temporary_front_route(
         port=desired.sftp_port,
         expected_sha256=desired.ssh_host_key_sha256,
         known_hosts=known_hosts,
+        route=sftp_route,
     )
     client = SFTPClient(
         host=desired.sftp_host,
@@ -93,6 +97,7 @@ def run_with_temporary_front_route(
         user=desired.sftp_user,
         known_hosts=known_hosts,
         auth=auth,
+        route=sftp_route,
     )
 
     with exclusive_lock(state / "apply.lock"):

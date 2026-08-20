@@ -17,6 +17,7 @@ from xhttp_setup.front_discovery import (
     resolve_front_dns,
 )
 from xhttp_setup.models import TLS_MODE_PINNED, TLS_MODE_PUBLIC
+from xhttp_setup.ssh_transport import TCPRoute
 
 
 DOMAIN = "front.example.org"
@@ -118,6 +119,30 @@ class FrontTLSDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(actual, LEAF)
         connect.assert_called_once_with((CONNECT_IP, 443), timeout=11)
+        self.assertEqual(context.server_hostname, DOMAIN)
+
+    def test_leaf_handshake_route_uses_loopback_and_keeps_domain_sni(self):
+        context = _TLSContext()
+        with (
+            patch(
+                "xhttp_setup.front_discovery.socket.create_connection",
+                return_value=_ContextObject(),
+            ) as connect,
+            patch(
+                "xhttp_setup.front_discovery.ssl.create_default_context",
+                return_value=context,
+            ),
+        ):
+            actual = _leaf_certificate(
+                DOMAIN,
+                CONNECT_IP,
+                verify_public_identity=True,
+                timeout=11,
+                route=TCPRoute("127.0.0.1", 43126),
+            )
+
+        self.assertEqual(actual, LEAF)
+        connect.assert_called_once_with(("127.0.0.1", 43126), timeout=11)
         self.assertEqual(context.server_hostname, DOMAIN)
 
     def test_public_ca_and_hostname_returns_public_policy(self):

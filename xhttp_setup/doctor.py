@@ -24,7 +24,7 @@ from .osutil import (
     sha256_file,
 )
 from .render import pretty_json, render_xray_client_config
-from .validate import validate_ipv4
+from .validate import validate_ipv4, validate_port
 
 
 @dataclass(frozen=True)
@@ -294,6 +294,7 @@ def e2e_probe(
     front_address: str,
     layout: Layout,
     probe_url: str = "https://www.cloudflare.com/cdn-cgi/trace",
+    front_port: int = 443,
 ) -> str:
     if not command_exists("curl"):
         raise InstallerError("Для E2E-проверки нужен curl")
@@ -305,6 +306,7 @@ def e2e_probe(
         domain=domain,
         socks_port=port,
         front_address=front_address,
+        front_port=validate_port(front_port),
     )
     ensure_dir(layout.state, 0o700)
     descriptor, name = tempfile.mkstemp(

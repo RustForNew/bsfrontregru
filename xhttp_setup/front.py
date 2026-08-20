@@ -18,7 +18,14 @@ from .models import FrontDesired, TLS_MODE_PINNED, validate_cert_sha256
 from .osutil import atomic_write_text, ensure_dir, exclusive_lock, sha256_file
 from .placeholder import neutral_placeholder
 from .render import merge_managed_block, render_htaccess_block
-from .ssh_transport import SFTPClient, SSHAuth, pin_host_key, sftp_quote
+from .ssh_transport import (
+    SFTPClient,
+    SSHAuth,
+    SSHRoute,
+    TCPRoute,
+    pin_host_key,
+    sftp_quote,
+)
 
 
 @dataclass(frozen=True)
@@ -102,8 +109,10 @@ def check_public_tls(
     connect_ip: str | None = None,
     pinned_peer_cert_sha256: str | None = None,
     timeout: int = 12,
+    route: TCPRoute | None = None,
 ) -> dict[str, str]:
     target = connect_ip or domain
+    transport = route.validate() if route is not None else None
     pin = (
         validate_cert_sha256(pinned_peer_cert_sha256)
         if pinned_peer_cert_sha256
@@ -111,7 +120,12 @@ def check_public_tls(
     )
     context = _client_tls_context(pin)
     try:
-        with socket.create_connection((target, 443), timeout=timeout) as raw:
+        endpoint = (
+            (transport.connect_host, transport.connect_port)
+            if transport is not None
+            else (target, 443)
+        )
+        with socket.create_connection(endpoint, timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=domain) as tls:
                 leaf_sha256 = _verify_leaf_pin(tls, pin) if pin else ""
                 certificate = tls.getpeercert()
@@ -139,6 +153,7 @@ def https_status(
     connect_ip: str | None = None,
     pinned_peer_cert_sha256: str | None = None,
     timeout: int = 15,
+    route: TCPRoute | None = None,
 ) -> int:
     parsed = urllib.parse.urlsplit(url)
     if (
@@ -153,8 +168,14 @@ def https_status(
         if pinned_peer_cert_sha256
         else None
     )
-    if connect_ip is not None or pin is not None:
-        target = (connect_ip or parsed.hostname, parsed.port or 443)
+    transport = route.validate() if route is not None else None
+    if connect_ip is not None or pin is not None or transport is not None:
+        logical_target = (connect_ip or parsed.hostname, parsed.port or 443)
+        target = (
+            (transport.connect_host, transport.connect_port)
+            if transport is not None
+            else logical_target
+        )
         request_target = urllib.parse.urlunsplit(
             ("", "", parsed.path or "/", parsed.query, "")
         )
@@ -183,7 +204,7 @@ def https_status(
                     return status
         except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
             raise VerificationError(
-                f"HTTPS-запрос {url} через {target[0]} не выполнен: {exc}"
+                f"HTTPS-запрос {url} через {logical_target[0]} не выполнен: {exc}"
             ) from exc
     request = urllib.request.Request(
         url, headers={"User-Agent": "xhttp-setup-doctor/0.1"}
@@ -919,6 +940,8 @@ def apply_front(
     pre_apply: Callable[[], None] | None = None,
     post_apply: Callable[[FrontResult], None] | None = None,
     on_failure: Callable[[BaseException], None] | None = None,
+    sftp_route: SSHRoute | None = None,
+    https_route: TCPRoute | None = None,
 ) -> FrontResult:
     desired = desired.validate()
     expanded_state = state_dir.expanduser()
@@ -958,6 +981,8 @@ def apply_front(
                 auth=auth,
                 state_dir=state_dir,
                 post_apply=post_apply,
+                sftp_route=sftp_route,
+                https_route=https_route,
             )
         except BaseException as exc:
             if on_failure is not None:
@@ -974,17 +999,21 @@ def _apply_front_locked(
     auth: SSHAuth,
     state_dir: Path,
     post_apply: Callable[[FrontResult], None] | None = None,
+    sftp_route: SSHRoute | None = None,
+    https_route: TCPRoute | None = None,
 ) -> FrontResult:
     check_front_dns(desired.domain, desired.dns_ipv4)
     check_public_tls(
         desired.domain,
         connect_ip=desired.client_connect_ip,
         pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+        route=https_route,
     )
     root_before = https_status(
         f"https://{desired.domain}/",
         connect_ip=desired.client_connect_ip,
         pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+        route=https_route,
     )
     if root_before >= 500:
         raise VerificationError(
@@ -997,6 +1026,7 @@ def _apply_front_locked(
         port=desired.sftp_port,
         expected_sha256=desired.ssh_host_key_sha256,
         known_hosts=known_hosts,
+        route=sftp_route,
     )
     client = SFTPClient(
         host=desired.sftp_host,
@@ -1004,6 +1034,7 @@ def _apply_front_locked(
         user=desired.sftp_user,
         known_hosts=known_hosts,
         auth=auth,
+        route=sftp_route,
     )
     timestamp = (
         __import__("datetime")
@@ -1073,11 +1104,13 @@ def _apply_front_locked(
             f"https://{desired.domain}/",
             connect_ip=desired.client_connect_ip,
             pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+            route=https_route,
         )
         path_status = https_status(
             f"https://{desired.domain}{desired.xhttp_path}/doctor",
             connect_ip=desired.client_connect_ip,
             pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+            route=https_route,
         )
         if root_status >= 500 or path_status in {500, 502, 503, 504}:
             raise VerificationError(

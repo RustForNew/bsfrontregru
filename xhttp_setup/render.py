@@ -4,6 +4,7 @@ import json
 from urllib.parse import quote, urlencode
 
 from .models import Handoff
+from .validate import validate_port
 
 
 SC_MAX_EACH_POST_BYTES = 1_000_000
@@ -85,7 +86,12 @@ def render_xray_server_config(
 
 
 def render_xray_client_config(
-    *, handoff: Handoff, domain: str, socks_port: int, front_address: str | None = None
+    *,
+    handoff: Handoff,
+    domain: str,
+    socks_port: int,
+    front_address: str | None = None,
+    front_port: int = 443,
 ) -> dict:
     tls_settings = {
         "serverName": domain,
@@ -111,7 +117,7 @@ def render_xray_client_config(
                     "vnext": [
                         {
                             "address": front_address or domain,
-                            "port": 443,
+                            "port": validate_port(front_port),
                             "users": [
                                 {
                                     "id": handoff.client_id,

@@ -21,7 +21,7 @@ from xhttp_setup.errors import InstallerError
 from xhttp_setup.front import FrontResult, FrontRollbackError
 from xhttp_setup.models import ExitDesired, FrontDesired, Handoff
 from xhttp_setup.osutil import exclusive_lock
-from xhttp_setup.pc_autosetup import PcPreparedInstall, PcUserInputs
+from xhttp_setup.pc_autosetup import PcBridgeInputs, PcPreparedInstall, PcUserInputs
 from xhttp_setup.remote_exit import RemoteExitTarget
 from xhttp_setup.ssh_transport import SSHAuth
 
@@ -30,6 +30,7 @@ DOMAIN = "front.example.org"
 EXIT_PASSWORD = "ExitPassword-only-for-test-73"
 PANEL_PASSWORD = "PanelPassword-only-for-test-42"
 SFTP_PASSWORD = "SftpPassword-only-for-test-91"
+BRIDGE_PASSWORD = "BridgePassword-only-for-test-64"
 FINGERPRINT = "SHA256:" + ("A" * 43)
 CLIENT_ID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
 XHTTP_PATH = "/api/0123456789abcdef0123456789abcdef"
@@ -113,12 +114,13 @@ def _assert_no_manual_technical_inputs(test: unittest.TestCase, transcript: str)
 
 
 class PcMinimalInputTests(unittest.TestCase):
-    def test_collects_exactly_seven_visible_fields_and_two_hidden_passwords(self):
+    def test_direct_collects_eight_visible_fields_and_two_hidden_passwords(self):
         visible_answers = iter(
             (
                 "8.8.8.8",
                 "",  # SSH port=22
                 "",  # SSH login=root
+                "",  # bridge=no
                 "https://vip999.hosting.reg.ru:1500/",
                 "u1234567",
                 "192.0.2.30",
@@ -153,6 +155,7 @@ class PcMinimalInputTests(unittest.TestCase):
                 "SSH port выхода [22]: ",
                 "SSH login выхода [root]: ",
                 "SSH password выхода: ",
+                "Использовать мост для входа? [y/N]: ",
                 "HTTPS-адрес панели REG.RU "
                 "(например https://vip123.hosting.reg.ru:1500/): ",
                 "Логин REG.RU: ",
@@ -168,10 +171,80 @@ class PcMinimalInputTests(unittest.TestCase):
             self.assertNotIn(secret, transcript)
             self.assertNotIn(secret, repr(inputs))
 
+    def test_bridge_collects_only_ipv4_login_and_hidden_password(self):
+        visible_answers = iter(
+            (
+                "8.8.8.8",
+                "",
+                "",
+                "y",
+                "9.9.9.9",
+                "",
+                "https://vip999.hosting.reg.ru:1500/",
+                "u1234567",
+                "192.0.2.30",
+                DOMAIN,
+            )
+        )
+        hidden_answers = iter((EXIT_PASSWORD, BRIDGE_PASSWORD, PANEL_PASSWORD))
+        prompts: list[str] = []
+
+        def visible(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(visible_answers)
+
+        def hidden(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(hidden_answers)
+
+        output = StringIO()
+        with (
+            patch("builtins.input", side_effect=visible),
+            patch("xhttp_setup.cli.getpass.getpass", side_effect=hidden),
+            redirect_stdout(output),
+        ):
+            inputs = _collect_pc_minimal_inputs()
+
+        self.assertEqual(
+            prompts,
+            [
+                "IPv4 выходного сервера: ",
+                "SSH port выхода [22]: ",
+                "SSH login выхода [root]: ",
+                "SSH password выхода: ",
+                "Использовать мост для входа? [y/N]: ",
+                "IPv4 моста: ",
+                "SSH login моста [root]: ",
+                "SSH password моста: ",
+                "HTTPS-адрес панели REG.RU "
+                "(например https://vip123.hosting.reg.ru:1500/): ",
+                "Логин REG.RU: ",
+                "Пароль панели REG.RU: ",
+                "IPv4 подключения REG.RU (поле «IP-адрес сервера»): ",
+                "Домен frontend: ",
+            ],
+        )
+        self.assertEqual(
+            inputs.bridge,
+            PcBridgeInputs(
+                host="9.9.9.9",
+                user="root",
+                password=BRIDGE_PASSWORD,
+            ).validate(),
+        )
+        self.assertEqual(inputs.bridge.port, 22)
+        transcript = output.getvalue()
+        _assert_no_manual_technical_inputs(self, transcript)
+        self.assertNotIn("port моста", transcript)
+        for secret in (EXIT_PASSWORD, BRIDGE_PASSWORD, PANEL_PASSWORD):
+            self.assertNotIn(secret, transcript)
+            self.assertNotIn(secret, repr(inputs))
+
     def test_invalid_secret_reprompts_only_that_hidden_field(self):
         visible_answers = iter(
             (
                 "8.8.8.8",
+                "",
                 "",
                 "",
                 "https://vip999.hosting.reg.ru:1500/",
@@ -201,7 +274,7 @@ class PcMinimalInputTests(unittest.TestCase):
             result = _collect_pc_minimal_inputs()
 
         self.assertEqual(result, _inputs())
-        self.assertEqual(len(visible_prompts), 7)
+        self.assertEqual(len(visible_prompts), 8)
         self.assertEqual(
             hidden_prompts,
             [
@@ -216,6 +289,7 @@ class PcMinimalInputTests(unittest.TestCase):
         visible_answers = iter(
             (
                 "8.8.8.8",
+                "",
                 "",
                 "",
                 "https://evil.example/ispmgr",

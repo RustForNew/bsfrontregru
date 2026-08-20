@@ -125,7 +125,12 @@ class SFTPPasswordMuxTests(unittest.TestCase):
                 captured["sftp_argv"] = argv
                 captured["sftp_env"] = kwargs["env"]
                 captured["batch_text"] = kwargs["input"]
-                return subprocess.CompletedProcess(argv, 0, "ok", "")
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    f"ok {secret}",
+                    f"remote reflected {secret}",
+                )
             raise AssertionError(argv)
 
         with tempfile.TemporaryDirectory() as temp:
@@ -141,7 +146,8 @@ class SFTPPasswordMuxTests(unittest.TestCase):
             ):
                 result = client.batch(["ls -l", "get file local"], check=True)
 
-        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(result.stdout, "ok [REDACTED]")
+        self.assertEqual(result.stderr, "remote reflected [REDACTED]")
         self.assertEqual(captured["password"], secret)
         self.assertEqual(captured["batch_text"], "ls -l\nget file local\n")
         self.assertEqual(captured["control_ops"], ["check", "exit"])

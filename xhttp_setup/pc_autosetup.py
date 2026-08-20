@@ -39,7 +39,10 @@ from .ssh_transport import (
     SFTPClient,
     SSHAuth,
     SSHAuthenticationError,
+    SSHBridgeSession,
     SSHClient,
+    SSHRoute,
+    TCPRoute,
     sftp_quote,
 )
 from .validate import (
@@ -85,6 +88,24 @@ _CAPTURE_SCRIPT = (
 
 
 @dataclass(frozen=True)
+class PcBridgeInputs:
+    host: str
+    user: str
+    password: str = field(repr=False, compare=False)
+    port: int = 22
+
+    def validate(self) -> "PcBridgeInputs":
+        auth = SSHAuth("password", password=self.password).validate()
+        del auth
+        return PcBridgeInputs(
+            host=validate_ipv4(self.host),
+            user=validate_ssh_user(self.user),
+            password=self.password,
+            port=validate_port(self.port),
+        )
+
+
+@dataclass(frozen=True)
 class PcUserInputs:
     exit_host: str
     exit_port: int
@@ -95,6 +116,7 @@ class PcUserInputs:
     panel_password: str = field(repr=False, compare=False)
     front_connect_ip: str
     domain: str
+    bridge: PcBridgeInputs | None = field(default=None, repr=False)
 
     def validate(self) -> "PcUserInputs":
         exit_auth = SSHAuth("password", password=self.exit_password).validate()
@@ -113,7 +135,15 @@ class PcUserInputs:
             panel_password=panel_password,
             front_connect_ip=validate_ipv4(self.front_connect_ip),
             domain=normalize_domain(self.domain),
+            bridge=(self.bridge.validate() if self.bridge is not None else None),
         )
+
+
+@dataclass(frozen=True)
+class PcBridgeAccess:
+    panel_route: TCPRoute
+    sftp_route: SSHRoute = field(repr=False, compare=False)
+    front_route: TCPRoute
 
 
 @dataclass(frozen=True)
@@ -143,6 +173,76 @@ def validate_pc_secret(value: str, label: str) -> str:
     ):
         raise InstallerError(f"{label} должен быть одной непустой строкой")
     return value
+
+
+def open_pc_bridge(
+    inputs: PcUserInputs,
+    *,
+    progress: Callable[[str], None] | None = None,
+    password_prompt: Callable[[], str] | None = None,
+) -> tuple[SSHBridgeSession, PcBridgeAccess]:
+    """Open one root bridge and route every frontend TCP control endpoint."""
+
+    from .ssh_transport import trust_host_key_tofu
+
+    validated = inputs.validate()
+    bridge = validated.bridge
+    if bridge is None:
+        raise InstallerError("SSH bridge не выбран")
+
+    def step(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    step("Проверяю SSH-мост и закрепляю первый ключ")
+    trust_dir = Path.home() / ".local/state/xhttp-setup/trust/ssh"
+    known_hosts, _ = trust_host_key_tofu(
+        host=bridge.host,
+        port=bridge.port,
+        trust_dir=trust_dir,
+    )
+    endpoint = panel_login_url_to_endpoint(validated.panel_url)
+    parsed_panel = urllib.parse.urlsplit(endpoint)
+    if not parsed_panel.hostname:
+        raise InstallerError("В URL ISPmanager отсутствует hostname")
+    panel_host = validate_host(parsed_panel.hostname)
+    forwards = {
+        "panel": (panel_host, parsed_panel.port or 443),
+        "sftp": (panel_host, 22),
+        "front": (validated.front_connect_ip, 443),
+    }
+    password = bridge.password
+    for attempt in range(_MAX_PASSWORD_ATTEMPTS):
+        session = SSHBridgeSession(
+            host=bridge.host,
+            port=bridge.port,
+            user=bridge.user,
+            known_hosts=known_hosts,
+            auth=SSHAuth("password", password=password),
+            forwards=forwards,
+        )
+        try:
+            session.open()
+        except SSHAuthenticationError:
+            if password_prompt is None or attempt + 1 >= _MAX_PASSWORD_ATTEMPTS:
+                raise
+            password = validate_pc_secret(
+                password_prompt(), "SSH password моста"
+            )
+            continue
+        password = ""
+        try:
+            access = PcBridgeAccess(
+                panel_route=session.tcp_route("panel"),
+                sftp_route=session.ssh_route("sftp"),
+                front_route=session.tcp_route("front"),
+            )
+        except BaseException:
+            session.close()
+            raise
+        step("SSH-мост готов; frontend control-plane направлен через него")
+        return session, access
+    raise InstallerError("Не удалось открыть SSH-мост")  # pragma: no cover
 
 
 def _public_ipv4(value: str, *, label: str) -> str:
@@ -627,14 +727,20 @@ def _wait_capture_ready(
     raise InstallerError("tcpdump frontend probe не подтвердил готовность")
 
 
-def _trigger_front_requests(desired: FrontDesired) -> None:
+def _trigger_front_requests(
+    desired: FrontDesired, *, https_route: TCPRoute | None = None
+) -> None:
     def request(number: int) -> None:
         try:
+            request_kwargs: dict[str, TCPRoute] = {}
+            if https_route is not None:
+                request_kwargs["route"] = https_route
             https_status(
                 f"https://{desired.domain}{desired.xhttp_path}/probe-{number}",
                 connect_ip=desired.client_connect_ip,
                 pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
                 timeout=5,
+                **request_kwargs,
             )
         except Exception:
             # The backend port is intentionally blocked.  Incoming SYN packets,
@@ -672,6 +778,8 @@ def measure_front_egress(
     temporary_front: FrontDesired,
     front_auth: SSHAuth,
     state_dir: Path,
+    sftp_route: SSHRoute | None = None,
+    https_route: TCPRoute | None = None,
 ) -> str:
     """Measure Apache source IPv4 without opening the temporary port in UFW."""
 
@@ -702,11 +810,19 @@ def measure_front_egress(
         )
         try:
             _wait_capture_ready(ssh, ready_path, future)
+            route_kwargs: dict[str, object] = {}
+            if sftp_route is not None:
+                route_kwargs["sftp_route"] = sftp_route
+            if https_route is not None:
+                route_kwargs["https_route"] = https_route
             run_with_temporary_front_route(
                 temporary_front,
                 auth=front_auth,
                 state_dir=state_dir,
-                operation=lambda: _trigger_front_requests(temporary_front),
+                operation=lambda: _trigger_front_requests(
+                    temporary_front, https_route=https_route
+                ),
+                **route_kwargs,
             )
             try:
                 capture_result = future.result(timeout=_PROBE_CAPTURE_SECONDS + 10)
@@ -748,6 +864,7 @@ def prepare_pc_install(
     panel_password_prompt: Callable[[], str] | None = None,
     sftp_password_prompt: Callable[[], str] | None = None,
     require_exit_recovery: bool = False,
+    bridge_access: PcBridgeAccess | None = None,
 ) -> PcPreparedInstall:
     """Discover every non-credential value needed by the existing transactions."""
 
@@ -758,6 +875,11 @@ def prepare_pc_install(
     from .ssh_transport import trust_host_key_tofu
 
     inputs = inputs.validate()
+    if (inputs.bridge is None) != (bridge_access is None):
+        raise InstallerError("Состояние SSH-моста не соответствует выбранному режиму")
+    panel_route = bridge_access.panel_route if bridge_access is not None else None
+    sftp_route = bridge_access.sftp_route if bridge_access is not None else None
+    front_route = bridge_access.front_route if bridge_access is not None else None
     output_candidate = output_dir.expanduser()
     if output_candidate.is_symlink():
         raise InstallerError("Каталог PC state не может быть symlink")
@@ -814,11 +936,15 @@ def prepare_pc_install(
     panel_password = inputs.panel_password
     for attempt in range(_MAX_PASSWORD_ATTEMPTS):
         try:
+            panel_kwargs: dict[str, TCPRoute] = {}
+            if panel_route is not None:
+                panel_kwargs["route"] = panel_route
             site = inspect_site(
                 endpoint=endpoint,
                 username=inputs.panel_user,
                 password=panel_password,
                 domain=inputs.domain,
+                **panel_kwargs,
             )
         except ISPmanagerAuthenticationError:
             if panel_password_prompt is None or attempt + 1 >= _MAX_PASSWORD_ATTEMPTS:
@@ -840,18 +966,27 @@ def prepare_pc_install(
     # that this credential was rejected.
     front_auth = SSHAuth("password", password=panel_password).validate()
     step("Проверяю SFTP и закрепляю первый ключ")
+    sftp_trust_kwargs: dict[str, SSHRoute] = {}
+    if sftp_route is not None:
+        sftp_trust_kwargs["route"] = sftp_route
     sftp_known_hosts, sftp_fingerprint = trust_host_key_tofu(
         host=sftp_host,
         port=22,
         trust_dir=trust_dir,
+        **sftp_trust_kwargs,
     )
+
     def check_sftp(auth: SSHAuth) -> subprocess.CompletedProcess[str]:
+        client_kwargs: dict[str, SSHRoute] = {}
+        if sftp_route is not None:
+            client_kwargs["route"] = sftp_route
         return SFTPClient(
             host=sftp_host,
             port=22,
             user=inputs.panel_user,
             known_hosts=sftp_known_hosts,
             auth=auth,
+            **client_kwargs,
         ).batch([f"cd {sftp_quote(site.docroot)}", "pwd"], check=False)
 
     for attempt in range(_MAX_PASSWORD_ATTEMPTS):
@@ -872,10 +1007,14 @@ def prepare_pc_install(
         raise InstallerError("REG.RU SFTP login или доступ к сайту не подтверждён")
 
     step("Автоматически проверяю TLS/SNI сайта")
+    tls_kwargs: dict[str, TCPRoute] = {}
+    if front_route is not None:
+        tls_kwargs["route"] = front_route
     tls_discovery = discover_front_tls_policy(
         inputs.domain,
         client_connect_ip,
         state_dir=output / "tls-trust",
+        **tls_kwargs,
     )
     tls_mode = tls_discovery.tls_mode
     cert_pin = tls_discovery.pinned_peer_cert_sha256
@@ -948,11 +1087,17 @@ def prepare_pc_install(
     if phase_callback is not None:
         phase_callback("front_probe_in_progress")
     try:
+        probe_kwargs: dict[str, object] = {}
+        if sftp_route is not None:
+            probe_kwargs["sftp_route"] = sftp_route
+        if front_route is not None:
+            probe_kwargs["https_route"] = front_route
         front_egress = measure_front_egress(
             ssh=exit_ssh,
             temporary_front=temporary_front,
             front_auth=front_auth,
             state_dir=output / "front-egress-probe",
+            **probe_kwargs,
         )
     except BaseException as exc:
         if phase_callback is not None and not _front_rollback_incomplete(exc):

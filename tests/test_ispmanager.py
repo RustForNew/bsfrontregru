@@ -1,15 +1,17 @@
 import unittest
 import xml.etree.ElementTree as ET
-from unittest.mock import patch
+from unittest.mock import ANY, MagicMock, patch
 
 from xhttp_setup.errors import InstallerError, VerificationError
 from xhttp_setup.ispmanager import (
     ISPmanagerAuthenticationError,
+    _routed_post,
     inspect_site,
     panel_login_url_to_endpoint,
     parse_site_list,
     validate_panel_endpoint,
 )
+from xhttp_setup.ssh_transport import TCPRoute
 
 
 class ISPmanagerTests(unittest.TestCase):
@@ -95,6 +97,59 @@ class ISPmanagerTests(unittest.TestCase):
 
         self.assertEqual([call["func"] for call in calls], ["auth", "webdomain"])
         self.assertFalse(any("sok" in call for call in calls))
+
+    def test_inspection_routes_both_panel_requests_through_bridge(self):
+        auth = ET.fromstring('<doc><auth id="session-123" /></doc>')
+        sites = ET.fromstring(
+            """<doc><elem><name>front.example.org</name>
+            <docroot>/var/www/front.example.org</docroot></elem></doc>"""
+        )
+        route = TCPRoute("127.0.0.1", 43124)
+        with patch(
+            "xhttp_setup.ispmanager._xml_post", side_effect=(auth, sites)
+        ) as post:
+            inspect_site(
+                endpoint="https://panel.example.org:1500/ispmgr",
+                username="example",
+                password="secret",
+                domain="front.example.org",
+                route=route,
+            )
+
+        self.assertEqual(len(post.call_args_list), 2)
+        self.assertTrue(all(call.kwargs["route"] == route for call in post.call_args_list))
+
+    def test_routed_post_keeps_panel_hostname_for_tls_and_http(self):
+        route = TCPRoute("127.0.0.1", 43124)
+        connection = MagicMock()
+        response = MagicMock(status=200)
+        response.read.return_value = b"<doc/>"
+        connection.getresponse.return_value = response
+        with patch(
+            "xhttp_setup.ispmanager._RoutedHTTPSConnection",
+            return_value=connection,
+        ) as routed:
+            payload = _routed_post(
+                "https://panel.example.org:1500/ispmgr",
+                b"func=auth",
+                timeout=9,
+                route=route,
+            )
+
+        self.assertEqual(payload, b"<doc/>")
+        routed.assert_called_once_with(
+            "panel.example.org",
+            1500,
+            route=route,
+            timeout=9,
+            context=ANY,
+        )
+        connection.request.assert_called_once_with(
+            "POST",
+            "/ispmgr",
+            body=b"func=auth",
+            headers=ANY,
+        )
 
     def test_inspection_redacts_reflected_password_without_exception_chain(self):
         secret = "FakeReflectedPanelSecret"

@@ -28,12 +28,13 @@
   fail-on-command semantics by running `sftp -b` only through its private
   control socket. Passwords are not placed in argv, regular files, config files,
   or environment values.
-- The PC wizard discovers exit and SFTP host keys before password
-  authentication, accepts the first supported key as TOFU, and persists it in
-  an endpoint-scoped private store. Later disappearance or change of that exact
-  key is rejected; adding another key type does not silently replace it. This
-  removes manual fingerprints but does not independently authenticate the
-  first network contact. Root passwords use the same private FIFO transport.
+- The PC wizard discovers exit, optional bridge and SFTP host keys before
+  password authentication, accepts the first supported key for each endpoint
+  as TOFU, and persists it in an endpoint-scoped private store. Later
+  disappearance or change of that exact key is rejected; adding another key
+  type does not silently replace it. This removes manual fingerprints but does
+  not independently authenticate the first network contact. Root passwords use
+  the same private FIFO transport.
 - Ready-made credential blocks remain available only in advanced modes. They
   are read from the controlling Linux/WSL terminal with echo disabled for the
   whole bounded paste. The minimal PC wizard instead asks for each credential
@@ -51,12 +52,27 @@
   a structured OpenSSH authentication failure. Network, TLS and document-root
   errors never trigger credential guessing. Reflected remote errors are
   redacted without a secret-bearing exception chain.
-- In advanced bridge mode the SFTP password is sent as one bounded stdin line inside an
-  already host-key-pinned SSH command. It is not placed in argv, environment,
-  regular files, or relayed command output.
-- The advanced optional bridge is a trusted operator host, not an anonymous proxy. Its
-  root can observe the handoff, frontend credentials and managed client
-  material; compromise of bridge root defeats these protections.
+- The optional PC bridge is a trusted, setup-only SSH control-plane host. PC
+  mode uses fixed bridge TCP/22, hidden password input and one TOFU-pinned
+  ControlMaster, then requires `id -u` to return `0`. The bridge password is
+  consumed by the same FIFO-backed askpass mechanism and is not stored in argv,
+  environment values, regular files or recovery state.
+- When selected, loopback-only forwards carry ISPmanager HTTPS, SFTP/keyscan,
+  frontend TLS, temporary-probe HTTPS and final E2E frontend TCP. ISPmanager and
+  frontend TLS retain their logical hostname/SNI checks, while SFTP remains a
+  nested host-key-checked SSH connection. Exit SSH is always direct from the
+  controller and DNS resolution remains local. The bridge session is closed at
+  success or failure; no Xray is installed there, and the bridge is absent from
+  `client.vless`, the VLESS URI and the post-setup datapath.
+- A bridge is nevertheless a privileged network position and must be trusted.
+  Its root can observe endpoint metadata, disrupt or redirect forwarded
+  connections, and can attack a first-use SFTP TOFU decision. Public PKI or an
+  already-pinned endpoint still fails closed on a mismatched identity, but the
+  bridge is not a substitute for independent first-contact verification.
+- The separate legacy/advanced remote-front workflow is not the optional PC
+  bridge. That older mode uploads bounded staging material and relays one SFTP
+  password line over an already pinned SSH command; its wider bridge exposure
+  does not describe the current PC forwarding design.
 - Remote firewall automation is fail-closed and restricted to clean supported
   Debian/Ubuntu hosts. An already-active compatible UFW is preserved. For a
   pristine inactive UFW, the PC flow installs only allowlisted prerequisites,

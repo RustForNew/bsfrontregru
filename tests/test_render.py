@@ -121,6 +121,27 @@ class RenderTests(unittest.TestCase):
             outbound["settings"]["vnext"][0]["users"][0]["encryption"], ENCRYPTION
         )
         self.assertEqual(outbound["settings"]["vnext"][0]["address"], "198.51.100.20")
+        self.assertEqual(outbound["settings"]["vnext"][0]["port"], 443)
+
+    def test_diagnostic_client_can_use_bridge_forward_without_changing_profile(self):
+        config = render_xray_client_config(
+            handoff=handoff(),
+            domain="front.example.org",
+            socks_port=10808,
+            front_address="127.0.0.1",
+            front_port=43126,
+        )
+        target = config["outbounds"][0]["settings"]["vnext"][0]
+        self.assertEqual((target["address"], target["port"]), ("127.0.0.1", 43126))
+        self.assertEqual(
+            config["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"],
+            "front.example.org",
+        )
+
+        uri = render_vless_uri(
+            handoff(), "front.example.org", front_address="198.51.100.20"
+        )
+        self.assertEqual(urlsplit(uri).port, 443)
 
     def test_uri_round_trip(self):
         uri = render_vless_uri(

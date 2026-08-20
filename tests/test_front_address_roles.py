@@ -17,6 +17,7 @@ from xhttp_setup.front import (
 )
 from xhttp_setup.ispmanager import SiteInfo
 from xhttp_setup.models import FrontDesired, Handoff
+from xhttp_setup.ssh_transport import TCPRoute
 
 
 UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
@@ -181,6 +182,28 @@ class FrontAddressRoleTests(unittest.TestCase):
         request = context.tls.sent.decode("ascii")
         self.assertIn("GET /api/check?probe=1 HTTP/1.1\r\n", request)
         self.assertIn("Host: front.example.org\r\n", request)
+
+    def test_https_route_uses_loopback_transport_but_original_sni_and_host(self):
+        context = _FakeContext()
+        route = TCPRoute("127.0.0.1", 43126)
+        with (
+            patch(
+                "xhttp_setup.front.socket.create_connection",
+                return_value=_ContextObject(),
+            ) as create_connection,
+            patch("xhttp_setup.front.ssl.create_default_context", return_value=context),
+            patch("xhttp_setup.front.http.client.HTTPResponse", _FakeResponse),
+        ):
+            status = https_status(
+                "https://front.example.org/api/check",
+                connect_ip="198.51.100.20",
+                route=route,
+            )
+
+        self.assertEqual(status, 204)
+        create_connection.assert_called_once_with(("127.0.0.1", 43126), timeout=15)
+        self.assertEqual(context.server_name, "front.example.org")
+        self.assertIn("Host: front.example.org\r\n", context.tls.sent.decode("ascii"))
 
     def test_https_status_checks_pin_before_request_and_preserves_host(self):
         context = _FakeContext()

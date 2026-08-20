@@ -14,6 +14,7 @@ from .errors import InstallerError, VerificationError
 from .front import https_status
 from .models import TLS_MODE_PINNED, TLS_MODE_PUBLIC
 from .osutil import atomic_write_text, ensure_dir
+from .ssh_transport import TCPRoute
 from .validate import normalize_domain, validate_ipv4
 
 
@@ -70,6 +71,7 @@ def _leaf_certificate(
     *,
     verify_public_identity: bool,
     timeout: int,
+    route: TCPRoute | None = None,
 ) -> bytes:
     if verify_public_identity:
         context = ssl.create_default_context()
@@ -82,9 +84,13 @@ def _leaf_certificate(
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-    with socket.create_connection(
-        (connect_ip, _TLS_PORT), timeout=timeout
-    ) as raw:
+    transport = route.validate() if route is not None else None
+    endpoint = (
+        (transport.connect_host, transport.connect_port)
+        if transport is not None
+        else (connect_ip, _TLS_PORT)
+    )
+    with socket.create_connection(endpoint, timeout=timeout) as raw:
         with context.wrap_socket(raw, server_hostname=domain) as tls:
             certificate_der = tls.getpeercert(binary_form=True)
     if not certificate_der:
@@ -227,6 +233,7 @@ def discover_front_tls_policy(
     *,
     state_dir: Path | None = None,
     timeout: int = 12,
+    route: TCPRoute | None = None,
 ) -> FrontTLSDiscovery:
     """Choose public validation or a stable exact leaf pin for one endpoint.
 
@@ -239,6 +246,9 @@ def discover_front_tls_policy(
     connect_ip = validate_ipv4(connect_ip)
     if timeout <= 0:
         raise VerificationError("TLS timeout должен быть положительным")
+    route_kwargs: dict[str, TCPRoute] = {}
+    if route is not None:
+        route_kwargs["route"] = route
 
     try:
         _leaf_certificate(
@@ -246,6 +256,7 @@ def discover_front_tls_policy(
             connect_ip,
             verify_public_identity=True,
             timeout=timeout,
+            **route_kwargs,
         )
     except ssl.SSLCertVerificationError:
         # A CA/hostname-verified public certificate may rotate normally and is
@@ -260,12 +271,14 @@ def discover_front_tls_policy(
                 connect_ip,
                 verify_public_identity=False,
                 timeout=timeout,
+                **route_kwargs,
             )
             second = _leaf_certificate(
                 domain,
                 connect_ip,
                 verify_public_identity=False,
                 timeout=timeout,
+                **route_kwargs,
             )
         except (OSError, ssl.SSLError, VerificationError) as exc:
             raise VerificationError(_certificate_error(domain, connect_ip, exc)) from exc
@@ -289,6 +302,7 @@ def discover_front_tls_policy(
             connect_ip=connect_ip,
             pinned_peer_cert_sha256=leaf_sha256,
             timeout=timeout,
+            **route_kwargs,
         )
         _enforce_or_persist_leaf(
             path=path,

@@ -55,8 +55,11 @@ from .pc_orchestrator import (
     front_for_handoff,
 )
 from .pc_autosetup import (
+    PcBridgeAccess,
+    PcBridgeInputs,
     PcUserInputs,
     clear_pending_pc_exit,
+    open_pc_bridge,
     prepare_pc_install,
     validate_pc_secret,
     write_pending_pc_exit,
@@ -472,6 +475,15 @@ def _collect_pc_minimal_inputs() -> PcUserInputs:
     exit_password = _validated_secret_prompt(
         "SSH password выхода: ", "SSH password выхода"
     )
+    bridge: PcBridgeInputs | None = None
+    if _yes_no("Использовать мост для входа?", default=False):
+        bridge = PcBridgeInputs(
+            host=_validated_prompt("IPv4 моста", validate_ipv4),
+            user=_validated_prompt("SSH login моста", validate_ssh_user, "root"),
+            password=_validated_secret_prompt(
+                "SSH password моста: ", "SSH password моста"
+            ),
+        ).validate()
     panel_url = _validated_prompt(
         "HTTPS-адрес панели REG.RU (например https://vip123.hosting.reg.ru:1500/)",
         validate_regru_panel_url,
@@ -494,6 +506,7 @@ def _collect_pc_minimal_inputs() -> PcUserInputs:
         panel_password=panel_password,
         front_connect_ip=front_connect_ip,
         domain=domain,
+        bridge=bridge,
     ).validate()
 
 
@@ -744,6 +757,7 @@ def _apply_front_and_issue(
     layout: Layout,
     firewall_plan_path: Path | None = None,
     firewall_supplied: bool | None = None,
+    bridge_access: PcBridgeAccess | None = None,
 ) -> FrontResult:
     stage = "frontend apply"
     link_withholding_started = False
@@ -781,6 +795,7 @@ def _apply_front_and_issue(
             client_connect_ip=desired.client_connect_ip,
             state_dir=state_dir,
             layout=layout,
+            bridge_access=bridge_access,
         )
 
     def record_failure(exc: BaseException) -> None:
@@ -816,6 +831,12 @@ def _apply_front_and_issue(
         if cleanup_error is not None:
             raise cleanup_error from exc
 
+    apply_kwargs: dict[str, object] = {}
+    if bridge_access is not None:
+        apply_kwargs.update(
+            sftp_route=bridge_access.sftp_route,
+            https_route=bridge_access.front_route,
+        )
     return apply_front(
         desired,
         auth=auth,
@@ -823,6 +844,7 @@ def _apply_front_and_issue(
         pre_apply=prepare_transaction,
         post_apply=finish_transaction,
         on_failure=record_failure,
+        **apply_kwargs,
     )
 
 
@@ -833,12 +855,22 @@ def _run_probe_and_issue(
     client_connect_ip: str,
     state_dir: Path,
     layout: Layout,
+    bridge_access: PcBridgeAccess | None = None,
 ) -> None:
+    probe_address = client_connect_ip
+    probe_port = 443
+    if bridge_access is not None:
+        probe_address = bridge_access.front_route.connect_host
+        probe_port = bridge_access.front_route.connect_port
+    probe_kwargs: dict[str, object] = {}
+    if bridge_access is not None:
+        probe_kwargs["front_port"] = probe_port
     output = e2e_probe(
         handoff=handoff,
         domain=domain,
-        front_address=client_connect_ip,
+        front_address=probe_address,
         layout=layout,
+        **probe_kwargs,
     )
     first_line = output.splitlines()[0] if output else "response received"
     print(f"E2E: OK ({first_line[:120]})")
@@ -921,7 +953,21 @@ def _run_pc_install(
             "автоматическое продолжение остановлено, чтобы не потерять исходный .htaccess"
         )
     prepared = None
+    bridge_session = None
+    bridge_access = None
     try:
+        if inputs.bridge is not None:
+            bridge_session, bridge_access = open_pc_bridge(
+                inputs,
+                progress=lambda message: print(f"\n→ {message}"),
+                password_prompt=lambda: _validated_secret_prompt(
+                    "SSH password моста не подошёл. Повторите: ",
+                    "SSH password моста",
+                ),
+            )
+        prepare_kwargs: dict[str, object] = {}
+        if bridge_access is not None:
+            prepare_kwargs["bridge_access"] = bridge_access
         prepared = prepare_pc_install(
             inputs,
             output_dir=output_dir,
@@ -941,6 +987,7 @@ def _run_pc_install(
             ),
             require_exit_recovery=initial_phase
             in {"exit_applying", "exit_ready", "complete"},
+            **prepare_kwargs,
         )
         inputs = None
         if prepared.existing_handoff is None:
@@ -972,12 +1019,16 @@ def _run_pc_install(
         front_state = output_dir / "front"
         _write_pc_phase(output_dir, "front_in_progress")
         try:
+            front_kwargs: dict[str, object] = {}
+            if bridge_access is not None:
+                front_kwargs["bridge_access"] = bridge_access
             _apply_front_and_issue(
                 desired=desired_front,
                 auth=prepared.front_auth,
                 state_dir=front_state,
                 handoff=client_handoff,
                 layout=Layout(root=front_state / "probe-runtime"),
+                **front_kwargs,
             )
         except BaseException as exc:
             rollback_incomplete = _has_front_rollback_error(exc)
@@ -993,6 +1044,10 @@ def _run_pc_install(
         _write_pc_phase(output_dir, "complete")
         print("\nГотово: установка и сквозная E2E-проверка завершены.")
     finally:
+        if bridge_session is not None:
+            bridge_session.close()
+        bridge_access = None
+        bridge_session = None
         inputs = None
         prepared = None
     return 0

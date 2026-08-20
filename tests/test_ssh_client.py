@@ -136,17 +136,24 @@ class SSHClientTests(unittest.TestCase):
                 captured["argv"] = argv
                 captured["env"] = kwargs["env"]
                 captured["kwargs"] = kwargs
-                return subprocess.CompletedProcess(argv, 0, "ok", "")
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    f"ok {secret}",
+                    f"remote reflected {secret}",
+                )
 
             with mock.patch(
                 "xhttp_setup.ssh_transport.subprocess.run", side_effect=fake_run
             ):
-                client.command(["true"])
+                result = client.command(["true"])
 
         self.assertNotIn(secret, repr(captured["argv"]))
         self.assertNotIn(secret, repr(captured["env"]))
         self.assertNotIn("input", captured["kwargs"])
         self.assertEqual(captured["kwargs"]["stdin"], subprocess.DEVNULL)
+        self.assertEqual(result.stdout, "ok [REDACTED]")
+        self.assertEqual(result.stderr, "remote reflected [REDACTED]")
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO")
     def test_password_command_uses_separate_stdin_and_redacts_error(self):

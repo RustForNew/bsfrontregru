@@ -139,6 +139,10 @@ class WindowsBundleTests(unittest.TestCase):
                     "SSH port выхода",
                     "SSH login выхода",
                     "SSH password выхода",
+                    "Использовать мост для входа? [y/N]",
+                    "IPv4 моста",
+                    "SSH login моста [root]",
+                    "SSH password моста",
                     "HTTPS-адрес панели REG.RU",
                     "основной логин REG.RU",
                     "пароль панели REG.RU",
@@ -152,8 +156,11 @@ class WindowsBundleTests(unittest.TestCase):
                     "E2E",
                     "мастер сайт не создаёт",
                     "не трогает index.html",
+                    "SSH к выходному VPS всегда идёт напрямую",
+                    "Мост — только временный control-plane",
                 ):
                     self.assertIn(automatic_invariant, instruction_text)
+                self.assertNotIn("SSH port моста", instruction_text)
                 for obsolete_manual_token in (
                     "xhttp-setup-egress-probe",
                     "EXIT_EGRESS_IP",
