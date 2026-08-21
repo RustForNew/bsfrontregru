@@ -33,7 +33,9 @@ from .ssh_transport import SFTPClient, SSHAuth, SSHRoute, TCPRoute, pin_host_key
 T = TypeVar("T")
 _STATE_MARKER = "xhttp-setup temporary frontend probe state v1\n"
 _CONTROL_REQUEST_TIMEOUT_SECONDS = 8
-_TemporaryRouteMode = Literal["proxy", "rewrite-control"]
+_TemporaryRouteMode = Literal["proxy", "rewrite-control", "proxy-control"]
+_ControlOutcome = tuple[Literal["http", "tls", "post-send", "pre-send"], int | None]
+_PROXY_CONTROL_OK_STATUSES = frozenset({502, 503, 504})
 
 
 def _render_rewrite_control_block(*, path: str, nonce: str) -> str:
@@ -49,6 +51,24 @@ def _render_rewrite_control_block(*, path: str, nonce: str) -> str:
             "RewriteEngine On",
             "RewriteCond %{REQUEST_METHOD} ^GET$",
             f"RewriteRule ^{control}$ / [R=302,L]",
+            END_MARKER,
+        ]
+    )
+
+
+def _render_proxy_control_block(*, path: str, nonce: str) -> str:
+    """Render one exact local-failure proxy canary with a literal upstream."""
+
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise InstallerError("Некорректный nonce контрольного frontend route")
+    relative = path.lstrip("/")
+    control = f"{relative}/xhttp-setup-control-{nonce}"
+    return "\n".join(
+        [
+            BEGIN_MARKER,
+            "RewriteEngine On",
+            "RewriteCond %{REQUEST_METHOD} ^GET$",
+            f"RewriteRule ^{control}$ http://127.0.0.1:9/{nonce} [P,L]",
             END_MARKER,
         ]
     )
@@ -72,6 +92,13 @@ def _render_temporary_block(
         if rewrite_control_nonce is None:
             raise InstallerError("Для контрольного frontend route нужен nonce")
         return _render_rewrite_control_block(
+            path=desired.xhttp_path,
+            nonce=rewrite_control_nonce,
+        )
+    if route_mode == "proxy-control":
+        if rewrite_control_nonce is None:
+            raise InstallerError("Для контрольного frontend proxy нужен nonce")
+        return _render_proxy_control_block(
             path=desired.xhttp_path,
             nonce=rewrite_control_nonce,
         )
@@ -101,7 +128,9 @@ def _prepare_state_dir(path: Path) -> Path:
     marker = resolved / ".xhttp-setup-probe-state"
     if existed:
         if not marker.is_file() or marker.is_symlink():
-            raise InstallerError("Существующий каталог frontend probe не является managed")
+            raise InstallerError(
+                "Существующий каталог frontend probe не является managed"
+            )
         if marker.read_text("utf-8") != _STATE_MARKER:
             raise InstallerError("Маркер каталога frontend probe не совпал")
     else:
@@ -217,6 +246,122 @@ def run_with_temporary_front_route(
             return result  # type: ignore[return-value]
 
 
+def _control_route_kwargs(
+    *,
+    sftp_route: SSHRoute | None,
+    https_route: TCPRoute | None,
+    trusted_known_hosts: Path | None,
+) -> dict[str, object]:
+    route_kwargs: dict[str, object] = {}
+    if sftp_route is not None:
+        route_kwargs["sftp_route"] = sftp_route
+    if https_route is not None:
+        route_kwargs["https_route"] = https_route
+    if trusted_known_hosts is not None:
+        route_kwargs["trusted_known_hosts"] = trusted_known_hosts
+    return route_kwargs
+
+
+def _observe_control_url(
+    desired: FrontDesired,
+    *,
+    url: str,
+    https_route: TCPRoute | None,
+) -> _ControlOutcome:
+    try:
+        status = https_status(
+            url,
+            connect_ip=desired.client_connect_ip,
+            pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
+            timeout=_CONTROL_REQUEST_TIMEOUT_SECONDS,
+            route=https_route,
+        )
+    except TLSVerificationError:
+        return ("tls", None)
+    except HTTPSResponseError:
+        return ("post-send", None)
+    except VerificationError:
+        return ("pre-send", None)
+    return ("http", status)
+
+
+def _run_control_route(
+    desired: FrontDesired,
+    *,
+    auth: SSHAuth,
+    state_dir: Path,
+    url: str,
+    nonce: str,
+    route_mode: Literal["rewrite-control", "proxy-control"],
+    sftp_route: SSHRoute | None,
+    https_route: TCPRoute | None,
+    trusted_known_hosts: Path | None,
+) -> _ControlOutcome:
+    route_kwargs = _control_route_kwargs(
+        sftp_route=sftp_route,
+        https_route=https_route,
+        trusted_known_hosts=trusted_known_hosts,
+    )
+    return run_with_temporary_front_route(
+        desired,
+        auth=auth,
+        state_dir=state_dir,
+        operation=lambda: _observe_control_url(
+            desired,
+            url=url,
+            https_route=https_route,
+        ),
+        route_mode=route_mode,
+        rewrite_control_nonce=nonce,
+        **route_kwargs,
+    )
+
+
+def _require_rewrite_control(outcome: _ControlOutcome) -> None:
+    kind, status = outcome
+    if kind == "tls":
+        raise TLSVerificationError(
+            "Контроль Apache/mod_rewrite: TLS/SNI/leaf-сертификат не прошёл проверку"
+        ) from None
+    if kind == "post-send":
+        raise VerificationError(
+            "Контроль Apache/mod_rewrite: HTTPS-запрос отправлен, но "
+            "корректный HTTP-ответ не получен"
+        ) from None
+    if kind == "pre-send":
+        raise VerificationError(
+            "Контроль Apache/mod_rewrite: HTTPS-запрос не удалось безопасно отправить"
+        ) from None
+    if type(status) is not int or not 200 <= status <= 599:
+        raise VerificationError(
+            "Контроль Apache/mod_rewrite вернул некорректный HTTP-статус"
+        ) from None
+    if status != 302:
+        raise VerificationError(
+            "Контроль Apache/mod_rewrite не прошёл: ожидался HTTP 302, "
+            f"получен HTTP {status}"
+        ) from None
+
+
+def _proxy_control_confirmed(outcome: _ControlOutcome) -> bool:
+    kind, status = outcome
+    if kind == "tls":
+        raise TLSVerificationError(
+            "Контроль frontend proxy: TLS/SNI/leaf-сертификат не прошёл проверку"
+        ) from None
+    if kind == "pre-send":
+        raise VerificationError(
+            "Контроль frontend proxy: HTTPS-запрос не удалось безопасно отправить"
+        ) from None
+    if kind == "post-send":
+        return False
+    if type(status) is not int or not 200 <= status <= 599:
+        raise VerificationError(
+            "Контроль frontend proxy вернул некорректный HTTP-статус"
+        ) from None
+    return status in _PROXY_CONTROL_OK_STATUSES
+
+
 def verify_front_rewrite_control(
     desired: FrontDesired,
     *,
@@ -226,75 +371,69 @@ def verify_front_rewrite_control(
     https_route: TCPRoute | None = None,
     trusted_known_hosts: Path | None = None,
 ) -> None:
-    """Obtain a bounded ``[R=302,L]`` control signal before trying ``[P]``.
+    """Obtain one bounded ``[R=302,L]`` signal after verified rollback."""
 
-    The generated suffix exercises the same XHTTP namespace and suffix-rule
-    shape without changing or revalidating a maximum-length desired path.  Only
-    fixed diagnostics survive, so a transport exception cannot disclose the
-    per-installation path.
+    desired = desired.validate()
+    nonce = secrets.token_hex(16)
+    control_suffix = f"xhttp-setup-control-{nonce}"
+    url = f"https://{desired.domain}{desired.xhttp_path}/{control_suffix}"
+    outcome = _run_control_route(
+        desired,
+        auth=auth,
+        state_dir=state_dir,
+        url=url,
+        nonce=nonce,
+        route_mode="rewrite-control",
+        sftp_route=sftp_route,
+        https_route=https_route,
+        trusted_known_hosts=trusted_known_hosts,
+    )
+    _require_rewrite_control(outcome)
+
+
+def verify_front_proxy_capability(
+    desired: FrontDesired,
+    *,
+    auth: SSHAuth,
+    state_dir: Path,
+    sftp_route: SSHRoute | None = None,
+    https_route: TCPRoute | None = None,
+    trusted_known_hosts: Path | None = None,
+) -> bool:
+    """Check exact rewrite and observe local ``[P,L]`` handling on one secret URL.
+
+    Each observation is interpreted only after the temporary managed block has
+    been restored through the normal CAS/rollback transaction.  ``True`` is a
+    positive 502/503/504 signal; ``False`` is safe but inconclusive and leaves
+    the authoritative TCP/8083 probe to decide.
     """
 
     desired = desired.validate()
     nonce = secrets.token_hex(16)
     control_suffix = f"xhttp-setup-control-{nonce}"
     url = f"https://{desired.domain}{desired.xhttp_path}/{control_suffix}"
-
-    def request_control() -> None:
-        outcome = "http"
-        status: int | None = None
-        try:
-            status = https_status(
-                url,
-                connect_ip=desired.client_connect_ip,
-                pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
-                timeout=_CONTROL_REQUEST_TIMEOUT_SECONDS,
-                route=https_route,
-            )
-        except TLSVerificationError:
-            outcome = "tls"
-        except HTTPSResponseError:
-            outcome = "post-send"
-        except VerificationError:
-            outcome = "pre-send"
-
-        if outcome == "tls":
-            raise TLSVerificationError(
-                "Контроль Apache/mod_rewrite: TLS/SNI/leaf-сертификат "
-                "не прошёл проверку"
-            )
-        if outcome == "post-send":
-            raise VerificationError(
-                "Контроль Apache/mod_rewrite: HTTPS-запрос отправлен, но "
-                "корректный HTTP-ответ не получен"
-            )
-        if outcome == "pre-send":
-            raise VerificationError(
-                "Контроль Apache/mod_rewrite: HTTPS-запрос не удалось "
-                "безопасно отправить"
-            )
-        if type(status) is not int or not 200 <= status <= 599:
-            raise VerificationError(
-                "Контроль Apache/mod_rewrite вернул некорректный HTTP-статус"
-            )
-        if status != 302:
-            raise VerificationError(
-                "Контроль Apache/mod_rewrite не прошёл: ожидался HTTP 302, "
-                f"получен HTTP {status}"
-            )
-
-    route_kwargs: dict[str, object] = {}
-    if sftp_route is not None:
-        route_kwargs["sftp_route"] = sftp_route
-    if https_route is not None:
-        route_kwargs["https_route"] = https_route
-    if trusted_known_hosts is not None:
-        route_kwargs["trusted_known_hosts"] = trusted_known_hosts
-    run_with_temporary_front_route(
+    rewrite_outcome = _run_control_route(
         desired,
         auth=auth,
         state_dir=state_dir,
-        operation=request_control,
+        url=url,
+        nonce=nonce,
         route_mode="rewrite-control",
-        rewrite_control_nonce=nonce,
-        **route_kwargs,
+        sftp_route=sftp_route,
+        https_route=https_route,
+        trusted_known_hosts=trusted_known_hosts,
     )
+    _require_rewrite_control(rewrite_outcome)
+
+    proxy_outcome = _run_control_route(
+        desired,
+        auth=auth,
+        state_dir=state_dir,
+        url=url,
+        nonce=nonce,
+        route_mode="proxy-control",
+        sftp_route=sftp_route,
+        https_route=https_route,
+        trusted_known_hosts=trusted_known_hosts,
+    )
+    return _proxy_control_confirmed(proxy_outcome)

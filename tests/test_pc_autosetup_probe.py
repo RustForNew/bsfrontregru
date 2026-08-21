@@ -20,7 +20,7 @@ from xhttp_setup.pc_autosetup import (
     measure_front_egress,
     parse_front_egress_capture,
 )
-from xhttp_setup.ssh_transport import SSHAuth
+from xhttp_setup.ssh_transport import SSHAuth, SSHRoute, TCPRoute
 
 
 _HOST_FINGERPRINT = "SHA256:" + "A" * 43
@@ -248,9 +248,7 @@ class FrontEgressCaptureTests(unittest.TestCase):
                 "sent request containing https://front.example.org/secret-token"
             )
 
-        with mock.patch(
-            "xhttp_setup.pc_autosetup.https_status", side_effect=status
-        ):
+        with mock.patch("xhttp_setup.pc_autosetup.https_status", side_effect=status):
             outcomes = _trigger_front_requests(_desired())
 
         self.assertEqual(outcomes, {404: 4, 502: 2, None: 2})
@@ -268,9 +266,7 @@ class FrontEgressCaptureTests(unittest.TestCase):
                 "xhttp_setup.pc_autosetup.secrets.token_hex",
                 side_effect=("wave-one", "wave-two", "wave-three"),
             ),
-            mock.patch(
-                "xhttp_setup.pc_autosetup.https_status", side_effect=status
-            ),
+            mock.patch("xhttp_setup.pc_autosetup.https_status", side_effect=status),
         ):
             for _ in range(3):
                 self.assertEqual(_trigger_front_requests(_desired()), {502: 8})
@@ -278,32 +274,26 @@ class FrontEgressCaptureTests(unittest.TestCase):
         self.assertEqual(len(seen_urls), 24)
         for number, nonce in enumerate(("wave-one", "wave-two", "wave-three")):
             wave_urls = seen_urls[number * 8 : (number + 1) * 8]
-            self.assertTrue(
-                all(f"/probe-8083-{nonce}-" in url for url in wave_urls)
-            )
+            self.assertTrue(all(f"/probe-8083-{nonce}-" in url for url in wave_urls))
 
 
 class FrontEgressMeasureTests(unittest.TestCase):
-    def setUp(self):
-        control_patcher = mock.patch(
-            "xhttp_setup.pc_autosetup.verify_front_rewrite_control"
-        )
-        self.rewrite_control = control_patcher.start()
-        self.addCleanup(control_patcher.stop)
-
     def _measure(self, root: Path, *, remove_returncode: int = 0):
         ssh = FakeExitSSH(remove_returncode=remove_returncode)
         secret = "sftp-secret-never-in-command"
         front_auth = SSHAuth("password", password=secret)
-        events: list[str] = []
-
-        self.rewrite_control.side_effect = lambda *_args, **_kwargs: events.append(
-            "rewrite-control"
+        https_route = TCPRoute("127.0.0.1", 44321)
+        sftp_route = SSHRoute(
+            scan=TCPRoute("127.0.0.1", 44322),
+            proxy_command="ssh -W %h:%p bridge",
         )
+        events: list[str] = []
 
         def temporary_route(_desired_value, **kwargs):
             events.append(f"proxy:{_desired_value.exit_port}")
             self.assertIs(kwargs["auth"], front_auth)
+            self.assertIs(kwargs["sftp_route"], sftp_route)
+            self.assertIs(kwargs["https_route"], https_route)
             before = sum(call[0][0] == "sh" for call in ssh.calls)
             result = kwargs["operation"]()
             after = sum(call[0][0] == "sh" for call in ssh.calls)
@@ -327,6 +317,9 @@ class FrontEgressMeasureTests(unittest.TestCase):
                     temporary_front=_desired(),
                     front_auth=front_auth,
                     state_dir=root / "front-probe",
+                    local_proxy_confirmed=False,
+                    sftp_route=sftp_route,
+                    https_route=https_route,
                     trusted_known_hosts=root / "persistent-sftp.known_hosts",
                 )
             finally:
@@ -349,18 +342,10 @@ class FrontEgressMeasureTests(unittest.TestCase):
         self.assertEqual(
             self.last_measure_events,
             [
-                "rewrite-control",
                 "proxy:8083",
                 "proxy:8083",
                 "proxy:8083",
             ],
-        )
-        self.rewrite_control.assert_called_once()
-        control_kwargs = self.rewrite_control.call_args.kwargs
-        self.assertEqual(control_kwargs["state_dir"], Path(temp) / "front-probe")
-        self.assertEqual(
-            control_kwargs["trusted_known_hosts"],
-            Path(temp) / "persistent-sftp.known_hosts",
         )
         self.assertEqual(len(self.last_route_calls), 3)
         self.assertEqual(len(self.last_trigger_calls), 3)
@@ -369,22 +354,24 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 call.kwargs["trusted_known_hosts"],
                 Path(temp) / "persistent-sftp.known_hosts",
             )
+        self.assertTrue(
+            all(
+                call.kwargs["https_route"] == TCPRoute("127.0.0.1", 44321)
+                for call in self.last_trigger_calls
+            )
+        )
         cleanup = [call for call in self.last_ssh.calls if call[0][0] == "rm"]
         self.assertEqual(len(cleanup), 3)
         port_checks = [call for call in self.last_ssh.calls if call[0][0] == "ss"]
         self.assertEqual(len(port_checks), 6)
-        self.assertTrue(
-            all(call[0][-1] == "sport = :8083" for call in port_checks)
-        )
+        self.assertTrue(all(call[0][-1] == "sport = :8083" for call in port_checks))
         self.assertEqual(
             cleanup[0][0],
             ["rm", "-f", "--", "/tmp/xhttp-front-probe.abc123.ready"],
         )
 
     def test_three_samples_must_report_the_same_public_ip(self):
-        ssh = FakeExitSSH(
-            sample_sources=("8.8.8.8", "1.1.1.1", "8.8.8.8")
-        )
+        ssh = FakeExitSSH(sample_sources=("8.8.8.8", "1.1.1.1", "8.8.8.8"))
         with (
             mock.patch("xhttp_setup.pc_autosetup._wait_capture_ready"),
             mock.patch(
@@ -399,6 +386,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
         sampled_ports = [
             int(argv[-1]) for argv, _kwargs in ssh.calls if argv[0] == "sh"
@@ -419,6 +407,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
 
         route.assert_not_called()
@@ -440,6 +429,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
                 require_free_port=False,
             )
 
@@ -472,39 +462,14 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
 
         self.assertEqual(events, ["installed", "rollback"])
-        self.assertEqual(
-            len([call for call in ssh.calls if call[0][0] == "ss"]), 2
-        )
+        self.assertEqual(len([call for call in ssh.calls if call[0][0] == "ss"]), 2)
 
-    def test_rewrite_control_failure_stops_before_any_proxy_probe(self):
-        ssh = FakeExitSSH()
-        self.rewrite_control.side_effect = VerificationError(
-            "контрольный HTTP-статус не совпал"
-        )
-        with (
-            mock.patch(
-                "xhttp_setup.pc_autosetup.run_with_temporary_front_route"
-            ) as route,
-            mock.patch("xhttp_setup.pc_autosetup._trigger_front_requests") as trigger,
-            self.assertRaisesRegex(VerificationError, "контрольный HTTP-статус"),
-        ):
-            measure_front_egress(
-                ssh=ssh,
-                temporary_front=_desired(),
-                front_auth=SSHAuth("password", password="secret"),
-                state_dir=Path("/tmp/front-probe"),
-            )
-
-        route.assert_not_called()
-        trigger.assert_not_called()
-        self.assertFalse(any(argv[0] == "sh" for argv, _kwargs in ssh.calls))
-
-    def test_zero_syn_with_all_404_reports_safe_route_diagnosis(self):
+    def _zero_syn_message(self, *, local_proxy_confirmed: bool) -> str:
         ssh = FakeExitSSH(capture="")
-        secret_path = _desired().xhttp_path
         with (
             mock.patch("xhttp_setup.pc_autosetup._wait_capture_ready"),
             mock.patch(
@@ -522,20 +487,38 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=local_proxy_confirmed,
             )
+        return str(caught.exception)
 
-        message = str(caught.exception)
+    def test_zero_syn_diagnosis_does_not_overclaim_unconfirmed_local_proxy(self):
+        message = self._zero_syn_message(local_proxy_confirmed=False)
         self.assertIn("получено 0", message)
         self.assertIn("HTTP 404 = 8", message)
         self.assertIn("не является свидетельством блокировки cloud firewall", message)
-        self.assertIn("[P]/mod_proxy_http не подтверждён", message)
-        self.assertNotIn(secret_path, message)
+        self.assertIn(
+            "Локальная обработка Apache RewriteRule [P,L] осталась неподтверждённой",
+            message,
+        )
+        self.assertIn("конкретному адресу TCP/8083", message)
+        self.assertIn("egress-политика провайдера", message)
+        self.assertIn("внешний firewall/маршрут", message)
+        self.assertNotIn(
+            "Локальная обработка Apache RewriteRule [P,L] подтверждена", message
+        )
+        self.assertNotIn(_desired().xhttp_path, message)
         self.assertNotIn("https://", message)
 
-    def test_parse_failure_reports_mixed_histogram_without_exception_details(self):
-        ssh = FakeExitSSH(
-            capture=_capture(("8.8.8.8", 41001), destination_port=25433)
+    def test_zero_syn_diagnosis_reports_confirmed_local_proxy_when_proven(self):
+        message = self._zero_syn_message(local_proxy_confirmed=True)
+        self.assertIn(
+            "Локальная обработка Apache RewriteRule [P,L] подтверждена", message
         )
+        self.assertNotIn("осталась неподтверждённой", message)
+        self.assertNotIn(_desired().xhttp_path, message)
+
+    def test_parse_failure_reports_mixed_histogram_without_exception_details(self):
+        ssh = FakeExitSSH(capture=_capture(("8.8.8.8", 41001), destination_port=25433))
         with (
             mock.patch("xhttp_setup.pc_autosetup._wait_capture_ready"),
             mock.patch(
@@ -553,6 +536,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
 
         message = str(caught.exception)
@@ -560,9 +544,10 @@ class FrontEgressMeasureTests(unittest.TestCase):
         self.assertIn("HTTP 502 = 2", message)
         self.assertIn("без корректного HTTP-статуса = 3", message)
         self.assertIn(
-            "не классифицированы автоматически как блокировка cloud firewall",
+            "Локальная обработка Apache RewriteRule [P,L] осталась неподтверждённой",
             message,
         )
+        self.assertIn("не является свидетельством блокировки cloud firewall", message)
         self.assertNotIn(_desired().xhttp_path, message)
 
     def test_saturated_capture_is_rejected_and_route_operation_rolls_back(self):
@@ -590,6 +575,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
         self.assertEqual(events, ["installed:8083", "rollback:8083"])
 
@@ -621,6 +607,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
         self.assertEqual(events, ["installed", "rollback"])
 
@@ -631,6 +618,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(exit_port=25432),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
 
     def test_marker_cleanup_failure_is_propagated(self):
@@ -672,6 +660,7 @@ class FrontEgressMeasureTests(unittest.TestCase):
                 temporary_front=_desired(),
                 front_auth=SSHAuth("password", password="secret"),
                 state_dir=Path("/tmp/front-probe"),
+                local_proxy_confirmed=False,
             )
 
         cleanup = [call for call in ssh.calls if call[0][0] == "rm"]

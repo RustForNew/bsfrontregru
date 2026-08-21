@@ -103,6 +103,8 @@ class PcPrepareTests(unittest.TestCase):
         inspect_sequence=None,
         phase_callback=None,
         front_egress_error=None,
+        front_capability_error=None,
+        front_capability_result=True,
         pending_desired=None,
     ):
         events: list[str] = []
@@ -155,10 +157,17 @@ class PcPrepareTests(unittest.TestCase):
             events.append("front-egress")
             self.assertEqual(_kwargs["temporary_front"].exit_port, 8083)
             self.assertIs(_kwargs["require_free_port"], resume is None)
+            self.assertIs(_kwargs["local_proxy_confirmed"], front_capability_result)
             self.assertNotIn("probe_ports", _kwargs)
             if front_egress_error is not None:
                 raise front_egress_error
             return "9.9.9.9"
+
+        def front_capability(_desired, **_kwargs):
+            events.append("front-capability")
+            if front_capability_error is not None:
+                raise front_capability_error
+            return front_capability_result
 
         with (
             patch(
@@ -199,6 +208,10 @@ class PcPrepareTests(unittest.TestCase):
                 "xhttp_setup.pc_autosetup.measure_front_egress",
                 side_effect=front_egress,
             ),
+            patch(
+                "xhttp_setup.pc_autosetup.verify_front_proxy_capability",
+                side_effect=front_capability,
+            ),
         ):
             result = prepare_pc_install(
                 inputs(),
@@ -229,8 +242,10 @@ class PcPrepareTests(unittest.TestCase):
             self.assertGreater(events.index(frontend_preflight), first_close)
             self.assertLess(events.index(frontend_preflight), second_open)
         mutation = events.index("prepare-exit")
-        for read_only in ("site", "dns", "sftp", "tls"):
-            self.assertLess(events.index(read_only), mutation)
+        for pre_exit_step in ("site", "dns", "sftp", "tls", "front-capability"):
+            self.assertLess(events.index(pre_exit_step), mutation)
+        self.assertLess(events.index("front-capability"), events.index("prepare-exit"))
+        self.assertLess(events.index("prepare-exit"), events.index("front-egress"))
         self.assertEqual(result.desired_exit.front_egress_ip, "9.9.9.9")
         self.assertEqual(result.desired_front.placeholder_mode, "keep")
         self.assertEqual(result.desired_front.client_connect_ip, "192.0.2.30")
@@ -251,6 +266,34 @@ class PcPrepareTests(unittest.TestCase):
         self.assertEqual(result.desired_front.exit_port, 8083)
         self.assertIn("front-egress", events)
         self.assertEqual(legacy_contents, "not valid legacy state\n")
+
+    def test_unconfirmed_proxy_observations_reach_prepare_and_8083_measure(self):
+        for observation in ("HTTP 404", "HTTP 500", "post-send"):
+            phases = []
+            with (
+                self.subTest(observation=observation),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                _result, events, prepare = self._run(
+                    Path(temp),
+                    phase_callback=phases.append,
+                    front_capability_result=False,
+                )
+
+            self.assertLess(
+                events.index("front-capability"), events.index("prepare-exit")
+            )
+            self.assertLess(events.index("prepare-exit"), events.index("front-egress"))
+            prepare.assert_called_once()
+            self.assertEqual(
+                phases,
+                [
+                    "front_probe_in_progress",
+                    "preparing",
+                    "front_probe_in_progress",
+                    "preparing",
+                ],
+            )
 
     def test_missing_site_aborts_before_any_exit_mutation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -806,6 +849,26 @@ class PcPrepareTests(unittest.TestCase):
                     Path(temp),
                     phase_callback=phases.append,
                     front_egress_error=FrontRollbackError("rollback неполон"),
+                )
+        self.assertEqual(
+            phases,
+            [
+                "front_probe_in_progress",
+                "preparing",
+                "front_probe_in_progress",
+            ],
+        )
+
+    def test_capability_rollback_failure_stops_before_exit_prepare(self):
+        from xhttp_setup.front import FrontRollbackError
+
+        phases = []
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(FrontRollbackError):
+                self._run(
+                    Path(temp),
+                    phase_callback=phases.append,
+                    front_capability_error=FrontRollbackError("rollback неполон"),
                 )
         self.assertEqual(phases, ["front_probe_in_progress"])
 

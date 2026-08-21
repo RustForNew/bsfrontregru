@@ -258,9 +258,7 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
         stack.enter_context(mock.patch("xhttp_setup.cli._write_pc_phase"))
         stack.enter_context(mock.patch("xhttp_setup.cli.clear_pending_pc_exit"))
         stack.enter_context(mock.patch("xhttp_setup.cli.write_pending_pc_exit"))
-        stack.enter_context(
-            mock.patch("xhttp_setup.cli._confirm_pc_provider_firewall")
-        )
+        stack.enter_context(mock.patch("xhttp_setup.cli._confirm_pc_provider_firewall"))
         return stack.enter_context(mock.patch("xhttp_setup.cli.apply_pc_exit"))
 
     def test_bridge_opens_before_prepare_routes_final_apply_and_closes_on_success(self):
@@ -504,9 +502,7 @@ class PcBridgeOrchestrationTests(unittest.TestCase):
                     return_value=prepared,
                 )
             )
-            stack.enter_context(
-                mock.patch("xhttp_setup.cli._apply_front_and_issue")
-            )
+            stack.enter_context(mock.patch("xhttp_setup.cli._apply_front_and_issue"))
             stack.enter_context(redirect_stdout(StringIO()))
             stack.enter_context(redirect_stderr(StringIO()))
             with self.assertRaises(InstallerError) as raised:
@@ -647,6 +643,13 @@ class PcBridgePreparationTests(unittest.TestCase):
             probe_calls.append(kwargs)
             return "9.9.9.9"
 
+        capability_calls = []
+
+        def front_capability(_desired, **kwargs):
+            events.append("front-capability")
+            capability_calls.append(kwargs)
+            return True
+
         stdout = StringIO()
         stderr = StringIO()
         prepare_exit_mock = mock.Mock(side_effect=prepare_exit)
@@ -721,6 +724,12 @@ class PcBridgePreparationTests(unittest.TestCase):
                     front_probe_mock,
                 )
             )
+            stack.enter_context(
+                mock.patch(
+                    "xhttp_setup.pc_autosetup.verify_front_proxy_capability",
+                    side_effect=front_capability,
+                )
+            )
             stack.enter_context(redirect_stdout(stdout))
             stack.enter_context(redirect_stderr(stderr))
             try:
@@ -745,6 +754,7 @@ class PcBridgePreparationTests(unittest.TestCase):
             "panel_calls": panel_calls,
             "tls_calls": tls_calls,
             "probe_calls": probe_calls,
+            "capability_calls": capability_calls,
             "prepare_exit": prepare_exit_mock,
             "measure_exit": measure_exit,
             "front_probe": front_probe_mock,
@@ -776,8 +786,11 @@ class PcBridgePreparationTests(unittest.TestCase):
         self.assertIs(state["panel_calls"][0]["route"], access.panel_route)
         self.assertIs(state["sftp_constructor_calls"][0]["route"], access.sftp_route)
         self.assertIs(state["tls_calls"][0][1]["route"], access.front_route)
+        self.assertIs(state["capability_calls"][0]["sftp_route"], access.sftp_route)
+        self.assertIs(state["capability_calls"][0]["https_route"], access.front_route)
         self.assertIs(state["probe_calls"][0]["sftp_route"], access.sftp_route)
         self.assertIs(state["probe_calls"][0]["https_route"], access.front_route)
+        self.assertIs(state["probe_calls"][0]["local_proxy_confirmed"], True)
         self.assertEqual(
             state["probe_calls"][0]["trusted_known_hosts"],
             result.sftp_known_hosts,
@@ -786,15 +799,17 @@ class PcBridgePreparationTests(unittest.TestCase):
         self.assertEqual(result.sftp_known_hosts, Path(temp) / "sftp.known_hosts")
         main_session = state["exit_ssh"].sessions[1]
         self.assertIs(state["probe_calls"][0]["ssh"], main_session)
-        self.assertEqual(
-            state["probe_calls"][0]["temporary_front"].exit_port, 8083
-        )
+        self.assertEqual(state["probe_calls"][0]["temporary_front"].exit_port, 8083)
         self.assertTrue(state["probe_calls"][0]["require_free_port"])
         self.assertNotIn("probe_ports", state["probe_calls"][0])
         self.assertIs(state["prepare_exit"].call_args.args[0], main_session)
         self.assertIs(state["measure_exit"].call_args.args[0], main_session)
         self.assertLess(
             state["events"].index("tls"), state["events"].index("prepare-exit")
+        )
+        self.assertLess(
+            state["events"].index("front-capability"),
+            state["events"].index("prepare-exit"),
         )
         self.assertLess(
             state["events"].index("prepare-exit"),

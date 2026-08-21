@@ -27,7 +27,7 @@ from .credential_parser import validate_regru_panel_url
 from .front import FrontRollbackError, https_status
 from .front_probe import (
     run_with_temporary_front_route,
-    verify_front_rewrite_control,
+    verify_front_proxy_capability,
 )
 from .ispmanager import (
     ISPmanagerAuthenticationError,
@@ -849,22 +849,36 @@ def _safe_front_request_outcome_summary(
 def _front_capture_failure_message(
     error: InstallerError,
     outcomes: dict[int | None, int] | None,
+    *,
+    local_proxy_confirmed: bool,
 ) -> str:
     summary, all_not_found = _safe_front_request_outcome_summary(outcomes)
+    if local_proxy_confirmed:
+        local_capability = (
+            "Локальная обработка Apache RewriteRule [P,L] подтверждена "
+            "отдельной canary-проверкой"
+        )
+    else:
+        local_capability = (
+            "Локальная обработка Apache RewriteRule [P,L] осталась "
+            "неподтверждённой: результат отдельной canary-проверки был "
+            "допустимым, но неоднозначным"
+        )
+    unconfirmed = (
+        "Доступ к конкретному адресу TCP/8083, egress-политика провайдера "
+        "и внешний firewall/маршрут для этого назначения не подтверждены"
+    )
     if all_not_found:
         diagnosis = (
-            "Контрольный запрос с временным [R=302,L] под тем же XHTTP path "
-            "получил ожидаемый HTTP 302, но все запросы через [P] получили "
-            "HTTP 404 и не создали видимый SYN. Reverse proxy "
-            "[P]/mod_proxy_http не подтверждён: он может быть отключён или "
-            "отфильтрован хостингом. Такой исход не является свидетельством "
-            "блокировки cloud firewall"
+            f"Все запросы к временному маршруту TCP/8083 получили HTTP 404 "
+            f"и не создали видимый SYN. {local_capability}. {unconfirmed}. Такой "
+            "исход не является свидетельством блокировки cloud firewall"
         )
     else:
         diagnosis = (
-            "Отсутствие или неоднозначность SYN не классифицированы автоматически "
-            "как блокировка cloud firewall; отдельно проверьте временный маршрут "
-            "Apache и доступность TCP/8083 во внешнем firewall"
+            f"{local_capability}. Отсутствие или неоднозначность SYN не "
+            f"подтверждают доступ к назначению. {unconfirmed}. Такой исход "
+            "не является свидетельством блокировки cloud firewall"
         )
     return f"{error}. {summary}. {diagnosis}"
 
@@ -913,6 +927,7 @@ def measure_front_egress(
     temporary_front: FrontDesired,
     front_auth: SSHAuth,
     state_dir: Path,
+    local_proxy_confirmed: bool,
     require_free_port: bool = True,
     sftp_route: SSHRoute | None = None,
     https_route: TCPRoute | None = None,
@@ -924,6 +939,8 @@ def measure_front_egress(
     temporary_front = temporary_front.validate()
     if temporary_front.exit_port != 8083:
         raise InstallerError("Frontend egress probe должен использовать TCP/8083")
+    if type(local_proxy_confirmed) is not bool:
+        raise TypeError("local_proxy_confirmed must be bool")
     if type(require_free_port) is not bool:
         raise TypeError("require_free_port must be bool")
     available = ssh.command(["command", "-v", "tcpdump"], check=False, timeout=20)
@@ -931,17 +948,6 @@ def measure_front_egress(
         raise InstallerError(
             "На exit отсутствует tcpdump после автоматической подготовки"
         )
-
-    if progress is not None:
-        progress("Проверяю контрольный RewriteRule Apache без reverse proxy")
-    verify_front_rewrite_control(
-        temporary_front,
-        auth=front_auth,
-        state_dir=state_dir,
-        sftp_route=sftp_route,
-        https_route=https_route,
-        trusted_known_hosts=trusted_known_hosts,
-    )
 
     samples: list[str] = []
     for number in range(1, _PROBE_SAMPLE_COUNT + 1):
@@ -955,6 +961,7 @@ def measure_front_egress(
             temporary_front=temporary_front,
             front_auth=front_auth,
             state_dir=state_dir,
+            local_proxy_confirmed=local_proxy_confirmed,
             require_free_port=require_free_port,
             sftp_route=sftp_route,
             https_route=https_route,
@@ -975,15 +982,14 @@ def _measure_front_egress_sample(
     temporary_front: FrontDesired,
     front_auth: SSHAuth,
     state_dir: Path,
+    local_proxy_confirmed: bool,
     require_free_port: bool,
     sftp_route: SSHRoute | None = None,
     https_route: TCPRoute | None = None,
     trusted_known_hosts: Path | None = None,
 ) -> str:
     temporary_front = temporary_front.validate()
-    if require_free_port and not _remote_port_is_free(
-        ssh, temporary_front.exit_port
-    ):
+    if require_free_port and not _remote_port_is_free(ssh, temporary_front.exit_port):
         raise InstallerError(
             "TCP/8083 занят во время frontend probe; продолжение разрешено только "
             "для подтверждённого managed exit"
@@ -1061,9 +1067,7 @@ def _measure_front_egress_sample(
         operation=capture_installed_route,
         **route_kwargs,
     )
-    if require_free_port and not _remote_port_is_free(
-        ssh, temporary_front.exit_port
-    ):
+    if require_free_port and not _remote_port_is_free(ssh, temporary_front.exit_port):
         raise VerificationError(
             "TCP/8083 стал занят во время frontend probe; результат не принят"
         )
@@ -1082,7 +1086,11 @@ def _measure_front_egress_sample(
         )
     except InstallerError as exc:
         raise VerificationError(
-            _front_capture_failure_message(exc, request_outcomes)
+            _front_capture_failure_message(
+                exc,
+                request_outcomes,
+                local_proxy_confirmed=local_proxy_confirmed,
+            )
         ) from None
 
 
@@ -1367,6 +1375,7 @@ def prepare_pc_install(
             raise InstallerError(
                 "PC phase требует восстановить прежний exit, но точного recovery state нет"
             )
+        expected_egress: str | None = None
         if resume is not None:
             step("Безопасно продолжаю ранее подтверждённый managed exit")
             expected_egress = resume.desired.expected_egress_ip
@@ -1387,9 +1396,6 @@ def prepare_pc_install(
                 raise InstallerError(
                     "TCP/8083 занят: это не подтверждённый managed exit текущей установки"
                 )
-            step("Автоматически готовлю чистый exit и UFW")
-            prepare_remote_exit(exit_ssh, ssh_port=exit_target.port)
-            expected_egress = measure_remote_exit_egress(exit_ssh)
             xhttp_path = "/api/" + secrets.token_urlsafe(24)
 
         temporary_front = FrontDesired(
@@ -1409,20 +1415,58 @@ def prepare_pc_install(
             pinned_peer_cert_sha256=cert_pin,
         ).validate()
 
+        probe_kwargs: dict[str, object] = {}
+        if sftp_route is not None:
+            probe_kwargs["sftp_route"] = sftp_route
+        if front_route is not None:
+            probe_kwargs["https_route"] = front_route
+
+        step("Проверяю RewriteRule Apache и поддержку frontend proxy")
+        if phase_callback is not None:
+            phase_callback("front_probe_in_progress")
+        try:
+            local_proxy_confirmed = verify_front_proxy_capability(
+                temporary_front,
+                auth=front_auth,
+                state_dir=output / "front-egress-probe",
+                trusted_known_hosts=sftp_known_hosts,
+                **probe_kwargs,
+            )
+            if type(local_proxy_confirmed) is not bool:
+                raise VerificationError(
+                    "Контроль frontend proxy вернул некорректный результат"
+                )
+        except BaseException as exc:
+            if phase_callback is not None and not _front_rollback_incomplete(exc):
+                phase_callback("preparing")
+            raise
+        if phase_callback is not None:
+            phase_callback("preparing")
+        if local_proxy_confirmed:
+            step("Локальная обработка Apache RewriteRule [P,L] подтверждена")
+        else:
+            step(
+                "Локальная проверка Apache RewriteRule [P,L] неоднозначна; "
+                "продолжаю проверку через TCP/8083"
+            )
+
+        if resume is None and pending_desired is None:
+            step("Автоматически готовлю чистый exit и UFW")
+            prepare_remote_exit(exit_ssh, ssh_port=exit_target.port)
+            expected_egress = measure_remote_exit_egress(exit_ssh)
+        if expected_egress is None:  # pragma: no cover - branch invariant
+            raise InstallerError("Не определён ожидаемый исходящий IPv4 exit")
+
         step("Измеряю фактический исходящий IP Apache напрямую через TCP/8083")
         if phase_callback is not None:
             phase_callback("front_probe_in_progress")
         try:
-            probe_kwargs: dict[str, object] = {}
-            if sftp_route is not None:
-                probe_kwargs["sftp_route"] = sftp_route
-            if front_route is not None:
-                probe_kwargs["https_route"] = front_route
             front_egress = measure_front_egress(
                 ssh=exit_ssh,
                 temporary_front=temporary_front,
                 front_auth=front_auth,
                 state_dir=output / "front-egress-probe",
+                local_proxy_confirmed=local_proxy_confirmed,
                 require_free_port=(resume is None),
                 trusted_known_hosts=sftp_known_hosts,
                 progress=step,

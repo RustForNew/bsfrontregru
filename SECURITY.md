@@ -59,9 +59,10 @@
   errors never trigger credential guessing. Reflected remote errors are
   redacted without a secret-bearing exception chain.
 - PC mode uses one SFTP authentication for document-root discovery, one for
-  the independently rolled-back `302` rewrite control, one for each of three
-  independently rolled-back `[P]` frontend egress samples, and one for the final
-  frontend transaction through post-apply E2E and any rollback. It never opens
+  each of the independently rolled-back `302` and local `[P]` controls, one for
+  each of three independently rolled-back `[P]` frontend egress samples, and one
+  for the final frontend transaction through post-apply E2E and any rollback. It
+  never opens
   a new authenticated SSH master for every individual file command. Long remote
   exit/front apply phases close the upload session and open a separate bounded
   download session afterwards instead of keeping one idle for up to 900 seconds.
@@ -85,7 +86,8 @@
   consumed by the same FIFO-backed askpass mechanism and is not stored in argv,
   environment values, regular files or recovery state.
 - When selected, loopback-only forwards carry ISPmanager HTTPS, SFTP and its
-  first-use keyscan, frontend TLS, temporary-probe HTTPS and final E2E frontend TCP. ISPmanager and
+  first-use keyscan, frontend TLS, both local canary requests, all three
+  TCP/8083 probe waves and final E2E frontend TCP. ISPmanager and
   frontend TLS retain their logical hostname/SNI checks, while SFTP remains a
   nested host-key-checked SSH connection. Exit SSH is always direct from the
   controller and DNS resolution remains local. The bridge session is closed at
@@ -157,6 +159,19 @@
   `filter` table managed by `iptables-nft`, the notice set must exactly match the
   validated stdout table set, and duplicates are rejected. Only presentation
   case, whitespace and punctuation may vary; mixed or unknown diagnostics fail.
+- Before any new mutation of a fresh exit, PC mode exercises one secret URL in
+  two separate `.htaccess` CAS transactions. The exact `[R=302,L]` route must
+  return HTTP 302; after its byte-exact rollback, a literal `[P,L]` route to
+  `http://127.0.0.1:9/<nonce>` is observed. HTTP 502, 503 or 504 is a strong
+  positive; another bounded HTTP or post-send outcome remains unconfirmed and
+  proceeds to the authoritative three-wave TCP/8083 capture. The second result
+  is classified only after its own byte-exact rollback. TLS/pre-send failure or
+  incomplete rollback stops before fresh exit/UFW preparation.
+  The upstream authority and path are generated literals: no
+  request data, backreference, query or user input can select a proxy target.
+  This paired gate checks bounded local Apache/mod_rewrite/`[P]` handling; it
+  neither enables PHP/FastCGI, `mod_proxy` or `mod_proxy_http`, nor proves
+  external egress or a complete live E2E.
 - Frontend egress discovery uses three separate, deadline-complete captures on
   the actual final backend TCP/8083. Every HTTPS wave has a fresh CSPRNG suffix,
   every capture must contain at least three independent SYN source endpoints,
