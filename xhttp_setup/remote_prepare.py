@@ -14,8 +14,10 @@ import shlex
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Protocol, Sequence
 
+from .command_output import english_words, parse_ufw_status
 from .errors import InstallerError, VerificationError
 from .ssh_transport import SSHCommand
 from .validate import validate_port
@@ -64,15 +66,15 @@ _NFT_UFW_DISPATCH = re.compile(
 )
 _NFT_COUNTER = re.compile(r"\bcounter packets [0-9]+ bytes [0-9]+\b")
 _IPTABLES_COUNTER = re.compile(r"\[[0-9]+:[0-9]+\]")
-_UFW_SHOW_ADDED_HEADER = (
-    "Added user rules (see 'ufw status' for running firewall):"
-)
+_UFW_SHOW_ADDED_HEADER = "Added user rules (see 'ufw status' for running firewall):"
 _UFW_SHOW_ADDED_EMPTY = "(None)"
-_NFTABLES_MISSING_UNIT_DIAGNOSTICS = frozenset(
+_NFTABLES_MISSING_UNIT_DIAGNOSTIC_WORDS = frozenset(
     {
-        "Failed to get unit file state for nftables.service: "
-        "No such file or directory",
-        "Unit file nftables.service does not exist.",
+        english_words(
+            "Failed to get unit file state for nftables.service: "
+            "No such file or directory"
+        ),
+        english_words("Unit file nftables.service does not exist."),
     }
 )
 
@@ -175,7 +177,9 @@ def _require_systemd(ssh: SSHCommand) -> None:
                 )
             time.sleep(_SYSTEMD_POLL_SECONDS)
             continue
-        raise InstallerError("systemd удалённого сервера не находится в рабочем состоянии")
+        raise InstallerError(
+            "systemd удалённого сервера не находится в рабочем состоянии"
+        )
 
 
 def _parse_os_release(payload: str) -> dict[str, str]:
@@ -209,9 +213,7 @@ def _require_supported_os(ssh: SSHCommand) -> tuple[str, str]:
     version = _version_tuple(version_id)
     minimum = {"debian": (12,), "ubuntu": (22, 4)}.get(os_id)
     if minimum is None or version < minimum:
-        raise InstallerError(
-            "Автоподготовка поддерживает Debian 12+ или Ubuntu 22.04+"
-        )
+        raise InstallerError("Автоподготовка поддерживает Debian 12+ или Ubuntu 22.04+")
     return os_id, version_id
 
 
@@ -231,7 +233,11 @@ def _reject_container_runtime(ssh: SSHCommand) -> None:
     # systemctl returns 1, with no output, when none of the exact patterns
     # matches a unit file.  That is the expected clean-host result, not a
     # failure to perform the check.
-    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+    if (
+        result.returncode == 1
+        and not result.stdout.strip()
+        and not result.stderr.strip()
+    ):
         return
     if result.returncode != 0:
         raise InstallerError(
@@ -244,7 +250,9 @@ def _reject_container_runtime(ssh: SSHCommand) -> None:
         )
     expected = {"docker.service", "docker.socket", "containerd.service"}
     lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
-    if not lines or any(len(fields) < 2 or fields[0] not in expected for fields in lines):
+    if not lines or any(
+        len(fields) < 2 or fields[0] not in expected for fields in lines
+    ):
         raise VerificationError(
             "systemctl вернул неоднозначный список Docker/containerd unit-файлов"
         )
@@ -255,19 +263,15 @@ def _reject_container_runtime(ssh: SSHCommand) -> None:
         )
 
 
-def _systemd_unit_state(
-    ssh: SSHCommand, operation: str, unit: str
-) -> tuple[int, str]:
+def _systemd_unit_state(ssh: SSHCommand, operation: str, unit: str) -> tuple[int, str]:
     result = _invoke(ssh, ["systemctl", operation, unit])
     state = result.stdout.strip().lower()
-    if "\n" in state or "\r" in state:
+    if result.stderr.strip() or "\n" in state or "\r" in state:
         raise VerificationError(f"systemctl вернул неоднозначное состояние {unit}")
     return result.returncode, state
 
 
-def _nftables_unit_state(
-    ssh: SSHCommand, operation: str
-) -> tuple[int, str, str]:
+def _nftables_unit_state(ssh: SSHCommand, operation: str) -> tuple[int, str, str]:
     result = _invoke(
         ssh,
         [
@@ -295,15 +299,18 @@ def _reject_standalone_nftables_service(ssh: SSHCommand) -> None:
     # systemd releases differ here: is-active reports an inactive or missing
     # unit with 1, 3, or 4.  The textual state is the stable part of the
     # interface; a zero exit status is never accepted for these states.
-    if active_diagnostic or active_code not in {1, 3, 4} or active not in {
-        "inactive",
-        "unknown",
-        "not-found",
-    }:
+    if (
+        active_diagnostic
+        or active_code not in {1, 3, 4}
+        or active
+        not in {
+            "inactive",
+            "unknown",
+            "not-found",
+        }
+    ):
         raise InstallerError("Не удалось однозначно проверить nftables.service")
-    enabled_code, enabled, enabled_diagnostic = _nftables_unit_state(
-        ssh, "is-enabled"
-    )
+    enabled_code, enabled, enabled_diagnostic = _nftables_unit_state(ssh, "is-enabled")
     if enabled_code == 0 or enabled in {"enabled", "enabled-runtime", "static"}:
         raise InstallerError("Обнаружен enabled nftables.service")
     disabled = (
@@ -314,7 +321,7 @@ def _reject_standalone_nftables_service(ssh: SSHCommand) -> None:
     missing = (
         enabled_code == 1
         and not enabled
-        and enabled_diagnostic in _NFTABLES_MISSING_UNIT_DIAGNOSTICS
+        and english_words(enabled_diagnostic) in _NFTABLES_MISSING_UNIT_DIAGNOSTIC_WORDS
     )
     if not (disabled or missing):
         raise InstallerError(
@@ -556,12 +563,12 @@ def _ufw_status(ssh: SSHCommand) -> bool:
         ["env", "LC_ALL=C", "LANG=C", "ufw", "status", "numbered"],
         operation="Не удалось прочитать состояние UFW",
     )
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if lines and lines[0] == "Status: active":
-        return True
-    if lines == ["Status: inactive"]:
-        return False
-    raise VerificationError("UFW вернул неоднозначное состояние")
+    if result.stderr.strip():
+        raise VerificationError("ufw status numbered вернул предупреждение")
+    try:
+        return parse_ufw_status(result.stdout)
+    except ValueError as exc:
+        raise VerificationError("UFW вернул неоднозначное состояние") from exc
 
 
 def _inspect_firewall(
@@ -625,13 +632,22 @@ def _inspect_firewall(
             "/proc/net/ip_tables_names",
             "/proc/net/ip6_tables_names",
         ):
+            exists = _invoke(ssh, ["test", "-e", proc_path])
+            if (
+                exists.returncode not in {0, 1}
+                or exists.stdout.strip()
+                or exists.stderr.strip()
+            ):
+                raise InstallerError("Не удалось проверить legacy iptables tables")
+            if exists.returncode == 1:
+                continue
             result = _invoke(ssh, ["cat", proc_path])
-            if result.returncode == 0 and result.stdout.strip():
+            if result.returncode != 0 or result.stderr.strip():
+                raise InstallerError("Не удалось проверить legacy iptables tables")
+            if result.stdout.strip():
                 raise InstallerError(
                     "Обнаружены legacy iptables tables без безопасного инспектора"
                 )
-            if result.returncode not in {0, 1}:
-                raise InstallerError("Не удалось проверить legacy iptables tables")
     return _FirewallSnapshot(
         nft=_canonical_nft(nft_payload) if nft_payload is not None else None,
         iptables_v4=(
@@ -679,24 +695,226 @@ def _verify_ufw_package_integrity(ssh: SSHCommand) -> None:
     if result.returncode != 0 or result.stderr.strip():
         raise InstallerError("Не удалось проверить package-owned файлы UFW")
     # Minimal cloud images commonly remove only documentation and man pages.
-    # Any changed/missing executable or configuration path remains fatal.
-    harmless_missing_prefixes = (
-        "missing     /usr/share/doc/ufw/",
-        "missing     /usr/share/man/",
+    # dpkg separates the status and path with padding whose width is not an API.
+    # Parse that separator, but keep the status and normalized path allow-list
+    # exact so a changed/missing executable or configuration remains fatal.
+    harmless_missing_roots = (
+        PurePosixPath("/usr/share/doc/ufw"),
+        PurePosixPath("/usr/share/man"),
     )
+
+    def harmless_missing(line: str) -> bool:
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2 or fields[0] != "missing":
+            return False
+        path = PurePosixPath(fields[1])
+        if not path.is_absolute() or ".." in path.parts:
+            return False
+        return any(root in path.parents for root in harmless_missing_roots)
+
     unexpected = [
         line.strip()
         for line in result.stdout.splitlines()
-        if line.strip()
-        and not any(
-            line.startswith(prefix) for prefix in harmless_missing_prefixes
-        )
+        if line.strip() and not harmless_missing(line.strip())
     ]
     if unexpected:
         raise InstallerError("Package-owned UFW configuration изменена")
 
 
-def _require_empty_ufw_user_rule_section(ssh: SSHCommand, path: str) -> None:
+def _official_empty_ufw_rewrites(prefix: str) -> frozenset[tuple[str, ...]]:
+    """Return the complete empty-rule files emitted by upstream UFW 0.36.x."""
+
+    limit = "-m limit --limit 3/min --limit-burst 10"
+
+    def logging_rule(
+        chain: str,
+        *,
+        insert: bool = False,
+        prefix_text: str | None = None,
+        before_log: str = "",
+        after_log: str = "",
+        target: str = "LOG",
+    ) -> str:
+        operation = "-I" if insert else "-A"
+        fields = [operation, chain]
+        if before_log:
+            fields.append(before_log)
+        fields.extend(["-j", target])
+        if prefix_text is not None:
+            fields.extend(["--log-prefix", f'"[{prefix_text}] "'])
+        if after_log:
+            fields.append(after_log)
+        return " ".join(fields)
+
+    after_input = f"{prefix}-after-logging-input"
+    after_output = f"{prefix}-after-logging-output"
+    after_forward = f"{prefix}-after-logging-forward"
+    logging_deny = f"{prefix}-logging-deny"
+    logging_allow = f"{prefix}-logging-allow"
+    before = tuple(
+        f"{prefix}-before-logging-{direction}"
+        for direction in ("input", "output", "forward")
+    )
+
+    logging_by_level = {
+        "off": tuple(
+            f"-I {prefix}-user-logging-{direction} -j RETURN"
+            for direction in ("input", "output", "forward")
+        ),
+        "low": (
+            logging_rule(after_input, prefix_text="UFW BLOCK", after_log=limit),
+            logging_rule(after_forward, prefix_text="UFW BLOCK", after_log=limit),
+            logging_rule(
+                logging_deny,
+                insert=True,
+                before_log="-m conntrack --ctstate INVALID",
+                target="RETURN",
+                after_log=limit,
+            ),
+            logging_rule(logging_deny, prefix_text="UFW BLOCK", after_log=limit),
+            logging_rule(logging_allow, prefix_text="UFW ALLOW", after_log=limit),
+        ),
+        "medium": (
+            logging_rule(after_input, prefix_text="UFW BLOCK", after_log=limit),
+            logging_rule(after_output, prefix_text="UFW ALLOW", after_log=limit),
+            logging_rule(after_forward, prefix_text="UFW BLOCK", after_log=limit),
+            logging_rule(
+                logging_deny,
+                before_log="-m conntrack --ctstate INVALID",
+                prefix_text="UFW AUDIT INVALID",
+                after_log=limit,
+            ),
+            logging_rule(logging_deny, prefix_text="UFW BLOCK", after_log=limit),
+            logging_rule(logging_allow, prefix_text="UFW ALLOW", after_log=limit),
+            *(
+                logging_rule(
+                    chain,
+                    insert=True,
+                    prefix_text="UFW AUDIT",
+                    after_log=f"-m conntrack --ctstate NEW {limit}",
+                )
+                for chain in before
+            ),
+        ),
+        "high": (
+            logging_rule(after_input, prefix_text="UFW BLOCK"),
+            logging_rule(after_output, prefix_text="UFW ALLOW"),
+            logging_rule(after_forward, prefix_text="UFW BLOCK"),
+            logging_rule(
+                logging_deny,
+                before_log="-m conntrack --ctstate INVALID",
+                prefix_text="UFW AUDIT INVALID",
+            ),
+            logging_rule(logging_deny, prefix_text="UFW BLOCK"),
+            logging_rule(logging_allow, prefix_text="UFW ALLOW"),
+            *(
+                logging_rule(
+                    chain,
+                    insert=True,
+                    prefix_text="UFW AUDIT",
+                    after_log=limit,
+                )
+                for chain in before
+            ),
+        ),
+        "full": (
+            logging_rule(after_input, prefix_text="UFW BLOCK"),
+            logging_rule(after_output, prefix_text="UFW ALLOW"),
+            logging_rule(after_forward, prefix_text="UFW BLOCK"),
+            logging_rule(
+                logging_deny,
+                before_log="-m conntrack --ctstate INVALID",
+                prefix_text="UFW AUDIT INVALID",
+            ),
+            logging_rule(logging_deny, prefix_text="UFW BLOCK"),
+            logging_rule(logging_allow, prefix_text="UFW ALLOW"),
+            *(
+                logging_rule(chain, insert=True, prefix_text="UFW AUDIT")
+                for chain in before
+            ),
+        ),
+    }
+
+    ordinary_chains = tuple(
+        f":{prefix}-{name} - [0:0]"
+        for name in (
+            "user-input",
+            "user-output",
+            "user-forward",
+            "before-logging-input",
+            "before-logging-output",
+            "before-logging-forward",
+            "user-logging-input",
+            "user-logging-output",
+            "user-logging-forward",
+            "after-logging-input",
+            "after-logging-output",
+            "after-logging-forward",
+            "logging-deny",
+            "logging-allow",
+        )
+    )
+    variants: set[tuple[str, ...]] = set()
+    for level, logging in logging_by_level.items():
+        for has_rate_limiting in (False, True):
+            lines = ["*filter", *ordinary_chains]
+            if has_rate_limiting:
+                lines.extend(
+                    (
+                        f":{prefix}-user-limit - [0:0]",
+                        f":{prefix}-user-limit-accept - [0:0]",
+                    )
+                )
+            lines.extend(
+                (
+                    "### RULES ###",
+                    "",
+                    "### END RULES ###",
+                    "",
+                    "### LOGGING ###",
+                    *logging,
+                    "### END LOGGING ###",
+                )
+            )
+            if has_rate_limiting:
+                lines.extend(("", "### RATE LIMITING ###"))
+                if level != "off":
+                    lines.append(
+                        f"-A {prefix}-user-limit -m limit --limit 3/minute "
+                        '-j LOG --log-prefix "[UFW LIMIT BLOCK] "'
+                    )
+                lines.extend(
+                    (
+                        f"-A {prefix}-user-limit -j REJECT",
+                        f"-A {prefix}-user-limit-accept -j ACCEPT",
+                        "### END RATE LIMITING ###",
+                    )
+                )
+            lines.append("COMMIT")
+            variants.add(tuple(lines))
+    return frozenset(variants)
+
+
+def _require_empty_ufw_user_rule_section(
+    ssh: SSHCommand,
+    path: str,
+    *,
+    template_path: str,
+) -> None:
+    layouts = {
+        (
+            "/etc/ufw/user.rules",
+            "/usr/share/ufw/iptables/user.rules",
+        ): "ufw",
+        (
+            "/etc/ufw/user6.rules",
+            "/usr/share/ufw/iptables/user6.rules",
+        ): "ufw6",
+    }
+    prefix = layouts.get((path, template_path))
+    if prefix is None:
+        raise InstallerError(f"{path} содержит dormant user rules")
+
     result = _must(
         ssh,
         ["cat", path],
@@ -707,9 +925,32 @@ def _require_empty_ufw_user_rule_section(ssh: SSHCommand, path: str) -> None:
     lines = result.stdout.splitlines()
     starts = [index for index, line in enumerate(lines) if line == "### RULES ###"]
     ends = [index for index, line in enumerate(lines) if line == "### END RULES ###"]
-    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+    if len(starts) != 1:
         raise VerificationError(f"{path} не содержит однозначный UFW RULES section")
-    if any(line.strip() for line in lines[starts[0] + 1 : ends[0]]):
+
+    # A rewritten UFW 0.36.x file contains executable logging and rate-limit
+    # sections outside RULES.  Accept only complete upstream-generated empty
+    # layouts; checking the delimited body alone would miss dormant rules.
+    if ends:
+        if len(ends) != 1 or starts[0] >= ends[0]:
+            raise VerificationError(f"{path} не содержит однозначный UFW RULES section")
+        if tuple(lines) not in _official_empty_ufw_rewrites(prefix):
+            raise InstallerError(f"{path} содержит dormant user rules")
+        return
+
+    # Fresh UFW 0.36.x package seeds have no END marker.  Their IPv4 seed also
+    # contains three built-in rate-limit rules, so a generic "empty after
+    # START" check is both wrong and unsafe.  Compare against the pristine
+    # template installed by this exact distro package; dpkg --verify has
+    # already checked that package-owned file against local dpkg metadata.
+    template = _must(
+        ssh,
+        ["cat", template_path],
+        operation=f"Не удалось прочитать штатный шаблон {template_path}",
+    )
+    if template.stderr.strip():
+        raise VerificationError(f"{template_path} вернул неоднозначную диагностику")
+    if result.stdout != template.stdout:
         raise InstallerError(f"{path} содержит dormant user rules")
 
 
@@ -722,24 +963,24 @@ def _ufw_added_commands(ssh: SSHCommand) -> list[list[str]]:
     if result.stderr.strip():
         raise VerificationError("ufw show added вернул неоднозначную диагностику")
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if not lines or lines[0] != _UFW_SHOW_ADDED_HEADER:
+    if not lines or english_words(lines[0]) != english_words(_UFW_SHOW_ADDED_HEADER):
         raise VerificationError("ufw show added не вернул ожидаемый заголовок")
     body = lines[1:]
     # UFW 0.36.x emits a literal `(None)` for an empty saved-rule set.  The
     # marker carries the same meaning as the historical header-only form, but
     # it must never be accepted alongside commands or other data.
-    if body == [_UFW_SHOW_ADDED_EMPTY]:
+    if len(body) == 1 and english_words(body[0]) == english_words(
+        _UFW_SHOW_ADDED_EMPTY
+    ):
         return []
     commands: list[list[str]] = []
     for line in body:
-        if not line.startswith("ufw "):
-            raise VerificationError("ufw show added содержит неизвестную строку")
         try:
             command = shlex.split(line)
         except ValueError as exc:
             raise VerificationError("Некорректный вывод ufw show added") from exc
-        if not command or command[0] != "ufw":  # pragma: no cover - prefix invariant
-            raise VerificationError("Некорректная команда ufw show added")
+        if not command or command[0] != "ufw":
+            raise VerificationError("ufw show added содержит неизвестную строку")
         commands.append(command)
     return commands
 
@@ -759,8 +1000,16 @@ def _require_pristine_inactive_ufw(ssh: SSHCommand) -> None:
         raise InstallerError(
             "UFW inactive, но содержит foreign rules; автоподготовка отказалась"
         )
-    _require_empty_ufw_user_rule_section(ssh, "/etc/ufw/user.rules")
-    _require_empty_ufw_user_rule_section(ssh, "/etc/ufw/user6.rules")
+    _require_empty_ufw_user_rule_section(
+        ssh,
+        "/etc/ufw/user.rules",
+        template_path="/usr/share/ufw/iptables/user.rules",
+    )
+    _require_empty_ufw_user_rule_section(
+        ssh,
+        "/etc/ufw/user6.rules",
+        template_path="/usr/share/ufw/iptables/user6.rules",
+    )
 
 
 def _missing_packages(ssh: SSHCommand) -> tuple[str, ...]:
@@ -789,8 +1038,8 @@ def _missing_packages(ssh: SSHCommand) -> tuple[str, ...]:
         not_known = (
             result.returncode == 1
             and not result.stdout
-            and result.stderr.strip()
-            == f"dpkg-query: no packages found matching {package}"
+            and bool(result.stderr.strip())
+            and not any(char in result.stderr.strip() for char in "\r\n")
         )
         if not_known:
             missing.append(package)
@@ -992,9 +1241,8 @@ def _recover_stale_ufw_guard(
     before_active = _ufw_status(ssh)
     before_rules = _ufw_added_commands(ssh)
     expected = [_expected_ssh_rule(ssh_port)]
-    safe_before = (
-        (before_active and before_rules == expected)
-        or (not before_active and before_rules in ([], expected))
+    safe_before = (before_active and before_rules == expected) or (
+        not before_active and before_rules in ([], expected)
     )
     if not safe_before:
         raise InstallerError(
@@ -1013,9 +1261,8 @@ def _recover_stale_ufw_guard(
     _require_root(ssh, fresh=True)
     after_active = _ufw_status(ssh)
     after_rules = _ufw_added_commands(ssh)
-    safe_after = (
-        (after_active and after_rules == expected)
-        or (not after_active and after_rules in ([], expected))
+    safe_after = (after_active and after_rules == expected) or (
+        not after_active and after_rules in ([], expected)
     )
     if not safe_after:
         raise InstallerError(
@@ -1081,7 +1328,9 @@ def _rollback_new_ufw(
             allow_inactive_ufw_scaffold=True,
         )
         if after != baseline:
-            raise VerificationError("Kernel firewall не совпал с baseline после rollback")
+            raise VerificationError(
+                "Kernel firewall не совпал с baseline после rollback"
+            )
         if guard_armed:
             guard.disarm(ssh, ssh_port=ssh_port)
         return True
@@ -1154,7 +1403,9 @@ def _enable_pristine_ufw(
             raise VerificationError("UFW не стал active после enable")
         stage = "ufw-rules-after-enable"
         if _ufw_added_commands(ssh) != [_expected_ssh_rule(ssh_port)]:
-            raise VerificationError("После enable UFW содержит не только managed SSH rule")
+            raise VerificationError(
+                "После enable UFW содержит не только managed SSH rule"
+            )
         stage = "guard-disarm"
         rollback_guard.disarm(ssh, ssh_port=ssh_port)
         guard_armed = False
@@ -1165,7 +1416,9 @@ def _enable_pristine_ufw(
         _require_root(ssh, fresh=True)
         stage = "ufw-status-after-guard"
         if not _ufw_status(ssh):
-            raise VerificationError("UFW стал inactive во время остановки rollback guard")
+            raise VerificationError(
+                "UFW стал inactive во время остановки rollback guard"
+            )
         stage = "ufw-rules-after-guard"
         if _ufw_added_commands(ssh) != [_expected_ssh_rule(ssh_port)]:
             raise VerificationError(
@@ -1276,11 +1529,11 @@ def prepare_remote_exit(
 
 
 def _parse_cloudflare_trace_ipv4(payload: str) -> str:
-    values = [
-        line.partition("=")[2].strip()
-        for line in payload.splitlines()
-        if line.partition("=")[:2] == ("ip", "=")
-    ]
+    values = []
+    for line in payload.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().casefold() == "ip":
+            values.append(value.strip())
     if len(values) != 1:
         raise VerificationError("Cloudflare trace должен вернуть ровно одну строку ip=")
     try:

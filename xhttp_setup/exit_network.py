@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .command_output import parse_ufw_status
 from .errors import InstallerError, ValidationError, VerificationError
 from .osutil import atomic_write, exclusive_lock, run
 from .validate import validate_ipv4, validate_port
@@ -193,8 +194,10 @@ def _inspect_ufw(profile: ExitNetworkProfile, runner: Runner) -> _UfwState:
     result = _invoke(runner, ["ufw", "status", "numbered"])
     if result.returncode != 0:
         raise InstallerError("Не удалось прочитать состояние UFW")
-    status_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    active = bool(status_lines) and status_lines[0] == "Status: active"
+    try:
+        active = parse_ufw_status(result.stdout)
+    except ValueError as exc:
+        raise InstallerError("UFW вернул неоднозначное состояние") from exc
     if not active:
         return _UfwState(False, (), (), result.stdout)
 

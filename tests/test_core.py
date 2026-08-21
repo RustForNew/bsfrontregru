@@ -168,7 +168,7 @@ Authentication: ML-KEM
 
     def test_cloudflare_trace_requires_valid_ipv4(self):
         self.assertEqual(
-            _parse_cloudflare_trace_ip("fl=1\nip=203.0.113.20\nts=1\n"),
+            _parse_cloudflare_trace_ip("fl=1\n  IP = 203.0.113.20  \nts=1\n"),
             "203.0.113.20",
         )
         with self.assertRaises(VerificationError):

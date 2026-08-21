@@ -44,6 +44,7 @@ class MemorySFTP:
         self.failed = False
 
     def batch(self, commands, check=True):
+        remote_dir = "/"
         for raw in commands:
             ignored = raw.startswith("-")
             command = raw[1:] if ignored else raw
@@ -51,7 +52,7 @@ class MemorySFTP:
             verb = parts[0]
             try:
                 if verb == "cd":
-                    pass
+                    remote_dir = parts[1]
                 elif verb == "ls":
                     if parts[-1] not in self.files:
                         raise FileNotFoundError(parts[-1])
@@ -71,7 +72,13 @@ class MemorySFTP:
             except (FileNotFoundError, KeyError):
                 if ignored:
                     continue
-                result = subprocess.CompletedProcess(commands, 1, "", "No such file")
+                remote_path = f"{remote_dir.rstrip('/')}/{parts[-1]}"
+                result = subprocess.CompletedProcess(
+                    commands,
+                    1,
+                    "",
+                    f'Can\'t ls: "{remote_path}" not found\n',
+                )
                 if check:
                     raise InstallerError("simulated missing remote file")
                 return result
@@ -208,11 +215,21 @@ class FrontTransactionTests(unittest.TestCase):
         self.assertIs(raised.exception.__cause__, original)
 
     def test_missing_remote_file_is_optional(self):
-        with tempfile.TemporaryDirectory() as temp:
-            local = Path(temp) / "copy"
-            client = FakeSFTP(1, "No such file")
-            self.assertFalse(_download_optional(client, "/remote", ".htaccess", local))
-            self.assertEqual(client.calls, 1)
+        diagnostics = (
+            'Can\'t ls: "/remote/.htaccess" not found\n',
+            'File "/remote/.htaccess" not found.\n',
+        )
+        for diagnostic in diagnostics:
+            with (
+                self.subTest(diagnostic=diagnostic),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                local = Path(temp) / "copy"
+                client = FakeSFTP(1, diagnostic)
+                self.assertFalse(
+                    _download_optional(client, "/remote", ".htaccess", local)
+                )
+                self.assertEqual(client.calls, 1)
 
     def test_permission_or_auth_failure_is_not_treated_as_missing(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -221,6 +238,23 @@ class FrontTransactionTests(unittest.TestCase):
             with self.assertRaises(InstallerError):
                 _download_optional(client, "/remote", ".htaccess", local)
             self.assertEqual(client.calls, 1)
+
+    def test_missing_classifier_rejects_mixed_or_wrong_path_diagnostics(self):
+        diagnostics = (
+            'Can\'t ls: "/remote/.htaccess" not found\nPermission denied\n',
+            'Can\'t ls: "/other/.htaccess" not found\n',
+            "No such file\n",
+        )
+        for diagnostic in diagnostics:
+            with (
+                self.subTest(diagnostic=diagnostic),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                local = Path(temp) / "copy"
+                client = FakeSFTP(1, diagnostic)
+                with self.assertRaises(InstallerError):
+                    _download_optional(client, "/remote", ".htaccess", local)
+                self.assertEqual(client.calls, 1)
 
     def test_existing_remote_file_must_be_downloaded(self):
         with tempfile.TemporaryDirectory() as temp:

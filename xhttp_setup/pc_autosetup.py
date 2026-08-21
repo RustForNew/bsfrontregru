@@ -106,6 +106,10 @@ _SFTP_PATH_MISSING_DIAGNOSTICS = frozenset(
         "Couldn't canonicalize: No such file or directory",
     }
 )
+_XRAY_LISTENER_OWNER = re.compile(
+    r'\busers\s*:\s*\(\s*\(\s*"xray"\s*,\s*pid\s*=\s*'
+    r"(?P<pid>[1-9][0-9]*)\s*(?=[,)])"
+)
 _CAPTURE_SCRIPT = (
     'umask 077; : > "$1"; touch "$1"; '
     f"exec timeout --signal=INT {_PROBE_CAPTURE_SECONDS} "
@@ -602,7 +606,7 @@ def _remote_managed_file(
             "LC_ALL=C",
             "LANG=C",
             "stat",
-            "--format=%U:%G:%a:%F:%s",
+            "--format=%U:%G:%a:%f:%s",
             "--",
             path,
         ],
@@ -613,8 +617,14 @@ def _remote_managed_file(
     if (
         metadata.returncode != 0
         or len(fields) != 5
-        or fields[:4] != [expected_owner, expected_group, expected_mode, "regular file"]
+        or fields[:3] != [expected_owner, expected_group, expected_mode]
     ):
+        raise InstallerError("Remote managed-файл имеет неожиданные metadata")
+    try:
+        file_mode = int(fields[3], 16)
+    except ValueError as exc:
+        raise InstallerError("Remote managed-файл имеет неожиданные metadata") from exc
+    if not re.fullmatch(r"[0-9a-fA-F]{1,16}", fields[3]) or not stat.S_ISREG(file_mode):
         raise InstallerError("Remote managed-файл имеет неожиданные metadata")
     try:
         size = int(fields[4])
@@ -801,10 +811,15 @@ def inspect_existing_pc_exit(
         raise InstallerError("Managed Xray service не подтверждён")
     listener_lines = [line for line in listener.stdout.splitlines() if line.strip()]
     pid = main_pid.stdout.strip()
+    listener_owner = (
+        _XRAY_LISTENER_OWNER.search(listener_lines[0])
+        if len(listener_lines) == 1
+        else None
+    )
     if (
         len(listener_lines) != 1
-        or '("xray",pid=' not in listener_lines[0]
-        or f"pid={pid}," not in listener_lines[0]
+        or listener_owner is None
+        or listener_owner.group("pid") != pid
     ):
         raise InstallerError("TCP/8083 не принадлежит managed Xray service")
 
@@ -950,10 +965,7 @@ def _safe_front_request_outcome_summary(
 
     parts = [f"HTTP {status} = {count}" for status, count in sorted(status_counts)]
     if post_send_count:
-        parts.append(
-            "после отправки без корректного HTTP-статуса = "
-            f"{post_send_count}"
-        )
+        parts.append(f"после отправки без корректного HTTP-статуса = {post_send_count}")
     summary = f"HTTP-исходы {_PROBE_REQUESTS} запросов: " + ", ".join(parts)
     all_not_found = status_counts == [(404, _PROBE_REQUESTS)] and not post_send_count
     return (summary, all_not_found)
@@ -1204,9 +1216,19 @@ def _sftp_working_directories(output: str, *, expected: int) -> list[str]:
     return matches
 
 
-def _sftp_reports_missing_path(result: subprocess.CompletedProcess[str]) -> bool:
+def _sftp_reports_missing_path(
+    result: subprocess.CompletedProcess[str], *, path: str
+) -> bool:
     diagnostics = [line.strip() for line in result.stderr.splitlines() if line.strip()]
-    return len(diagnostics) == 1 and diagnostics[0] in _SFTP_PATH_MISSING_DIAGNOSTICS
+    if len(diagnostics) != 1:
+        return False
+    current_realpath_diagnostics = {
+        f"realpath {path}: No such file",
+        f"realpath {path}: No such file or directory",
+    }
+    return diagnostics[0] in (
+        _SFTP_PATH_MISSING_DIAGNOSTICS | current_realpath_diagnostics
+    )
 
 
 def _resolve_sftp_docroot(client: SFTPBatch, api_docroot: str) -> str:
@@ -1224,7 +1246,7 @@ def _resolve_sftp_docroot(client: SFTPBatch, api_docroot: str) -> str:
         _start, resolved = _sftp_working_directories(exact.stdout, expected=2)
         return resolved
 
-    if not _sftp_reports_missing_path(exact):
+    if not _sftp_reports_missing_path(exact, path=api_docroot):
         raise VerificationError(
             "REG.RU SFTP доступ есть, но document root из ISPmanager недоступен"
         )

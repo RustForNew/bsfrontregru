@@ -19,7 +19,9 @@ _MAX_LOGIN_CHARS = 256
 _MAX_PASSWORD_CHARS = 1024
 _MAX_URL_CHARS = 2048
 
-_FIELD_LINE = re.compile(r"^\s*(?P<label>[^:\r\n]{1,96})\s*:\s*(?P<value>.*?)\s*$")
+_FIELD_LINE = re.compile(
+    r"^\s*(?P<label>[^:：\r\n]{1,96})\s*[:：]\s*(?P<value>.*?)\s*$"
+)
 _MARKDOWN_LINK = re.compile(r"^\[([^\]\r\n]+)\]\(([^()\s]+)\)$")
 _REGRU_PANEL_HOST = re.compile(r"^vip[0-9]+\.hosting\.reg\.ru$")
 _DASHES = str.maketrans(
@@ -144,7 +146,9 @@ def parse_exit_credentials(value: str) -> ExitCredentials:
 
 def _normalized_label(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).translate(_DASHES)
-    normalized = " ".join(normalized.split()).casefold().strip().rstrip(":").strip()
+    normalized = " ".join(normalized.split()).casefold().strip()
+    while normalized and unicodedata.category(normalized[-1]).startswith("P"):
+        normalized = normalized[:-1].rstrip()
     return re.sub(r"\s*-\s*", "-", normalized)
 
 

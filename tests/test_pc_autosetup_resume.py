@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import threading
@@ -42,6 +43,8 @@ class ResumeSSH:
         self.calls: list[list[str]] = []
         self.service_active = True
         self.listener_matches = True
+        self.listener_output: str | None = None
+        self.file_types: dict[str, int] = {}
 
     def command(self, argv, *, check=True, timeout=300):
         del check, timeout
@@ -51,8 +54,10 @@ class ResumeSSH:
             path = argv[-1]
             content, group, mode = self.files[path]
             size = len(content.encode("utf-8"))
+            file_type = self.file_types.get(path, stat.S_IFREG)
             return completed(
-                argv, stdout=f"root:{group}:{mode}:regular file:{size}\n"
+                argv,
+                stdout=f"root:{group}:{mode}:{file_type | int(mode, 8):x}:{size}\n",
             )
         if argv[:2] == ["sha256sum", "--"]:
             path = argv[-1]
@@ -73,11 +78,13 @@ class ResumeSSH:
         if argv[:3] == ["systemctl", "show", "--property=MainPID"]:
             return completed(argv, stdout="1234\n")
         if argv[:3] == ["ss", "-H", "-lntp"]:
-            listener = (
-                'LISTEN 0 4096 *:8083 *:* users:(("xray",pid=1234,fd=9))\n'
-                if self.listener_matches
-                else 'LISTEN 0 4096 *:8083 *:* users:(("other",pid=44,fd=9))\n'
-            )
+            listener = self.listener_output
+            if listener is None:
+                listener = (
+                    'LISTEN 0 4096 *:8083 *:* users:(("xray",pid=1234,fd=9))\n'
+                    if self.listener_matches
+                    else 'LISTEN 0 4096 *:8083 *:* users:(("other",pid=44,fd=9))\n'
+                )
             return completed(argv, stdout=listener)
         raise AssertionError(argv)
 
@@ -102,9 +109,10 @@ class PcExitResumeTests(unittest.TestCase):
         ).validate()
         output = root / "state"
         output.mkdir(mode=0o700)
-        handoff_text = json.dumps(
-            handoff.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
-        ) + "\n"
+        handoff_text = (
+            json.dumps(handoff.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
+        )
         firewall_text = _firewall_plan(desired)
         (output / "handoff.json").write_bytes(handoff_text.encode("utf-8"))
         (output / "firewall-plan.txt").write_bytes(firewall_text.encode("utf-8"))
@@ -180,6 +188,7 @@ class PcExitResumeTests(unittest.TestCase):
         self.assertEqual(result.desired, desired)
         self.assertEqual(result.handoff, handoff)
         self.assertNotIn(ENCRYPTION, repr(result))
+        self.assertTrue(any("--format=%U:%G:%a:%f:%s" in call for call in ssh.calls))
         preflight.assert_called_once_with(
             ssh,
             ExitNetworkProfile("9.9.9.9", 8083),
@@ -305,6 +314,30 @@ class PcExitResumeTests(unittest.TestCase):
             output, _, _, ssh = self._fixture(Path(temp))
             with self.assertRaisesRegex(InstallerError, "IPv4.*изменился"):
                 self._inspect(output, ssh, egress="1.1.1.1")
+
+    def test_numeric_file_type_and_listener_presentation_are_parsed_safely(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output, _, _, ssh = self._fixture(Path(temp))
+            ssh.listener_output = (
+                'LISTEN 0 4096 *:8083 *:* users : ( ( "xray" , '
+                "pid = 1234 , fd = 9 ) )\n"
+            )
+            result, _, _ = self._inspect(output, ssh)
+        self.assertIsNotNone(result)
+
+        with tempfile.TemporaryDirectory() as temp:
+            output, _, _, ssh = self._fixture(Path(temp))
+            ssh.listener_output = (
+                'LISTEN 0 4096 *:8083 *:* users:(("xray",pid=12345,fd=9))\n'
+            )
+            with self.assertRaisesRegex(InstallerError, "не принадлежит"):
+                self._inspect(output, ssh)
+
+        with tempfile.TemporaryDirectory() as temp:
+            output, _, _, ssh = self._fixture(Path(temp))
+            ssh.file_types["/var/lib/xhttp-setup/handoff.json"] = stat.S_IFDIR
+            with self.assertRaisesRegex(InstallerError, "metadata"):
+                self._inspect(output, ssh)
 
     @unittest.skipUnless(os.name == "posix", "POSIX pending file semantics")
     def test_pending_exit_marker_is_private_exactly_bound_and_removable(self):

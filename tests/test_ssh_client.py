@@ -91,9 +91,13 @@ class SSHClientTests(unittest.TestCase):
 
         self.assertEqual(result.stdout, "ok")
         argv = runner.call_args.args[0]
+        env = runner.call_args.kwargs["env"]
         self.assertEqual(argv[-2], "root@exit.example.org")
         self.assertEqual(argv[-1], "printf %s 'a b;$(id)'")
         self.assertNotIn("input_text", runner.call_args.kwargs)
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertEqual(env["LANG"], "C")
+        self.assertNotIn("SSH_ASKPASS", env)
 
     def test_remote_command_rejects_control_characters(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -250,7 +254,9 @@ class SSHClientTests(unittest.TestCase):
         self.assertIn("[REDACTED]", str(raised.exception))
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO")
-    def test_password_permission_denied_is_a_typed_auth_failure_even_without_check(self):
+    def test_password_permission_denied_is_a_typed_auth_failure_even_without_check(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             client = SSHClient(
@@ -407,9 +413,7 @@ class SSHScopedSessionTests(unittest.TestCase):
             self.assertNotIn("XHTTP_ASKPASS_FIFO", kwargs["env"])
 
         fresh_argv, _ = captured["fresh_calls"][0]
-        self.assertFalse(
-            any(value.startswith("ControlPath=") for value in fresh_argv)
-        )
+        self.assertFalse(any(value.startswith("ControlPath=") for value in fresh_argv))
         self.assertNotIn("ProxyCommand=/bin/false", fresh_argv)
         self.assertFalse(captured["control_dir"].exists())
 
@@ -428,8 +432,7 @@ class SSHScopedSessionTests(unittest.TestCase):
                 control_path,
                 returncode=255,
                 stderr=(
-                    "root@exit.example.org: Permission denied "
-                    "(publickey,password).\n"
+                    "root@exit.example.org: Permission denied (publickey,password).\n"
                 ),
             )
 
@@ -549,9 +552,10 @@ class SSHScopedSessionTests(unittest.TestCase):
                     side_effect=fake_run,
                 ),
             ):
-                with client.session() as session, ThreadPoolExecutor(
-                    max_workers=2
-                ) as executor:
+                with (
+                    client.session() as session,
+                    ThreadPoolExecutor(max_workers=2) as executor,
+                ):
                     first = executor.submit(session.command, ["printf", "first"])
                     second = executor.submit(session.command, ["printf", "second"])
                     rendezvous.wait(timeout=3)

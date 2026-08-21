@@ -20,6 +20,10 @@ class ISPmanagerTests(unittest.TestCase):
             validate_panel_endpoint("https://panel.example.org:1500/ispmgr/"),
             "https://panel.example.org:1500/ispmgr",
         )
+        self.assertEqual(
+            validate_panel_endpoint("HTTPS://panel.example.org:1500/ispmgr/"),
+            "HTTPS://panel.example.org:1500/ispmgr",
+        )
         for value in (
             "http://panel.example.org:1500/ispmgr",
             "https://user:pass@panel.example.org:1500/ispmgr",
@@ -117,7 +121,9 @@ class ISPmanagerTests(unittest.TestCase):
             )
 
         self.assertEqual(len(post.call_args_list), 2)
-        self.assertTrue(all(call.kwargs["route"] == route for call in post.call_args_list))
+        self.assertTrue(
+            all(call.kwargs["route"] == route for call in post.call_args_list)
+        )
 
     def test_routed_post_keeps_panel_hostname_for_tls_and_http(self):
         route = TCPRoute("127.0.0.1", 43124)

@@ -155,6 +155,20 @@ class FakeNetworkSystem:
 class ExitNetworkTests(unittest.TestCase):
     def setUp(self):
         self.profile = ExitNetworkProfile("198.51.100.20", 8083)
+
+    def test_ufw_status_presentation_variant_is_not_treated_as_inactive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            layout = ExitNetworkLayout(Path(temp))
+            fake = FakeNetworkSystem(layout.sysctl_file)
+            original = fake._ufw_output
+            fake._ufw_output = lambda: original().replace(
+                "Status: active", " STATUS, ACTIVE!"
+            )
+
+            apply_exit_network(self.profile, layout=layout, runner=fake)
+
+        self.assertTrue(fake.allow)
+        self.assertTrue(fake.deny)
         patcher = mock.patch(
             "xhttp_setup.exit_network.atomic_write",
             side_effect=portable_atomic_write,

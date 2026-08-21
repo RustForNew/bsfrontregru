@@ -169,6 +169,33 @@ IP‑адрес сервера: 198.51.100.28
         self.assertEqual(credentials.panel_url, "https://vip999.hosting.reg.ru:1500/")
         self.assertEqual(credentials.ftp_server_ip, "198.51.100.28")
 
+    def test_accepts_label_punctuation_and_fullwidth_colon_without_changing_secret(
+        self,
+    ):
+        secret = "FakePanelSecret_42!?。"
+        block = regru_block().replace(PANEL_SECRET, secret, 1)
+        replacements = {
+            "Доступ в панель управления хостингом": (
+                "Доступ в панель управления хостингом！"
+            ),
+            "Логин:": "Логин.：",
+            "Пароль:": "Пароль…：",
+            "Ваша панель управления:": "Ваша панель управления：",
+            "Адрес панели управления хостингом:": (
+                "Адрес панели управления хостингом.："
+            ),
+            "Доступ к FTP": "Доступ к FTP。",
+            "IP-адрес сервера:": "IP-адрес сервера：",
+        }
+        for source, target in replacements.items():
+            block = block.replace(source, target)
+
+        credentials = parse_regru_credentials(block)
+
+        self.assertEqual(credentials.panel_password, secret)
+        self.assertEqual(credentials.panel_login, "u1234567")
+        self.assertEqual(credentials.ftp_login, "u1234567")
+
     def test_accepts_markdown_link_with_text_label(self):
         block = regru_block().replace(
             "[https://vip999.hosting.reg.ru:1500/](https://vip999.hosting.reg.ru:1500/)",

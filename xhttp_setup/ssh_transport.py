@@ -167,6 +167,7 @@ def _without_askpass_env() -> dict[str, str]:
         "XHTTP_ASKPASS_FIFO",
     ):
         env.pop(name, None)
+    env.update({"LC_ALL": "C", "LANG": "C"})
     return env
 
 
@@ -283,10 +284,10 @@ def _wait_for_control_master(
             auth_detail = _permission_denied_detail(stderr)
             if auth_detail is not None:
                 auth_detail = _redact_input_text(auth_detail, auth.password)
-                raise SSHAuthenticationError(
-                    f"{authentication_message}: {auth_detail}"
-                )
-            detail = _bounded_process_tail(stderr or f"код {returncode}", secret=auth.password)
+                raise SSHAuthenticationError(f"{authentication_message}: {auth_detail}")
+            detail = _bounded_process_tail(
+                stderr or f"код {returncode}", secret=auth.password
+            )
             raise transport_error(f"{transport_message}: {detail}")
         try:
             check = subprocess.run(
@@ -314,9 +315,7 @@ def _wait_for_control_master(
             if not stat.S_ISSOCK(metadata.st_mode):
                 raise transport_error("SSH ControlPath не является Unix socket")
             if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-                raise transport_error(
-                    "Небезопасные владелец или права SSH ControlPath"
-                )
+                raise transport_error("Небезопасные владелец или права SSH ControlPath")
             return
         time.sleep(0.05)
     raise transport_error(f"{transport_message} за 20 секунд")
@@ -457,9 +456,7 @@ def _parse_host_key_fields(
     host_token, key_type, key_blob = parts
     accepted_tokens = {host, f"[{host}]:{port}"}
     if host_token not in accepted_tokens:
-        raise VerificationError(
-            f"SSH host key в {source} относится к другому endpoint"
-        )
+        raise VerificationError(f"SSH host key в {source} относится к другому endpoint")
     if key_type not in _HOST_KEY_PREFERENCE:
         raise VerificationError(
             f"Неподдерживаемый тип SSH host key в {source}: {key_type}"
@@ -467,9 +464,7 @@ def _parse_host_key_fields(
     try:
         decoded = base64.b64decode(key_blob, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise VerificationError(
-            f"Некорректный SSH public key в {source}"
-        ) from exc
+        raise VerificationError(f"Некорректный SSH public key в {source}") from exc
     if not decoded:
         raise VerificationError(f"Пустой SSH public key в {source}")
     return _ObservedHostKey(key_type=key_type, key_blob=key_blob)
@@ -480,6 +475,7 @@ def _fingerprint_host_key(line: str, *, source: str) -> str:
         result = run(
             ["ssh-keygen", "-E", "sha256", "-lf", "-"],
             input_text=line + "\n",
+            env=_without_askpass_env(),
         )
     except InstallerError as exc:
         raise VerificationError(
@@ -512,9 +508,7 @@ def _parse_existing_trust(
         raise VerificationError(
             f"SSH trust-файл должен содержать ровно один host key: {path}"
         )
-    observed = _parse_host_key_fields(
-        lines[0], host=host, port=port, source=str(path)
-    )
+    observed = _parse_host_key_fields(lines[0], host=host, port=port, source=str(path))
     canonical = _canonical_host_key_line(host=host, port=port, observed=observed)
     if lines[0] != canonical:
         raise VerificationError(f"SSH trust-файл имеет неканоничный формат: {path}")
@@ -522,15 +516,15 @@ def _parse_existing_trust(
     return canonical, fingerprint
 
 
-def _read_existing_trust(
-    path: Path, *, host: str, port: int
-) -> tuple[str, str] | None:
+def _read_existing_trust(path: Path, *, host: str, port: int) -> tuple[str, str] | None:
     try:
         path_metadata = path.lstat()
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise InstallerError(f"Не удалось проверить SSH trust-файл {path}: {exc}") from exc
+        raise InstallerError(
+            f"Не удалось проверить SSH trust-файл {path}: {exc}"
+        ) from exc
     if stat.S_ISLNK(path_metadata.st_mode):
         raise InstallerError(f"SSH trust-файл не может быть symlink: {path}")
     if not stat.S_ISREG(path_metadata.st_mode):
@@ -600,6 +594,7 @@ def _scan_host_keys(
             ],
             check=False,
             timeout=20,
+            env=_without_askpass_env(),
         )
         by_type: dict[str, set[str]] = {}
         for raw_line in scan.stdout.splitlines():
@@ -702,17 +697,11 @@ def trust_host_key_tofu(
         _, existing_fingerprint = existing
         return known_hosts, existing_fingerprint
 
-    observed = _scan_host_keys(
-        host=normalized_host, port=normalized_port, route=route
-    )
+    observed = _scan_host_keys(host=normalized_host, port=normalized_port, route=route)
     observed_line = next(
-        observed[key_type]
-        for key_type in _HOST_KEY_PREFERENCE
-        if key_type in observed
+        observed[key_type] for key_type in _HOST_KEY_PREFERENCE if key_type in observed
     )
-    observed_fingerprint = _fingerprint_host_key(
-        observed_line, source="ssh-keyscan"
-    )
+    observed_fingerprint = _fingerprint_host_key(observed_line, source="ssh-keyscan")
     _atomic_create_trust(known_hosts, observed_line + "\n")
     return known_hosts, observed_fingerprint
 
@@ -780,7 +769,9 @@ def pin_host_key(
     observed: list[str] = []
     for line in candidates:
         fingerprint = run(
-            ["ssh-keygen", "-E", "sha256", "-lf", "-"], input_text=line + "\n"
+            ["ssh-keygen", "-E", "sha256", "-lf", "-"],
+            input_text=line + "\n",
+            env=_without_askpass_env(),
         ).stdout.strip()
         parts = fingerprint.split()
         if len(parts) >= 2:
@@ -1031,7 +1022,13 @@ class SFTPClient:
     ) -> subprocess.CompletedProcess[str]:
         batch_text = "\n".join(commands) + "\n"
         if self.auth.method == "key":
-            return run(self._argv(), input_text=batch_text, check=check, timeout=90)
+            return run(
+                self._argv(),
+                input_text=batch_text,
+                env=_without_askpass_env(),
+                check=check,
+                timeout=90,
+            )
         return self._batch_password(batch_text, check=check)
 
     @contextlib.contextmanager
@@ -1873,7 +1870,9 @@ class SSHBridgeSession:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             detail = _redact_input_text(str(exc), self._auth.password)
-            raise InstallerError(f"Команда проверки SSH-моста не запустилась: {detail}") from None
+            raise InstallerError(
+                f"Команда проверки SSH-моста не запустилась: {detail}"
+            ) from None
         return _redact_process_result(result, self._auth.password)
 
     def open(self) -> "SSHBridgeSession":

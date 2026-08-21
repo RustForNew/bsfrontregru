@@ -146,9 +146,7 @@ class FakeSSH:
                 continue
             seen.add(rule.comment)
             if rule.comment == f"xhttp-setup-ssh-guard-{rule.port}":
-                command = (
-                    f"ufw allow {rule.port}/tcp comment {rule.comment}"
-                )
+                command = f"ufw allow {rule.port}/tcp comment {rule.comment}"
             elif rule.comment.startswith("xhttp-setup-allow-"):
                 command = (
                     f"ufw allow from {rule.source}/32 to any port {rule.port} "
@@ -156,8 +154,7 @@ class FakeSSH:
                 )
             elif rule.comment.startswith("xhttp-setup-deny-"):
                 command = (
-                    f"ufw deny to any port {rule.port} proto tcp "
-                    f"comment {rule.comment}"
+                    f"ufw deny to any port {rule.port} proto tcp comment {rule.comment}"
                 )
             elif rule.comment:
                 command = f"ufw allow {rule.port}/tcp comment {rule.comment}"
@@ -271,9 +268,7 @@ class FakeSSH:
                 stderr=self.nft_enabled_stderr,
             )
         if command == ["nft", "list", "ruleset"]:
-            return completed(
-                command, stdout=self.nft_ruleset, stderr=self.nft_stderr
-            )
+            return completed(command, stdout=self.nft_ruleset, stderr=self.nft_stderr)
         if command == ["iptables-save"]:
             return completed(
                 command,
@@ -301,6 +296,23 @@ class RemoteNetworkTests(unittest.TestCase):
     def setUp(self):
         self.profile = ExitNetworkProfile("198.51.100.20", 8083)
 
+    def test_numbered_status_accepts_presentation_variants(self):
+        output = (
+            " STATUS, ACTIVE!\n"
+            "To   Action   From\n"
+            "--- -------- -----\n"
+            "[ 1] 22/tcp ALLOW IN Anywhere # xhttp-setup-ssh-guard-22\n"
+        )
+
+        self.assertEqual(
+            subject._numbered_rules(output),
+            [(1, "22/tcp ALLOW IN Anywhere", "xhttp-setup-ssh-guard-22")],
+        )
+
+    def test_numbered_status_rejects_semantic_extra_text(self):
+        with self.assertRaisesRegex(VerificationError, "Некорректный вывод"):
+            subject._numbered_rules("Status: active, degraded\n")
+
     @staticmethod
     def _commands(ssh: FakeSSH) -> list[tuple[str, ...]]:
         return [command for command, _timeout in ssh.calls]
@@ -310,9 +322,7 @@ class RemoteNetworkTests(unittest.TestCase):
         return [
             rule
             for rule in ssh.rules
-            if rule.comment.startswith(
-                ("xhttp-setup-allow-", "xhttp-setup-deny-")
-            )
+            if rule.comment.startswith(("xhttp-setup-allow-", "xhttp-setup-deny-"))
         ]
 
     def test_preflight_requires_direct_root_without_mutation(self):
@@ -426,6 +436,18 @@ class RemoteNetworkTests(unittest.TestCase):
         state = preflight_remote_exit_network(ssh, self.profile, ssh_port=22)
 
         self.assertEqual(state.os_id, "debian")
+
+    def test_missing_nftables_unit_diagnostic_ignores_presentation(self):
+        ssh = FakeSSH()
+        ssh.nft_enabled = (1, "")
+        ssh.nft_enabled_stderr = (
+            "FAILED to get unit-file state for nftables.service!  "
+            "No such file or directory.\n"
+        )
+
+        state = preflight_remote_exit_network(ssh, self.profile, ssh_port=22)
+
+        self.assertEqual(state.os_id, "debian")
         self.assertEqual(state.ufw_allow_indices, ())
 
     def test_dual_stack_family_and_all_inspector_outputs_are_fail_closed(self):
@@ -444,8 +466,7 @@ class RemoteNetworkTests(unittest.TestCase):
         ipv6_foreign = FakeSSH()
         ipv6_foreign.ip6tables_ruleset = ipv6_foreign.ip6tables_ruleset.replace(
             "-A INPUT -j ufw6-before-input",
-            "-A INPUT -p tcp --dport 9999 -j ACCEPT\n"
-            "-A INPUT -j ufw6-before-input",
+            "-A INPUT -p tcp --dport 9999 -j ACCEPT\n-A INPUT -j ufw6-before-input",
         )
         with self.assertRaisesRegex(InstallerError, "custom iptables base-chain"):
             preflight_remote_exit_network(ipv6_foreign, self.profile, ssh_port=22)
@@ -831,9 +852,7 @@ class RemoteNetworkTests(unittest.TestCase):
 
         recovery_ssh = FakeSSH()
         recovery_ssh.rules = list(ssh.rules)
-        reconciled = reconcile_remote_exit_network(
-            recovery_ssh, error.recovery
-        )
+        reconciled = reconcile_remote_exit_network(recovery_ssh, error.recovery)
 
         self.assertTrue(reconciled.ufw_allow_removed)
         self.assertFalse(reconciled.ufw_deny_removed)
@@ -843,10 +862,7 @@ class RemoteNetworkTests(unittest.TestCase):
             ["xhttp-setup-ssh-guard-22"],
         )
         self.assertFalse(
-            any(
-                "insert" in command
-                for command in self._commands(recovery_ssh)
-            )
+            any("insert" in command for command in self._commands(recovery_ssh))
         )
 
     def test_keyboard_interrupt_after_allow_rolls_back_before_reraise(self):
@@ -864,16 +880,12 @@ class RemoteNetworkTests(unittest.TestCase):
     def test_keyboard_interrupt_preserved_when_rollback_is_incomplete(self):
         ssh = FakeSSH()
         ssh.interrupt_after_allow = True
-        ssh.fail_delete_comments.add(
-            "xhttp-setup-allow-8083-198.51.100.20"
-        )
+        ssh.fail_delete_comments.add("xhttp-setup-allow-8083-198.51.100.20")
 
         with self.assertRaises(KeyboardInterrupt) as raised:
             apply_remote_exit_network(ssh, self.profile, ssh_port=22)
 
-        self.assertTrue(
-            any("rollback" in note for note in raised.exception.__notes__)
-        )
+        self.assertTrue(any("rollback" in note for note in raised.exception.__notes__))
         self.assertEqual(len(self._managed(ssh)), 1)
 
     def test_recovery_rejects_foreign_or_duplicate_journal_before_commands(self):
@@ -955,9 +967,7 @@ class RemoteNetworkTests(unittest.TestCase):
         )
         recovery_ssh = FakeSSH()
         recovery_ssh.rules = list(ssh.rules)
-        reconcile_remote_exit_network(
-            recovery_ssh, raised.exception.recovery
-        )
+        reconcile_remote_exit_network(recovery_ssh, raised.exception.recovery)
 
         self.assertEqual(self._managed(recovery_ssh), [])
         self.assertEqual(
@@ -988,9 +998,7 @@ class RemoteNetworkTests(unittest.TestCase):
 
         self.assertEqual(len(self._managed(ssh)), 1)
         self.assertEqual(self._managed(ssh)[0].action, "ALLOW")
-        self.assertFalse(
-            any("insert" in command for command in self._commands(ssh))
-        )
+        self.assertFalse(any("insert" in command for command in self._commands(ssh)))
 
     def test_post_mutation_ssh_failure_rolls_back_both_rules(self):
         ssh = FakeSSH()

@@ -68,7 +68,7 @@ class SSHTofuTests(unittest.TestCase):
             trust_dir = Path(temp) / "ssh"
             with mock.patch(
                 "xhttp_setup.ssh_transport.run", side_effect=self._runner(scan)
-            ):
+            ) as runner:
                 known_hosts, fingerprint = trust_host_key_tofu(
                     host="EXAMPLE.org.", port=22, trust_dir=trust_dir
                 )
@@ -81,6 +81,38 @@ class SSHTofuTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(trust_dir.stat().st_mode), 0o700)
                 self.assertEqual(stat.S_IMODE(known_hosts.stat().st_mode), 0o600)
+            for call in runner.call_args_list:
+                env = call.kwargs["env"]
+                self.assertEqual(env["LC_ALL"], "C")
+                self.assertEqual(env["LANG"], "C")
+                self.assertNotIn("SSH_ASKPASS", env)
+
+    def test_key_sftp_batch_forces_c_locale_without_askpass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            key = root / "id_ed25519"
+            key.write_text("test key material\n", encoding="utf-8")
+            known_hosts = root / "known_hosts"
+            known_hosts.write_text(
+                f"example.org ssh-ed25519 {_ED25519}\n", encoding="utf-8"
+            )
+            client = SFTPClient(
+                host="example.org",
+                port=22,
+                user="operator",
+                known_hosts=known_hosts,
+                auth=SSHAuth("key", private_key=key),
+            )
+            with mock.patch(
+                "xhttp_setup.ssh_transport.run",
+                return_value=_completed(["sftp"]),
+            ) as runner:
+                client.batch(["pwd"])
+
+        env = runner.call_args.kwargs["env"]
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertEqual(env["LANG"], "C")
+        self.assertNotIn("SSH_ASKPASS", env)
 
     def test_empty_keyscan_is_retried_but_success_is_still_pinned_once(self):
         scan_calls = 0
@@ -144,7 +176,9 @@ class SSHTofuTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             trust_dir = Path(temp) / "ssh"
             runner = self._runner(scan)
-            with mock.patch("xhttp_setup.ssh_transport.run", side_effect=runner) as run_mock:
+            with mock.patch(
+                "xhttp_setup.ssh_transport.run", side_effect=runner
+            ) as run_mock:
                 known_hosts, first = trust_host_key_tofu(
                     host="example.org", port=22, trust_dir=trust_dir
                 )
@@ -156,7 +190,11 @@ class SSHTofuTests(unittest.TestCase):
             self.assertEqual(reused, known_hosts)
             self.assertEqual(first, second)
             self.assertEqual(known_hosts.read_bytes(), original)
-            scans = [call for call in run_mock.call_args_list if call.args[0][0] == "ssh-keyscan"]
+            scans = [
+                call
+                for call in run_mock.call_args_list
+                if call.args[0][0] == "ssh-keyscan"
+            ]
             self.assertEqual(len(scans), 1)
 
     def test_existing_key_survives_addition_of_a_more_preferred_key(self):
@@ -208,7 +246,9 @@ class SSHTofuTests(unittest.TestCase):
             self.assertEqual(reused, known_hosts)
             self.assertEqual(fingerprint, _FINGERPRINT)
             self.assertFalse(
-                any(call.args[0][0] == "ssh-keyscan" for call in run_mock.call_args_list)
+                any(
+                    call.args[0][0] == "ssh-keyscan" for call in run_mock.call_args_list
+                )
             )
             self.assertEqual(known_hosts.read_bytes(), original)
 
@@ -259,8 +299,7 @@ class SSHTofuTests(unittest.TestCase):
             )
             self.assertEqual(
                 sum(
-                    call.args[0][0] == "ssh-keyscan"
-                    for call in run_mock.call_args_list
+                    call.args[0][0] == "ssh-keyscan" for call in run_mock.call_args_list
                 ),
                 1,
             )
@@ -293,7 +332,9 @@ class SSHTofuTests(unittest.TestCase):
 
         def runner(argv, **_kwargs):
             if argv[0] == "ssh-keygen":
-                return _completed(argv, f"256 {_OTHER_FINGERPRINT} endpoint (ED25519)\n")
+                return _completed(
+                    argv, f"256 {_OTHER_FINGERPRINT} endpoint (ED25519)\n"
+                )
             self.fail(f"unexpected network command: {argv!r}")
 
         with tempfile.TemporaryDirectory() as temp:
@@ -434,9 +475,7 @@ class SSHTofuTests(unittest.TestCase):
                 ),
                 self.assertRaises(VerificationError),
             ):
-                trust_host_key_tofu(
-                    host="example.org", port=22, trust_dir=trust_dir
-                )
+                trust_host_key_tofu(host="example.org", port=22, trust_dir=trust_dir)
 
             self.assertFalse(known_hosts.exists())
 
@@ -456,9 +495,7 @@ class SSHTofuTests(unittest.TestCase):
                 mock.patch("xhttp_setup.ssh_transport.run") as runner,
                 self.assertRaises(VerificationError),
             ):
-                trust_host_key_tofu(
-                    host="example.org", port=22, trust_dir=trust_dir
-                )
+                trust_host_key_tofu(host="example.org", port=22, trust_dir=trust_dir)
 
             runner.assert_not_called()
             self.assertEqual(known_hosts.read_bytes(), original)
@@ -482,9 +519,7 @@ class SSHTofuTests(unittest.TestCase):
                 mock.patch("xhttp_setup.ssh_transport.run") as runner,
                 self.assertRaises(InstallerError),
             ):
-                trust_host_key_tofu(
-                    host="example.org", port=22, trust_dir=trust_dir
-                )
+                trust_host_key_tofu(host="example.org", port=22, trust_dir=trust_dir)
 
             runner.assert_not_called()
             self.assertEqual(target.read_text("utf-8"), "keep me\n")
@@ -506,9 +541,7 @@ class SSHTofuTests(unittest.TestCase):
                 mock.patch("xhttp_setup.ssh_transport.run") as runner,
                 self.assertRaises(InstallerError),
             ):
-                trust_host_key_tofu(
-                    host="example.org", port=22, trust_dir=trust_dir
-                )
+                trust_host_key_tofu(host="example.org", port=22, trust_dir=trust_dir)
 
             runner.assert_not_called()
 

@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
+from .command_output import english_words, parse_ufw_status
 from .errors import InstallerError, ValidationError, VerificationError
 from .exit_network import ExitNetworkProfile
 from .remote_prepare import (
@@ -31,11 +32,13 @@ _MUTATION_TIMEOUT = 30
 _MANAGED_ALLOW_PREFIX = "xhttp-setup-allow-"
 _MANAGED_DENY_PREFIX = "xhttp-setup-deny-"
 _NUMBERED_UFW_LINE = re.compile(r"^\s*\[\s*(\d+)\]\s+(.*)$")
-_NFTABLES_MISSING_UNIT_DIAGNOSTICS = frozenset(
+_NFTABLES_MISSING_UNIT_DIAGNOSTIC_WORDS = frozenset(
     {
-        "Failed to get unit file state for nftables.service: "
-        "No such file or directory",
-        "Unit file nftables.service does not exist.",
+        english_words(
+            "Failed to get unit file state for nftables.service: "
+            "No such file or directory"
+        ),
+        english_words("Unit file nftables.service does not exist."),
     }
 )
 
@@ -83,8 +86,7 @@ class RemoteExitNetworkError(InstallerError):
     ) -> None:
         state = "succeeded" if recovery_completed else "required"
         super().__init__(
-            "Remote UFW mutation transport failed; "
-            f"exact_reconciliation={state}"
+            f"Remote UFW mutation transport failed; exact_reconciliation={state}"
         )
         self.recovery = recovery
         self.recovery_completed = recovery_completed
@@ -209,7 +211,9 @@ def _reject_docker_units(ssh: SSHCommand) -> None:
         )
     expected = {"docker.service", "docker.socket", "containerd.service"}
     lines = [line.split() for line in units.stdout.splitlines() if line.strip()]
-    if not lines or any(len(fields) < 2 or fields[0] not in expected for fields in lines):
+    if not lines or any(
+        len(fields) < 2 or fields[0] not in expected for fields in lines
+    ):
         raise VerificationError(
             "systemctl вернул неоднозначный список Docker/containerd unit-файлов"
         )
@@ -246,11 +250,16 @@ def _reject_nftables_service(ssh: SSHCommand) -> None:
     active_code, active, active_diagnostic = _systemd_state(ssh, "is-active")
     if active_code == 0 or active == "active":
         raise InstallerError("Обнаружен активный nftables.service")
-    if active_diagnostic or active_code not in {1, 3, 4} or active not in {
-        "inactive",
-        "unknown",
-        "not-found",
-    }:
+    if (
+        active_diagnostic
+        or active_code not in {1, 3, 4}
+        or active
+        not in {
+            "inactive",
+            "unknown",
+            "not-found",
+        }
+    ):
         raise InstallerError("Не удалось однозначно проверить nftables.service")
 
     enabled_code, enabled, enabled_diagnostic = _systemd_state(ssh, "is-enabled")
@@ -264,7 +273,7 @@ def _reject_nftables_service(ssh: SSHCommand) -> None:
     missing = (
         enabled_code == 1
         and not enabled
-        and enabled_diagnostic in _NFTABLES_MISSING_UNIT_DIAGNOSTICS
+        and english_words(enabled_diagnostic) in _NFTABLES_MISSING_UNIT_DIAGNOSTIC_WORDS
     )
     if not (disabled or missing):
         raise InstallerError(
@@ -324,11 +333,18 @@ def _numbered_rules(output: str) -> list[tuple[int, str, str]]:
         match = _NUMBERED_UFW_LINE.match(raw_line)
         if match is None:
             fields = tuple(stripped.split())
-            if fields in {
-                ("Status:", "active"),
-                ("To", "Action", "From"),
-                ("--", "------", "----"),
-            }:
+            words = english_words(stripped)
+            is_separator = len(fields) == 3 and all(
+                re.fullmatch(r"-+", field) for field in fields
+            )
+            if (
+                words
+                in {
+                    ("status", "active"),
+                    ("to", "action", "from"),
+                }
+                or is_separator
+            ):
                 continue
             raise VerificationError("Некорректный вывод ufw status numbered")
         body = match.group(2).strip()
@@ -364,8 +380,10 @@ def _inspect_ufw(
     )
     if result.stderr.strip():
         raise VerificationError("ufw status numbered вернул предупреждение")
-    status_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    active = bool(status_lines) and status_lines[0] == "Status: active"
+    try:
+        active = parse_ufw_status(result.stdout)
+    except ValueError as exc:
+        raise VerificationError("UFW вернул неоднозначное состояние") from exc
     if not active:
         return _UfwState(False, (), (), ())
 
@@ -375,25 +393,23 @@ def _inspect_ufw(
     numbered = _numbered_rules(result.stdout)
     allowed_comments = {guard_comment, allow_comment, deny_comment}
     foreign_comments = sorted(
-        {comment for _index, _rule, comment in numbered if comment not in allowed_comments}
+        {
+            comment
+            for _index, _rule, comment in numbered
+            if comment not in allowed_comments
+        }
     )
     if foreign_comments:
         raise InstallerError("UFW содержит foreign rules")
 
     guard_lines = [
-        (index, rule)
-        for index, rule, comment in numbered
-        if comment == guard_comment
+        (index, rule) for index, rule, comment in numbered if comment == guard_comment
     ]
     allow_lines = [
-        (index, rule)
-        for index, rule, comment in numbered
-        if comment == allow_comment
+        (index, rule) for index, rule, comment in numbered if comment == allow_comment
     ]
     deny_lines = [
-        (index, rule)
-        for index, rule, comment in numbered
-        if comment == deny_comment
+        (index, rule) for index, rule, comment in numbered if comment == deny_comment
     ]
 
     allow_namespace = f"{_MANAGED_ALLOW_PREFIX}{profile.backend_port}-"
@@ -425,9 +441,7 @@ def _inspect_ufw(
         or len(ipv6_guard) > 1
         or len(guard_lines) != len(ipv4_guard) + len(ipv6_guard)
     ):
-        raise InstallerError(
-            "UFW не содержит exact managed SSH guard текущего порта"
-        )
+        raise InstallerError("UFW не содержит exact managed SSH guard текущего порта")
 
     if len(allow_lines) > 1:
         raise InstallerError("Обнаружены дубли managed UFW allow rule")
@@ -646,7 +660,9 @@ def _validated_recovery(
     )
     comments = tuple(recovery.attempted_comments)
     if comments != expected[: len(comments)] or len(comments) > len(expected):
-        raise ValidationError("Remote network recovery journal не является exact prefix")
+        raise ValidationError(
+            "Remote network recovery journal не является exact prefix"
+        )
     return RemoteExitNetworkRecovery(profile, ssh_port, comments)
 
 
@@ -834,16 +850,12 @@ def apply_remote_exit_network(
             )
         except SSHTransportError:
             if not isinstance(original, Exception):
-                original.add_note(
-                    "Remote UFW rollback после прерывания не подтверждён"
-                )
+                original.add_note("Remote UFW rollback после прерывания не подтверждён")
                 raise original from None
             raise RemoteExitNetworkError(recovery=recovery) from original
         except Exception as rollback_error:
             if not isinstance(original, Exception):
-                original.add_note(
-                    "Remote UFW rollback после прерывания не подтверждён"
-                )
+                original.add_note("Remote UFW rollback после прерывания не подтверждён")
                 raise original from None
             raise InstallerError(
                 "Remote UFW apply не удался, rollback неполон"

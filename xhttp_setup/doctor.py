@@ -205,7 +205,7 @@ def _free_tcp_port() -> int:
 def _parse_cloudflare_trace_ip(payload: str) -> str:
     for line in payload.splitlines():
         key, separator, value = line.partition("=")
-        if separator and key.strip() == "ip":
+        if separator and key.strip().casefold() == "ip":
             return validate_ipv4(value.strip())
     raise VerificationError("E2E endpoint не вернул строку ip=...")
 

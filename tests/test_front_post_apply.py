@@ -75,11 +75,13 @@ class MemorySFTP:
 
     def batch(self, commands, check=True):
         self.commands.extend(commands)
+        remote_dir = "/"
         for raw in commands:
             ignored = raw.startswith("-")
             parts = shlex.split(raw[1:] if ignored else raw)
             try:
                 if parts[0] == "cd":
+                    remote_dir = parts[1]
                     continue
                 if parts[0] == "ls":
                     if parts[-1] not in self.files:
@@ -102,7 +104,13 @@ class MemorySFTP:
             except (FileNotFoundError, KeyError):
                 if ignored:
                     continue
-                result = subprocess.CompletedProcess(commands, 1, "", "No such file")
+                remote_path = f"{remote_dir.rstrip('/')}/{parts[-1]}"
+                result = subprocess.CompletedProcess(
+                    commands,
+                    1,
+                    "",
+                    f'Can\'t ls: "{remote_path}" not found\n',
+                )
                 if check:
                     raise InstallerError("simulated missing remote file")
                 return result

@@ -16,6 +16,150 @@ def completed(argv, returncode=0, stdout="", stderr=""):
     )
 
 
+def official_empty_ufw_rewrite(
+    prefix: str,
+    *,
+    logging: str = "low",
+    rate_limiting: bool = True,
+) -> str:
+    chains = "".join(
+        f":{prefix}-{name} - [0:0]\n"
+        for name in (
+            "user-input",
+            "user-output",
+            "user-forward",
+            "before-logging-input",
+            "before-logging-output",
+            "before-logging-forward",
+            "user-logging-input",
+            "user-logging-output",
+            "user-logging-forward",
+            "after-logging-input",
+            "after-logging-output",
+            "after-logging-forward",
+            "logging-deny",
+            "logging-allow",
+        )
+    )
+    if rate_limiting:
+        chains += f":{prefix}-user-limit - [0:0]\n:{prefix}-user-limit-accept - [0:0]\n"
+    if logging == "low":
+        logging_rules = (
+            f"-A {prefix}-after-logging-input -j LOG --log-prefix "
+            '"[UFW BLOCK] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-A {prefix}-after-logging-forward -j LOG --log-prefix "
+            '"[UFW BLOCK] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-I {prefix}-logging-deny -m conntrack --ctstate INVALID "
+            "-j RETURN -m limit --limit 3/min --limit-burst 10\n"
+            f"-A {prefix}-logging-deny -j LOG --log-prefix "
+            '"[UFW BLOCK] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-A {prefix}-logging-allow -j LOG --log-prefix "
+            '"[UFW ALLOW] " -m limit --limit 3/min --limit-burst 10\n'
+        )
+    elif logging == "medium":
+        logging_rules = (
+            f"-A {prefix}-after-logging-input -j LOG --log-prefix "
+            '"[UFW BLOCK] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-A {prefix}-after-logging-output -j LOG --log-prefix "
+            '"[UFW ALLOW] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-A {prefix}-after-logging-forward -j LOG --log-prefix "
+            '"[UFW BLOCK] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-A {prefix}-logging-deny -m conntrack --ctstate INVALID "
+            '-j LOG --log-prefix "[UFW AUDIT INVALID] " '
+            "-m limit --limit 3/min --limit-burst 10\n"
+            f"-A {prefix}-logging-deny -j LOG --log-prefix "
+            '"[UFW BLOCK] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-A {prefix}-logging-allow -j LOG --log-prefix "
+            '"[UFW ALLOW] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-I {prefix}-before-logging-input -j LOG --log-prefix "
+            '"[UFW AUDIT] " -m conntrack --ctstate NEW '
+            "-m limit --limit 3/min --limit-burst 10\n"
+            f"-I {prefix}-before-logging-output -j LOG --log-prefix "
+            '"[UFW AUDIT] " -m conntrack --ctstate NEW '
+            "-m limit --limit 3/min --limit-burst 10\n"
+            f"-I {prefix}-before-logging-forward -j LOG --log-prefix "
+            '"[UFW AUDIT] " -m conntrack --ctstate NEW '
+            "-m limit --limit 3/min --limit-burst 10\n"
+        )
+    elif logging == "high":
+        logging_rules = (
+            f"-A {prefix}-after-logging-input -j LOG --log-prefix "
+            '"[UFW BLOCK] "\n'
+            f"-A {prefix}-after-logging-output -j LOG --log-prefix "
+            '"[UFW ALLOW] "\n'
+            f"-A {prefix}-after-logging-forward -j LOG --log-prefix "
+            '"[UFW BLOCK] "\n'
+            f"-A {prefix}-logging-deny -m conntrack --ctstate INVALID "
+            '-j LOG --log-prefix "[UFW AUDIT INVALID] "\n'
+            f"-A {prefix}-logging-deny -j LOG --log-prefix "
+            '"[UFW BLOCK] "\n'
+            f"-A {prefix}-logging-allow -j LOG --log-prefix "
+            '"[UFW ALLOW] "\n'
+            f"-I {prefix}-before-logging-input -j LOG --log-prefix "
+            '"[UFW AUDIT] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-I {prefix}-before-logging-output -j LOG --log-prefix "
+            '"[UFW AUDIT] " -m limit --limit 3/min --limit-burst 10\n'
+            f"-I {prefix}-before-logging-forward -j LOG --log-prefix "
+            '"[UFW AUDIT] " -m limit --limit 3/min --limit-burst 10\n'
+        )
+    elif logging == "full":
+        logging_rules = (
+            f"-A {prefix}-after-logging-input -j LOG --log-prefix "
+            '"[UFW BLOCK] "\n'
+            f"-A {prefix}-after-logging-output -j LOG --log-prefix "
+            '"[UFW ALLOW] "\n'
+            f"-A {prefix}-after-logging-forward -j LOG --log-prefix "
+            '"[UFW BLOCK] "\n'
+            f"-A {prefix}-logging-deny -m conntrack --ctstate INVALID "
+            '-j LOG --log-prefix "[UFW AUDIT INVALID] "\n'
+            f"-A {prefix}-logging-deny -j LOG --log-prefix "
+            '"[UFW BLOCK] "\n'
+            f"-A {prefix}-logging-allow -j LOG --log-prefix "
+            '"[UFW ALLOW] "\n'
+            f"-I {prefix}-before-logging-input -j LOG --log-prefix "
+            '"[UFW AUDIT] "\n'
+            f"-I {prefix}-before-logging-output -j LOG --log-prefix "
+            '"[UFW AUDIT] "\n'
+            f"-I {prefix}-before-logging-forward -j LOG --log-prefix "
+            '"[UFW AUDIT] "\n'
+        )
+    elif logging == "off":
+        logging_rules = "".join(
+            f"-I {prefix}-user-logging-{direction} -j RETURN\n"
+            for direction in ("input", "output", "forward")
+        )
+    else:  # pragma: no cover - fixture contract
+        raise AssertionError(f"unsupported fixture log level: {logging}")
+
+    rate_rules = ""
+    if rate_limiting:
+        rate_log = (
+            f"-A {prefix}-user-limit -m limit --limit 3/minute -j LOG "
+            '--log-prefix "[UFW LIMIT BLOCK] "\n'
+            if logging != "off"
+            else ""
+        )
+        rate_rules = (
+            "\n### RATE LIMITING ###\n"
+            f"{rate_log}"
+            f"-A {prefix}-user-limit -j REJECT\n"
+            f"-A {prefix}-user-limit-accept -j ACCEPT\n"
+            "### END RATE LIMITING ###\n"
+        )
+    return (
+        f"*filter\n{chains}"
+        "### RULES ###\n"
+        "\n"
+        "### END RULES ###\n"
+        "\n"
+        "### LOGGING ###\n"
+        f"{logging_rules}"
+        "### END LOGGING ###\n"
+        f"{rate_rules}"
+        "COMMIT\n"
+    )
+
+
 class FakeGuard:
     def __init__(self, *, armed=False, disarm_effect=None, arm_effective=True):
         self.calls = []
@@ -86,11 +230,36 @@ IPV6=yes
         self.fail_fresh_id_once = False
         self.trace_payloads = []
         self.systemd_unit_states = {}
+        self.systemd_unit_stderr = {}
         self.guard_stop_lag_queries = 0
         self.guard_stopping_units = set()
         self.package_verify = (0, "", "")
-        self.user_rules = "*filter\n### RULES ###\n\n### END RULES ###\nCOMMIT\n"
-        self.user6_rules = "*filter\n### RULES ###\n\n### END RULES ###\nCOMMIT\n"
+        self.cat_results = {}
+        self.proc_exists = {"ipv4": True, "ipv6": True}
+        self.user_rules_template = (
+            "*filter\n"
+            ":ufw-user-input - [0:0]\n"
+            ":ufw-user-output - [0:0]\n"
+            ":ufw-user-forward - [0:0]\n"
+            ":ufw-user-limit - [0:0]\n"
+            ":ufw-user-limit-accept - [0:0]\n"
+            "### RULES ###\n"
+            "-A ufw-user-limit -m limit --limit 3/minute -j LOG "
+            '--log-prefix "[UFW LIMIT BLOCK] "\n'
+            "-A ufw-user-limit -j REJECT\n"
+            "-A ufw-user-limit-accept -j ACCEPT\n"
+            "COMMIT\n"
+        )
+        self.user6_rules_template = (
+            "*filter\n"
+            ":ufw6-user-input - [0:0]\n"
+            ":ufw6-user-output - [0:0]\n"
+            ":ufw6-user-forward - [0:0]\n"
+            "### RULES ###\n"
+            "COMMIT\n"
+        )
+        self.user_rules = self.user_rules_template
+        self.user6_rules = self.user6_rules_template
         self.fail_allow_after_side_effect = False
         self.foreign_rule_after_allow = None
         self.foreign_nft_after_disable = None
@@ -220,6 +389,14 @@ COMMIT
         del check, timeout
         command = list(argv)
         self.calls.append(tuple(command))
+        if len(command) == 2 and command[0] == "cat" and command[1] in self.cat_results:
+            code, stdout, stderr = self.cat_results[command[1]]
+            return completed(
+                command,
+                returncode=code,
+                stdout=stdout,
+                stderr=stderr,
+            )
         if command == ["id", "-u"]:
             self.id_calls += 1
             if self.fail_fresh_id_once and self.ufw_active:
@@ -295,6 +472,16 @@ COMMIT
                 stdout=self._iptables_save(ipv6=True),
                 stderr=self.ip6tables_stderr,
             )
+        if command == ["test", "-e", "/proc/net/ip_tables_names"]:
+            return completed(
+                command,
+                returncode=0 if self.proc_exists["ipv4"] else 1,
+            )
+        if command == ["test", "-e", "/proc/net/ip6_tables_names"]:
+            return completed(
+                command,
+                returncode=0 if self.proc_exists["ipv6"] else 1,
+            )
         if command == ["cat", "/proc/net/ip_tables_names"]:
             return completed(command, stdout=self.proc_tables["ipv4"])
         if command == ["cat", "/proc/net/ip6_tables_names"]:
@@ -307,6 +494,10 @@ COMMIT
             return completed(command, stdout=self.user_rules)
         if command == ["cat", "/etc/ufw/user6.rules"]:
             return completed(command, stdout=self.user6_rules)
+        if command == ["cat", "/usr/share/ufw/iptables/user.rules"]:
+            return completed(command, stdout=self.user_rules_template)
+        if command == ["cat", "/usr/share/ufw/iptables/user6.rules"]:
+            return completed(command, stdout=self.user6_rules_template)
         if command == ["env", "LC_ALL=C", "LANG=C", "dpkg", "--verify", "ufw"]:
             code, stdout, stderr = self.package_verify
             return completed(command, returncode=code, stdout=stdout, stderr=stderr)
@@ -321,9 +512,7 @@ COMMIT
             package = command[6]
             if package in self.package_results:
                 code, stdout, stderr = self.package_results[package]
-                return completed(
-                    command, returncode=code, stdout=stdout, stderr=stderr
-                )
+                return completed(command, returncode=code, stdout=stdout, stderr=stderr)
             if package in self.packages:
                 return completed(command, stdout="ii ")
             return completed(command, stdout="un ")
@@ -367,8 +556,18 @@ COMMIT
                 return completed(command, stdout="active\n")
             if command[2] in self.systemd_unit_states:
                 code, output = self.systemd_unit_states[command[2]]
-                return completed(command, returncode=code, stdout=output)
-            return completed(command, returncode=1, stdout="inactive\n")
+                return completed(
+                    command,
+                    returncode=code,
+                    stdout=output,
+                    stderr=self.systemd_unit_stderr.get(command[2], ""),
+                )
+            return completed(
+                command,
+                returncode=1,
+                stdout="inactive\n",
+                stderr=self.systemd_unit_stderr.get(command[2], ""),
+            )
         raise AssertionError(f"unexpected SSH command: {command!r}")
 
     def fresh_command(self, argv, *, check=True, timeout=300):
@@ -695,6 +894,37 @@ COMMIT
 
         self.assertEqual(subject._ufw_added_commands(ssh), [])
 
+    def test_ufw_human_output_accepts_presentation_variants(self):
+        ssh = FakeSSH()
+        ssh.ufw_show_added_override = (
+            "ADDED USER RULES, see UFW status for running firewall!\n"
+            "ufw\tallow   22/tcp comment xhttp-setup-ssh-guard-22\n"
+        )
+
+        self.assertEqual(
+            subject._ufw_added_commands(ssh),
+            [subject._expected_ssh_rule(22)],
+        )
+
+        ssh.ufw_active = True
+        ssh._ufw_output = lambda: " STATUS - ACTIVE!\n"
+        self.assertTrue(subject._ufw_status(ssh))
+
+    def test_ufw_status_stderr_still_fails_closed(self):
+        ssh = FakeSSH()
+        original_ufw = ssh._ufw
+
+        def warning_status(command, inner):
+            if inner == ["status", "numbered"]:
+                return completed(
+                    command, stdout="Status: inactive\n", stderr="warning\n"
+                )
+            return original_ufw(command, inner)
+
+        ssh._ufw = warning_status
+        with self.assertRaisesRegex(VerificationError, "предупреждение"):
+            subject._ufw_status(ssh)
+
     def test_ufw_show_added_empty_marker_must_be_the_only_payload(self):
         expected = shlex.join(subject._expected_ssh_rule(22))
         cases = (
@@ -831,14 +1061,16 @@ COMMIT
         unknown_missing.package_results["ufw"] = (
             1,
             "",
-            "dpkg-query: no packages found matching ufw\n",
+            "dpkg-query: no packages found matching 'ufw'.\n",
         )
         self.assertIn("ufw", subject._missing_packages(unknown_missing))
 
         bad_shapes = (
             (0, "rc ", ""),
             (0, "un ", "warning\n"),
-            (1, "", "unexpected error\n"),
+            (1, "partial", "no package found\n"),
+            (1, "", ""),
+            (1, "", "first diagnostic\nsecond diagnostic\n"),
             (2, "", "dpkg database error\n"),
         )
         for code, stdout, stderr in bad_shapes:
@@ -959,13 +1191,13 @@ COMMIT
         modified = FakeSSH()
         modified.package_verify = (
             0,
-            "??5?????? c /etc/ufw/before.rules\n",
+            "??5?????? /usr/share/ufw/iptables/user.rules\n",
             "",
         )
         dormant = FakeSSH()
-        dormant.user_rules = (
-            "*filter\n### RULES ###\n-A ufw-user-input -p tcp --dport 80 "
-            "-j ACCEPT\n### END RULES ###\nCOMMIT\n"
+        dormant.user_rules = dormant.user_rules.replace(
+            "COMMIT\n",
+            "-A ufw-user-input -p tcp --dport 80 -j ACCEPT\nCOMMIT\n",
         )
 
         for ssh, message in (
@@ -981,16 +1213,217 @@ COMMIT
                     )
                 self.assertFalse(ssh.events)
 
+    def test_ufw_user_rule_parser_accepts_real_seed_and_official_rewrite(self):
+        seed = FakeSSH()
+        for path, template_path in (
+            (
+                "/etc/ufw/user.rules",
+                "/usr/share/ufw/iptables/user.rules",
+            ),
+            (
+                "/etc/ufw/user6.rules",
+                "/usr/share/ufw/iptables/user6.rules",
+            ),
+        ):
+            with self.subTest(form="package-seed", path=path):
+                subject._require_empty_ufw_user_rule_section(
+                    seed,
+                    path,
+                    template_path=template_path,
+                )
+
+        for logging in ("off", "low", "medium", "high", "full"):
+            for rate_limiting in (False, True):
+                rewritten = FakeSSH()
+                rewritten.user_rules = official_empty_ufw_rewrite(
+                    "ufw",
+                    logging=logging,
+                    rate_limiting=rate_limiting,
+                )
+                rewritten.user6_rules = official_empty_ufw_rewrite(
+                    "ufw6",
+                    logging=logging,
+                    rate_limiting=rate_limiting,
+                )
+                for path, template_path in (
+                    (
+                        "/etc/ufw/user.rules",
+                        "/usr/share/ufw/iptables/user.rules",
+                    ),
+                    (
+                        "/etc/ufw/user6.rules",
+                        "/usr/share/ufw/iptables/user6.rules",
+                    ),
+                ):
+                    with self.subTest(
+                        form="rewritten",
+                        logging=logging,
+                        rate_limiting=rate_limiting,
+                        path=path,
+                    ):
+                        subject._require_empty_ufw_user_rule_section(
+                            rewritten,
+                            path,
+                            template_path=template_path,
+                        )
+                self.assertNotIn(
+                    ("cat", "/usr/share/ufw/iptables/user.rules"),
+                    rewritten.calls,
+                )
+                self.assertNotIn(
+                    ("cat", "/usr/share/ufw/iptables/user6.rules"),
+                    rewritten.calls,
+                )
+
+    def test_ufw_user_rule_parser_rejects_changed_or_ambiguous_files(self):
+        changed_seed = FakeSSH()
+        changed_seed.user_rules = changed_seed.user_rules.replace(
+            "COMMIT\n",
+            "-A ufw-user-output -p tcp --dport 443 -j ACCEPT\nCOMMIT\n",
+        )
+        with self.assertRaisesRegex(InstallerError, "dormant user rules"):
+            subject._require_empty_ufw_user_rule_section(
+                changed_seed,
+                "/etc/ufw/user.rules",
+                template_path="/usr/share/ufw/iptables/user.rules",
+            )
+
+        changed_rewrite = FakeSSH()
+        changed_rewrite.user_rules = (
+            "*filter\n"
+            "### RULES ###\n"
+            "### tuple ### allow tcp 443 0.0.0.0/0 any 0.0.0.0/0 in\n"
+            "-A ufw-user-input -p tcp --dport 443 -j ACCEPT\n"
+            "### END RULES ###\n"
+            "COMMIT\n"
+        )
+        with self.assertRaisesRegex(InstallerError, "dormant user rules"):
+            subject._require_empty_ufw_user_rule_section(
+                changed_rewrite,
+                "/etc/ufw/user.rules",
+                template_path="/usr/share/ufw/iptables/user.rules",
+            )
+
+        valid_rewrite = official_empty_ufw_rewrite("ufw")
+        outside_or_malformed = {
+            "before-rules": valid_rewrite.replace(
+                "### RULES ###\n",
+                "-A ufw-user-input -p tcp --dport 80 -j ACCEPT\n### RULES ###\n",
+                1,
+            ),
+            "logging": valid_rewrite.replace(
+                "### LOGGING ###\n",
+                "### LOGGING ###\n-A ufw-after-logging-input -j ACCEPT\n",
+                1,
+            ),
+            "rate-limiting": valid_rewrite.replace(
+                "### RATE LIMITING ###\n",
+                "### RATE LIMITING ###\n-A ufw-user-limit -j ACCEPT\n",
+                1,
+            ),
+            "after-rate-limiting": valid_rewrite.replace(
+                "### END RATE LIMITING ###\n",
+                "### END RATE LIMITING ###\n-A ufw-user-output -j ACCEPT\n",
+                1,
+            ),
+            "logging-markers-reversed": valid_rewrite.replace(
+                "### LOGGING ###",
+                "### TEMP LOGGING ###",
+                1,
+            )
+            .replace("### END LOGGING ###", "### LOGGING ###", 1)
+            .replace("### TEMP LOGGING ###", "### END LOGGING ###", 1),
+        }
+        for name, payload in outside_or_malformed.items():
+            ssh = FakeSSH()
+            ssh.user_rules = payload
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(InstallerError, "dormant user rules"):
+                    subject._require_empty_ufw_user_rule_section(
+                        ssh,
+                        "/etc/ufw/user.rules",
+                        template_path="/usr/share/ufw/iptables/user.rules",
+                    )
+
+        malformed = (
+            "*filter\nCOMMIT\n",
+            "*filter\n### END RULES ###\nCOMMIT\n",
+            "*filter\n### RULES ###\n### RULES ###\nCOMMIT\n",
+            "*filter\n### END RULES ###\n### RULES ###\nCOMMIT\n",
+            ("*filter\n### RULES ###\n### END RULES ###\n### END RULES ###\nCOMMIT\n"),
+        )
+        for payload in malformed:
+            ssh = FakeSSH()
+            ssh.user_rules = payload
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(
+                    VerificationError,
+                    "не содержит однозначный",
+                ):
+                    subject._require_empty_ufw_user_rule_section(
+                        ssh,
+                        "/etc/ufw/user.rules",
+                        template_path="/usr/share/ufw/iptables/user.rules",
+                    )
+
+    def test_ufw_user_rule_parser_read_failures_and_mapping_fail_closed(self):
+        cases = (
+            ("/etc/ufw/user.rules", (1, "", "read failed"), InstallerError),
+            ("/etc/ufw/user.rules", (0, "", "warning"), VerificationError),
+            (
+                "/usr/share/ufw/iptables/user.rules",
+                (1, "", "read failed"),
+                InstallerError,
+            ),
+            (
+                "/usr/share/ufw/iptables/user.rules",
+                (0, "", "warning"),
+                VerificationError,
+            ),
+        )
+        for path, result, error in cases:
+            ssh = FakeSSH()
+            ssh.cat_results[path] = result
+            with self.subTest(path=path, result=result):
+                with self.assertRaises(error):
+                    subject._require_empty_ufw_user_rule_section(
+                        ssh,
+                        "/etc/ufw/user.rules",
+                        template_path="/usr/share/ufw/iptables/user.rules",
+                    )
+
+        swapped = FakeSSH()
+        with self.assertRaisesRegex(InstallerError, "dormant user rules"):
+            subject._require_empty_ufw_user_rule_section(
+                swapped,
+                "/etc/ufw/user.rules",
+                template_path="/usr/share/ufw/iptables/user6.rules",
+            )
+
     def test_minimal_image_missing_only_ufw_docs_is_accepted(self):
         ssh = FakeSSH()
         ssh.package_verify = (
             0,
-            "missing     /usr/share/doc/ufw/README.gz\n"
-            "missing     /usr/share/man/man8/ufw.8.gz\n",
+            "missing\t/usr/share/doc/ufw/README.gz\n"
+            "missing  /usr/share/man/man8/ufw.8.gz\n",
             "",
         )
 
         subject._verify_ufw_package_integrity(ssh)
+
+    def test_ufw_package_verify_rejects_status_and_path_lookalikes(self):
+        payloads = (
+            "??5?????? /usr/share/doc/ufw/README.gz\n",
+            "missing /usr/share/doc/ufw.evil/README.gz\n",
+            "missing /usr/share/doc/ufw/../../etc/ufw/ufw.conf\n",
+            "missing /usr/share/doc/ufw\n",
+        )
+        for payload in payloads:
+            ssh = FakeSSH()
+            ssh.package_verify = (0, payload, "")
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(InstallerError, "configuration изменена"):
+                    subject._verify_ufw_package_integrity(ssh)
 
     def test_cross_family_ufw_and_inspector_warnings_fail_closed(self):
         ssh = FakeSSH()
@@ -1011,6 +1444,34 @@ COMMIT
         warning.ip6tables_stderr = "legacy tables present\n"
         with self.assertRaisesRegex(VerificationError, "предупреждение"):
             subject._inspect_firewall(warning, ufw_active=False)
+
+    def test_legacy_proc_firewall_probe_distinguishes_absent_and_read_failure(self):
+        absent = FakeSSH()
+        absent.tools.difference_update({"iptables-save", "ip6tables-save"})
+        absent.proc_exists = {"ipv4": False, "ipv6": False}
+        subject._inspect_firewall(absent, ufw_active=False)
+        self.assertNotIn(("cat", "/proc/net/ip_tables_names"), absent.calls)
+        self.assertNotIn(("cat", "/proc/net/ip6_tables_names"), absent.calls)
+
+        readable = FakeSSH()
+        readable.tools.difference_update({"iptables-save", "ip6tables-save"})
+        subject._inspect_firewall(readable, ufw_active=False)
+
+        unreadable = FakeSSH()
+        unreadable.tools.difference_update({"iptables-save", "ip6tables-save"})
+        unreadable.cat_results["/proc/net/ip_tables_names"] = (
+            1,
+            "",
+            "read failed\n",
+        )
+        with self.assertRaisesRegex(InstallerError, "legacy iptables"):
+            subject._inspect_firewall(unreadable, ufw_active=False)
+
+        populated = FakeSSH()
+        populated.tools.difference_update({"iptables-save", "ip6tables-save"})
+        populated.proc_tables["ipv4"] = "filter\n"
+        with self.assertRaisesRegex(InstallerError, "legacy iptables tables"):
+            subject._inspect_firewall(populated, ufw_active=False)
 
     def test_firewall_snapshot_ignores_only_runtime_counters_and_comments(self):
         nft_a = "# first\ncounter packets 1 bytes 2 jump ufw-before-input\n"
@@ -1097,6 +1558,11 @@ COMMIT
         ssh.systemd_unit_states[f"{unit}.timer"] = (0, "inactive\n")
         with self.assertRaisesRegex(VerificationError, "неоднозначно"):
             guard.is_armed(ssh, ssh_port=22)
+
+        warning = FakeSSH()
+        warning.systemd_unit_stderr[f"{unit}.timer"] = "systemctl warning\n"
+        with self.assertRaisesRegex(VerificationError, "неоднозначное состояние"):
+            guard.is_armed(warning, ssh_port=22)
 
     def test_systemd_guard_disarm_waits_for_transient_active_state(self):
         ssh = FakeSSH()

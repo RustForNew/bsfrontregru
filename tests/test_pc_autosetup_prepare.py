@@ -346,8 +346,12 @@ class PcPrepareTests(unittest.TestCase):
                     return completed(
                         commands,
                         returncode=1,
-                        stdout=f"Remote working directory: {sftp_home}\n",
-                        stderr="stat remote: No such file or directory\n",
+                        stdout=(
+                            "sftp> pwd\n"
+                            f"Remote working directory: {sftp_home}\n"
+                            f'sftp> cd "{api_docroot}"\n'
+                        ),
+                        stderr=(f"realpath {api_docroot}: No such file or directory\n"),
                     )
                 if commands == [f'cd "{resolved_docroot}"', "pwd"]:
                     return completed(
@@ -518,6 +522,39 @@ class PcPrepareTests(unittest.TestCase):
                 self._run(
                     Path(temp),
                     sftp_factory=MixedFailureSFTP,
+                    inspect_sequence=(site,),
+                )
+        self.assertEqual(len(calls), 1)
+
+    def test_missing_path_diagnostic_must_name_the_attempted_docroot(self):
+        calls = []
+
+        class WrongPathFailureSFTP:
+            def __init__(self, **_kwargs):
+                pass
+
+            def batch(self, commands, *, check=True):
+                del check
+                calls.append(commands)
+                return completed(
+                    commands,
+                    returncode=1,
+                    stdout=(
+                        "sftp> pwd\n"
+                        "Remote working directory: /var/www/u/data\n"
+                        'sftp> cd "/front.example.org"\n'
+                    ),
+                    stderr=(
+                        "realpath /different.example.org: No such file or directory\n"
+                    ),
+                )
+
+        site = SiteInfo("front.example.org", "/front.example.org", None)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(VerificationError, "недоступен"):
+                self._run(
+                    Path(temp),
+                    sftp_factory=WrongPathFailureSFTP,
                     inspect_sequence=(site,),
                 )
         self.assertEqual(len(calls), 1)

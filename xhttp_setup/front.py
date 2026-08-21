@@ -318,8 +318,15 @@ def _download_optional(
         check=False,
     )
     if probe.returncode != 0:
-        detail = (probe.stderr + "\n" + probe.stdout).lower()
-        if "no such file" in detail or "not found" in detail:
+        remote_path = f"{remote_dir.rstrip('/')}/{name}"
+        diagnostics = [
+            line.strip() for line in probe.stderr.splitlines() if line.strip()
+        ]
+        missing_diagnostics = {
+            f'Can\'t ls: "{remote_path}" not found',
+            f'File "{remote_path}" not found.',
+        }
+        if len(diagnostics) == 1 and diagnostics[0] in missing_diagnostics:
             return False
         raise InstallerError(
             f"SFTP не смог проверить существующий {name}; перезапись запрещена"

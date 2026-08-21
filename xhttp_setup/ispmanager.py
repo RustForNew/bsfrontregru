@@ -59,9 +59,7 @@ class _RoutedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
-def _routed_post(
-    endpoint: str, data: bytes, *, timeout: int, route: TCPRoute
-) -> bytes:
+def _routed_post(endpoint: str, data: bytes, *, timeout: int, route: TCPRoute) -> bytes:
     parsed = urlsplit(endpoint)
     if not parsed.hostname:
         raise VerificationError("ISPmanager endpoint не содержит hostname")
@@ -100,7 +98,7 @@ def validate_panel_endpoint(value: str) -> str:
     endpoint = value.strip().rstrip("/")
     parsed = urlsplit(endpoint)
     if (
-        parsed.scheme != "https"
+        parsed.scheme.casefold() != "https"
         or not parsed.hostname
         or parsed.username
         or parsed.password

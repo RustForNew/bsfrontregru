@@ -123,7 +123,13 @@
   only disables UFW and never deletes the sole SSH allow after a failed disable.
   UFW 0.36.x's official `(None)` marker is treated as an empty persistent rule
   inventory; the marker mixed with commands, unknown payload lines and stderr
-  diagnostics still fail closed.
+  diagnostics still fail closed. A no-END `user.rules`/`user6.rules` package
+  seed is accepted only when its complete text matches the local template
+  previously checked by `dpkg --verify`. A rewritten file is accepted only
+  when the complete file matches an upstream-generated empty UFW 0.36.x layout
+  for one of the five logging levels and either rate-limit-chain capability.
+  Extra, missing, reordered or foreign content anywhere in either form fails
+  closed; an empty delimited RULES body alone is not sufficient.
   A later run detects and reconciles an owned stale guard or exact dormant SSH
   rule. It never edits provider cloud firewalls, merges custom nftables/iptables,
   or disables a standalone firewall service.
@@ -134,6 +140,11 @@
   chain names are not cryptographic ownership evidence for pre-edited raw
   `before/after` files or injected internal-chain contents. Such hosts are
   outside the automatic merge contract and require manual audit or replacement.
+- Fixed human-oriented command labels and headers are compared as normalized
+  word sequences, ignoring only presentation case, whitespace and punctuation.
+  Extra or missing words remain semantic changes. Machine fields, paths, unit
+  state tokens, rule bodies, keys, identifiers and comments retain their strict
+  owning-module validation; unknown payload and stderr diagnostics fail closed.
 - Frontend egress discovery uses three distinct CSPRNG destination ports in
   separate, deadline-complete captures. The exact triple is stored with mode
   `0600`, bound to the domain and exit/SSH/backend endpoint, printed for a
