@@ -267,7 +267,14 @@ class FakeSSH:
                 stdout=output,
                 stderr=self.nft_enabled_stderr,
             )
-        if command == ["nft", "list", "ruleset"]:
+        if command == [
+            "env",
+            "LC_ALL=C",
+            "LANG=C",
+            "nft",
+            "list",
+            "ruleset",
+        ]:
             return completed(command, stdout=self.nft_ruleset, stderr=self.nft_stderr)
         if command == ["iptables-save"]:
             return completed(
@@ -436,6 +443,38 @@ class RemoteNetworkTests(unittest.TestCase):
         state = preflight_remote_exit_network(ssh, self.profile, ssh_port=22)
 
         self.assertEqual(state.os_id, "debian")
+
+    def test_preflight_accepts_only_matching_iptables_nft_ownership_notices(self):
+        official = (
+            "# Warning: table ip filter is managed by iptables-nft, do not touch!\n"
+            "# Warning: table ip6 filter is managed by iptables-nft, do not touch!\n"
+        )
+        ssh = FakeSSH()
+        ssh.nft_stderr = official
+
+        state = preflight_remote_exit_network(ssh, self.profile, ssh_port=22)
+
+        self.assertEqual(state.os_id, "debian")
+        self.assertIn(
+            ("env", "LC_ALL=C", "LANG=C", "nft", "list", "ruleset"),
+            self._commands(ssh),
+        )
+
+        bad_diagnostics = {
+            "missing-family": official.splitlines(keepends=True)[0],
+            "mixed-warning": official + "warning: cache was stale\n",
+            "wrong-table": official.replace(" ip filter ", " ip nat ", 1),
+        }
+        for name, diagnostic in bad_diagnostics.items():
+            broken = FakeSSH()
+            broken.nft_stderr = diagnostic
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(VerificationError, "диагностику"):
+                    preflight_remote_exit_network(
+                        broken,
+                        self.profile,
+                        ssh_port=22,
+                    )
 
     def test_missing_nftables_unit_diagnostic_ignores_presentation(self):
         ssh = FakeSSH()

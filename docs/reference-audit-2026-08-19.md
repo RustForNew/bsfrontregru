@@ -83,7 +83,7 @@ VLESS Encryption, bare Xray exit без Remnawave. `METHOD-bs-front.md` и ви�
 
 ## Версии PC-мастера
 
-Текущий публичный immutable Release — `v0.6.3`; его CI, Windows launcher и пять
+Текущий публичный immutable Release — `v0.6.4`; его CI, Windows launcher и пять
 артефактов проверены 2026-08-21. `v0.6.1` ошибочно отклоняет штатный пустой вывод
 UFW `(None)`. `v0.6.2` исправляет этот marker, но ошибочно отклоняет нетронутый
 package seed UFW 0.36.x без `### END RULES ###`.
@@ -95,7 +95,20 @@ package seed UFW 0.36.x без `### END RULES ###`.
 labels/headers допускают различия регистра, пробелов и пунктуации, но machine
 fields, rules, paths, keys, identifiers и comments остаются exact.
 
-Публикация `v0.6.3` не является новым успешным live E2E; исторические результаты
+`v0.6.3` при этом ошибочно отклоняет штатные dual-stack ownership notices,
+которые Ubuntu 24.04 печатает в stderr для `iptables-nft` tables, хотя сам
+ruleset корректен. После неудачного первого enable версия также может ложно
+назвать rollback неполным: package seed и пустой kernel baseline штатно
+превращаются в официальный empty rewrite и inert inactive UFW scaffold.
+
+`v0.6.4` принимает только семантически точный, без дубликатов полный набор таких
+notices, привязанный к уже строго проверенным `ip filter`/`ip6 filter` tables;
+неизвестная, смешанная, неполная или wrong-table диагностика остаётся fatal.
+Rollback теперь доказывает inactive UFW, пустой inventory, разрешённые целые
+persistent layouts, ACCEPT base policies и отсутствие executable/custom rules,
+а сообщение отдельно отражает фактическое состояние guard.
+
+Публикация `v0.6.4` не является новым успешным live E2E; исторические результаты
 ниже относятся к указанным версиям.
 
 ## Исторический контракт публичного PC-мастера 0.6.0

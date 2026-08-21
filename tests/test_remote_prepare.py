@@ -369,6 +369,9 @@ COMMIT
             return completed(command, stdout="Firewall is active\n")
         if inner == ["--force", "disable"]:
             self.ufw_active = False
+            # UFW can retain its inert framework after the first disable even
+            # when the pristine package seed had no kernel scaffold at all.
+            self.inactive_ufw_scaffold = True
             if self.foreign_nft_after_disable is not None:
                 self.nft_ruleset_override = self.foreign_nft_after_disable
             self.events.append(("ufw", "disable"))
@@ -381,6 +384,12 @@ COMMIT
                 for rule in self.ufw_rules
                 if not (rule[2] == port and rule[4] == comment)
             ]
+            if not self.ufw_rules:
+                # The first UFW mutation rewrites the package seed into the
+                # complete upstream empty layout even after the managed rule
+                # is removed again.
+                self.user_rules = official_empty_ufw_rewrite("ufw")
+                self.user6_rules = official_empty_ufw_rewrite("ufw6")
             self.events.append(("ufw", "delete"))
             return completed(command, stdout="Rule deleted\n")
         raise AssertionError(f"unexpected UFW command: {inner!r}")
@@ -456,7 +465,14 @@ COMMIT
             if name in self.tools:
                 return completed(command, stdout=f"/usr/sbin/{name}\n")
             return completed(command, returncode=1)
-        if command == ["nft", "list", "ruleset"]:
+        if command == [
+            "env",
+            "LC_ALL=C",
+            "LANG=C",
+            "nft",
+            "list",
+            "ruleset",
+        ]:
             return completed(
                 command, stdout=self._nft_ruleset(), stderr=self.nft_stderr
             )
@@ -1084,6 +1100,7 @@ COMMIT
         ssh = FakeSSH()
         ssh.fail_fresh_id_once = True
         guard = FakeGuard()
+        package_seed = ssh.user_rules
 
         with self.assertRaisesRegex(InstallerError, "inactive-состояние восстановлено"):
             subject.prepare_remote_exit(
@@ -1094,6 +1111,10 @@ COMMIT
 
         self.assertFalse(ssh.ufw_active)
         self.assertEqual(ssh.ufw_rules, [])
+        self.assertTrue(ssh.inactive_ufw_scaffold)
+        self.assertNotEqual(ssh.user_rules, package_seed)
+        self.assertEqual(ssh.user_rules, official_empty_ufw_rewrite("ufw"))
+        self.assertEqual(ssh.user6_rules, official_empty_ufw_rewrite("ufw6"))
         self.assertEqual(guard.calls, [("arm", 22), ("disarm", 22)])
         self.assertLess(
             self._index(ssh.events, ("ufw", "disable")),
@@ -1172,7 +1193,7 @@ COMMIT
         self.assertEqual(ssh.ufw_rules, [foreign])
         self.assertTrue(guard.armed)
 
-    def test_kernel_baseline_mismatch_cannot_be_reported_as_rollback_success(self):
+    def test_custom_kernel_state_cannot_be_reported_as_rollback_success(self):
         ssh = FakeSSH()
         ssh.fail_fresh_id_once = True
         ssh.foreign_nft_after_disable = "table inet foreign {\n}\n"
@@ -1186,6 +1207,47 @@ COMMIT
             )
 
         self.assertTrue(guard.armed)
+
+    def test_guard_service_race_during_rollback_disarm_cannot_report_restored(self):
+        ssh = FakeSSH()
+        ssh.fail_fresh_id_once = True
+        custom_ruleset = "table inet foreign {\n}\n"
+
+        def service_mutates_during_disarm(target):
+            target.nft_ruleset_override = custom_ruleset
+            target.events.append(("guard", "service-mutated-firewall"))
+
+        guard = FakeGuard(disarm_effect=service_mutates_during_disarm)
+
+        with self.assertRaisesRegex(InstallerError, "rollback guard не активен"):
+            subject.prepare_remote_exit(
+                ssh,
+                ssh_port=22,
+                rollback_guard=guard,
+            )
+
+        self.assertFalse(guard.armed)
+        self.assertEqual(guard.calls, [("arm", 22), ("disarm", 22)])
+        self.assertIn(("guard", "service-mutated-firewall"), ssh.events)
+
+    def test_failed_rollback_after_guard_disarm_reports_guard_inactive(self):
+        ssh = FakeSSH()
+        custom_ruleset = "table inet foreign {\n}\n"
+
+        def add_foreign_kernel_state(target):
+            target.nft_ruleset_override = custom_ruleset
+
+        guard = FakeGuard(disarm_effect=add_foreign_kernel_state)
+
+        with self.assertRaisesRegex(InstallerError, "rollback guard не активен"):
+            subject.prepare_remote_exit(
+                ssh,
+                ssh_port=22,
+                rollback_guard=guard,
+            )
+
+        self.assertFalse(guard.armed)
+        self.assertEqual(guard.calls, [("arm", 22), ("disarm", 22)])
 
     def test_modified_package_or_dormant_user_rules_fail_before_mutation(self):
         modified = FakeSSH()
@@ -1444,6 +1506,66 @@ COMMIT
         warning.ip6tables_stderr = "legacy tables present\n"
         with self.assertRaisesRegex(VerificationError, "предупреждение"):
             subject._inspect_firewall(warning, ufw_active=False)
+
+    def test_official_nft_iptables_nft_notices_are_bound_to_stdout_tables(self):
+        notice = (
+            "# Warning: table ip filter is managed by iptables-nft, do not touch!\n"
+            "# Warning: table ip6 filter is managed by iptables-nft, do not touch!\n"
+        )
+        for ufw_active, inactive_scaffold in ((True, False), (False, True)):
+            ssh = FakeSSH()
+            ssh.ufw_active = ufw_active
+            ssh.inactive_ufw_scaffold = inactive_scaffold
+            ssh.nft_stderr = notice
+
+            subject._inspect_firewall(
+                ssh,
+                ufw_active=ufw_active,
+                allow_inactive_ufw_scaffold=inactive_scaffold,
+            )
+
+            self.assertIn(
+                ("env", "LC_ALL=C", "LANG=C", "nft", "list", "ruleset"),
+                ssh.calls,
+            )
+
+    def test_nft_iptables_nft_notice_tolerates_only_human_formatting(self):
+        ssh = FakeSSH()
+        ssh.ufw_active = True
+        ssh.nft_stderr = (
+            "  # WARNING : table ip filter is managed by iptables-nft; "
+            "do not touch.\n"
+            "Warning -- table ip6 filter is managed by iptables-nft, "
+            "do not touch!!!\n"
+        )
+
+        subject._inspect_firewall(ssh, ufw_active=True)
+
+    def test_nft_iptables_nft_notice_family_and_mixed_warnings_fail_closed(self):
+        valid_ip = (
+            "# Warning: table ip filter is managed by iptables-nft, do not touch!\n"
+        )
+        valid_ip6 = (
+            "# Warning: table ip6 filter is managed by iptables-nft, do not touch!\n"
+        )
+        cases = {
+            "missing-family": valid_ip,
+            "duplicate-family": valid_ip + valid_ip + valid_ip6,
+            "extra-family": valid_ip + valid_ip6,
+            "mixed-warning": valid_ip + valid_ip6 + "warning: cache was stale\n",
+            "wrong-table": valid_ip.replace(" ip filter ", " ip nat ") + valid_ip6,
+        }
+        for name, diagnostic in cases.items():
+            ssh = FakeSSH()
+            ssh.ufw_active = True
+            ssh.nft_stderr = diagnostic
+            if name == "extra-family":
+                ssh.nft_ruleset_override = ssh._nft_ruleset().split(
+                    "table ip6 filter {", 1
+                )[0]
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(VerificationError, "диагностику"):
+                    subject._inspect_firewall(ssh, ufw_active=True)
 
     def test_legacy_proc_firewall_probe_distinguishes_absent_and_read_failure(self):
         absent = FakeSSH()

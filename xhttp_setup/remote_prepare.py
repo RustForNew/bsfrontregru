@@ -64,6 +64,7 @@ _NFT_UFW_DISPATCH = re.compile(
     r"^(?:counter packets [0-9]+ bytes [0-9]+ )?"
     r"(?:jump|goto) ([A-Za-z0-9_-]+)$"
 )
+_HUMAN_DIAGNOSTIC_WORD = re.compile(r"[^\W_]+(?:-[^\W_]+)*")
 _NFT_COUNTER = re.compile(r"\bcounter packets [0-9]+ bytes [0-9]+\b")
 _IPTABLES_COUNTER = re.compile(r"\[[0-9]+:[0-9]+\]")
 _UFW_SHOW_ADDED_HEADER = "Added user rules (see 'ufw status' for running firewall):"
@@ -97,6 +98,12 @@ class _FirewallSnapshot:
     iptables_v6: str | None
     iptables_legacy_v4: str | None
     iptables_legacy_v6: str | None
+
+
+@dataclass(frozen=True)
+class _UfwRollbackOutcome:
+    restored: bool
+    guard_is_armed: bool | None
 
 
 class UfwRollbackGuard(Protocol):
@@ -549,6 +556,59 @@ def _canonical_nft(payload: str) -> str:
     )
 
 
+def _validate_nft_diagnostics(payload: str, diagnostic: str) -> None:
+    """Allow only nft's bounded iptables-nft ownership notices.
+
+    Ubuntu's nft inspector writes one human-readable notice per ip/ip6 filter
+    table to stderr even though the command and ruleset are valid.  Match the
+    semantic words instead of punctuation and bind every notice to the exact
+    set of filter tables already accepted from stdout.
+    """
+
+    if not diagnostic.strip():
+        return
+    expected_tables = {
+        match.groups()
+        for raw_line in payload.splitlines()
+        if (match := _NFT_TABLE.fullmatch(raw_line.strip())) is not None
+    }
+    warned_tables: list[tuple[str, str]] = []
+    expected_words = (
+        "warning",
+        "table",
+        None,
+        None,
+        "is",
+        "managed",
+        "by",
+        "iptables-nft",
+        "do",
+        "not",
+        "touch",
+    )
+    for raw_line in diagnostic.splitlines():
+        if not raw_line.strip():
+            continue
+        words = tuple(
+            word.casefold() for word in _HUMAN_DIAGNOSTIC_WORD.findall(raw_line)
+        )
+        if len(words) != len(expected_words) or any(
+            expected is not None and actual != expected
+            for actual, expected in zip(words, expected_words, strict=True)
+        ):
+            raise VerificationError("nft вернул неоднозначную диагностику")
+        family, name = words[2:4]
+        if family not in {"ip", "ip6"} or name != "filter":
+            raise VerificationError("nft вернул неоднозначную диагностику")
+        warned_tables.append((family, name))
+    if (
+        not warned_tables
+        or len(warned_tables) != len(set(warned_tables))
+        or set(warned_tables) != expected_tables
+    ):
+        raise VerificationError("nft вернул неоднозначную диагностику")
+
+
 def _canonical_iptables(payload: str) -> str:
     return "\n".join(
         _IPTABLES_COUNTER.sub("[0:0]", line.strip())
@@ -583,17 +643,16 @@ def _inspect_firewall(
     if has_nft:
         nft = _must(
             ssh,
-            ["nft", "list", "ruleset"],
+            ["env", "LC_ALL=C", "LANG=C", "nft", "list", "ruleset"],
             operation="Не удалось прочитать nftables ruleset",
         )
-        if nft.stderr.strip():
-            raise VerificationError("nft вернул неоднозначную диагностику")
         nft_payload = nft.stdout
         _validate_nft_ruleset(
             nft_payload,
             allow_ufw=ufw_active,
             allow_inactive_ufw_scaffold=allow_inactive_ufw_scaffold,
         )
+        _validate_nft_diagnostics(nft_payload, nft.stderr)
     has_iptables_save = _tool_exists(ssh, "iptables-save")
     has_ip6tables_save = _tool_exists(ssh, "ip6tables-save")
     if has_iptables_save != has_ip6tables_save:
@@ -1289,8 +1348,7 @@ def _rollback_new_ufw(
     guard_armed: bool,
     allow_attempted: bool,
     enable_attempted: bool,
-    baseline: _FirewallSnapshot,
-) -> bool:
+) -> _UfwRollbackOutcome:
     try:
         if enable_attempted:
             _must(
@@ -1322,20 +1380,46 @@ def _rollback_new_ufw(
         if _ufw_added_commands(ssh):
             raise VerificationError("SSH rule осталась после UFW rollback")
         _require_pristine_inactive_ufw(ssh)
-        after = _inspect_firewall(
+        # The first enable/disable cycle legitimately turns a fresh package
+        # seed into UFW's generated empty user-rule files and can leave an
+        # inert ACCEPT-policy framework in the kernel.  Exact snapshot
+        # equality would reject that representation-only transition.  The
+        # validators above and below prove the stronger recovery contract:
+        # no saved user rules, only official empty files, and no executable
+        # rule outside a harmless inactive UFW scaffold.
+        _inspect_firewall(
             ssh,
             ufw_active=False,
             allow_inactive_ufw_scaffold=True,
         )
-        if after != baseline:
-            raise VerificationError(
-                "Kernel firewall не совпал с baseline после rollback"
-            )
         if guard_armed:
             guard.disarm(ssh, ssh_port=ssh_port)
-        return True
+        # A timer may already have activated its service when disarm starts.
+        # disarm() waits for both units to stop, but that service can mutate
+        # UFW while being stopped.  Prove the complete recovery contract once
+        # more through a genuinely fresh SSH process after the guard is
+        # quiescent; the pre-disarm proof alone is racy.
+        _require_root(ssh, fresh=True)
+        if _ufw_status(ssh):
+            raise VerificationError("UFW снова стал active после остановки guard")
+        if _ufw_added_commands(ssh):
+            raise VerificationError("SSH rule появилась после остановки guard")
+        _require_pristine_inactive_ufw(ssh)
+        _inspect_firewall(
+            ssh,
+            ufw_active=False,
+            allow_inactive_ufw_scaffold=True,
+        )
+        return _UfwRollbackOutcome(restored=True, guard_is_armed=False)
     except Exception:
-        return False
+        try:
+            actual_guard_state = guard.is_armed(ssh, ssh_port=ssh_port)
+        except Exception:
+            actual_guard_state = None
+        return _UfwRollbackOutcome(
+            restored=False,
+            guard_is_armed=actual_guard_state,
+        )
 
 
 def _enable_pristine_ufw(
@@ -1345,7 +1429,7 @@ def _enable_pristine_ufw(
     rollback_guard: UfwRollbackGuard,
 ) -> None:
     comment = _ssh_rule_comment(ssh_port)
-    baseline = _inspect_firewall(
+    _inspect_firewall(
         ssh,
         ufw_active=False,
         allow_inactive_ufw_scaffold=True,
@@ -1427,23 +1511,27 @@ def _enable_pristine_ufw(
         stage = "firewall-inspect-after-guard"
         _inspect_firewall(ssh, ufw_active=True)
     except BaseException as original:
-        rolled_back = _rollback_new_ufw(
+        rollback = _rollback_new_ufw(
             ssh,
             ssh_port=ssh_port,
             guard=rollback_guard,
             guard_armed=guard_armed,
             allow_attempted=allow_attempted,
             enable_attempted=enable_attempted,
-            baseline=baseline,
         )
-        if rolled_back:
+        if rollback.restored:
             raise InstallerError(
                 "UFW enable не прошёл проверку на этапе "
                 f"{stage}; исходное inactive-состояние восстановлено"
             ) from original
+        if rollback.guard_is_armed is True:
+            recovery = "автоматический rollback guard оставлен активным"
+        elif rollback.guard_is_armed is False:
+            recovery = "rollback не подтверждён; rollback guard не активен"
+        else:
+            recovery = "rollback не подтверждён; состояние rollback guard неизвестно"
         raise InstallerError(
-            "UFW enable не прошёл проверку на этапе "
-            f"{stage}; автоматический rollback guard оставлен активным"
+            f"UFW enable не прошёл проверку на этапе {stage}; {recovery}"
         ) from original
 
 

@@ -130,6 +130,13 @@
   for one of the five logging levels and either rate-limit-chain capability.
   Extra, missing, reordered or foreign content anywhere in either form fails
   closed; an empty delimited RULES body alone is not sufficient.
+  After a failed first enable, a package seed may legitimately become a complete
+  approved empty rewrite and leave an inert dual-stack UFW scaffold. Recovery is
+  accepted only after guard quiescence and a fresh-SSH proof of inactive UFW, no
+  saved user commands, approved persistent files, ACCEPT base policies, no
+  executable UFW-chain rules and no custom firewall state. Failure reporting
+  separately probes whether the rollback guard is armed, inactive or of unknown
+  state.
   A later run detects and reconciles an owned stale guard or exact dormant SSH
   rule. It never edits provider cloud firewalls, merges custom nftables/iptables,
   or disables a standalone firewall service.
@@ -145,6 +152,11 @@
   Extra or missing words remain semantic changes. Machine fields, paths, unit
   state tokens, rule bodies, keys, identifiers and comments retain their strict
   owning-module validation; unknown payload and stderr diagnostics fail closed.
+  The sole bounded stderr exception is nft's iptables-nft ownership notice: stdout
+  is validated first, every notice must semantically identify an `ip` or `ip6`
+  `filter` table managed by `iptables-nft`, the notice set must exactly match the
+  validated stdout table set, and duplicates are rejected. Only presentation
+  case, whitespace and punctuation may vary; mixed or unknown diagnostics fail.
 - Frontend egress discovery uses three distinct CSPRNG destination ports in
   separate, deadline-complete captures. The exact triple is stored with mode
   `0600`, bound to the domain and exit/SSH/backend endpoint, printed for a

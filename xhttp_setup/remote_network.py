@@ -20,6 +20,7 @@ from .remote_prepare import (
     _expected_ssh_rule,
     _ssh_rule_comment,
     _ufw_added_commands,
+    _validate_nft_diagnostics,
     _validate_iptables_save as _validate_prepared_iptables_save,
 )
 from .remote_prepare import _validate_nft_ruleset as _validate_prepared_nft_ruleset
@@ -290,12 +291,11 @@ def _reject_custom_nftables(ssh: SSHCommand) -> None:
     _reject_nftables_service(ssh)
     ruleset = _must(
         ssh,
-        ["nft", "list", "ruleset"],
+        ["env", "LC_ALL=C", "LANG=C", "nft", "list", "ruleset"],
         operation="Не удалось прочитать nftables ruleset",
     )
-    if ruleset.stderr.strip():
-        raise VerificationError("nft вернул неоднозначную диагностику")
     _validate_nft_ruleset(ruleset.stdout)
+    _validate_nft_diagnostics(ruleset.stdout, ruleset.stderr)
     iptables = _must(
         ssh,
         ["iptables-save"],
