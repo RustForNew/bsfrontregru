@@ -171,6 +171,8 @@ COMMIT
         if self.ufw_show_added_override is not None:
             return self.ufw_show_added_override
         header = "Added user rules (see 'ufw status' for running firewall):\n"
+        if not self.ufw_rules:
+            return header + "(None)\n"
         return header + "".join(shlex.join(rule) + "\n" for rule in self.ufw_rules)
 
     def _ufw(self, command, inner):
@@ -686,6 +688,26 @@ COMMIT
                     )
 
                 self.assertFalse(ssh.events)
+
+    def test_ufw_show_added_accepts_official_empty_marker(self):
+        ssh = FakeSSH()
+        ssh.ufw_show_added_override = subject._UFW_SHOW_ADDED_HEADER + "\n(None)\n"
+
+        self.assertEqual(subject._ufw_added_commands(ssh), [])
+
+    def test_ufw_show_added_empty_marker_must_be_the_only_payload(self):
+        expected = shlex.join(subject._expected_ssh_rule(22))
+        cases = (
+            f"{subject._UFW_SHOW_ADDED_HEADER}\n(None)\n{expected}\n",
+            f"{subject._UFW_SHOW_ADDED_HEADER}\n(None)\n(None)\n",
+        )
+        for output in cases:
+            with self.subTest(output=output):
+                ssh = FakeSSH()
+                ssh.ufw_show_added_override = output
+
+                with self.assertRaisesRegex(VerificationError, "неизвестную строку"):
+                    subject._ufw_added_commands(ssh)
 
     def test_stale_guard_is_quiesced_before_active_ufw_is_accepted(self):
         ssh = FakeSSH()

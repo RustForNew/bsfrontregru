@@ -121,6 +121,9 @@
   verifies a fresh SSH connection both before and after quiescing its timer and
   service. The timer must report active before the first firewall mutation. It
   only disables UFW and never deletes the sole SSH allow after a failed disable.
+  UFW 0.36.x's official `(None)` marker is treated as an empty persistent rule
+  inventory; the marker mixed with commands, unknown payload lines and stderr
+  diagnostics still fail closed.
   A later run detects and reconciles an owned stale guard or exact dormant SSH
   rule. It never edits provider cloud firewalls, merges custom nftables/iptables,
   or disables a standalone firewall service.

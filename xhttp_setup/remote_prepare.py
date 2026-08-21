@@ -67,6 +67,7 @@ _IPTABLES_COUNTER = re.compile(r"\[[0-9]+:[0-9]+\]")
 _UFW_SHOW_ADDED_HEADER = (
     "Added user rules (see 'ufw status' for running firewall):"
 )
+_UFW_SHOW_ADDED_EMPTY = "(None)"
 _NFTABLES_MISSING_UNIT_DIAGNOSTICS = frozenset(
     {
         "Failed to get unit file state for nftables.service: "
@@ -723,8 +724,14 @@ def _ufw_added_commands(ssh: SSHCommand) -> list[list[str]]:
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if not lines or lines[0] != _UFW_SHOW_ADDED_HEADER:
         raise VerificationError("ufw show added не вернул ожидаемый заголовок")
+    body = lines[1:]
+    # UFW 0.36.x emits a literal `(None)` for an empty saved-rule set.  The
+    # marker carries the same meaning as the historical header-only form, but
+    # it must never be accepted alongside commands or other data.
+    if body == [_UFW_SHOW_ADDED_EMPTY]:
+        return []
     commands: list[list[str]] = []
-    for line in lines[1:]:
+    for line in body:
         if not line.startswith("ufw "):
             raise VerificationError("ufw show added содержит неизвестную строку")
         try:
