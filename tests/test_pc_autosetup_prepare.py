@@ -153,9 +153,9 @@ class PcPrepareTests(unittest.TestCase):
 
         def front_egress(**_kwargs):
             events.append("front-egress")
-            self.assertGreaterEqual(_kwargs["temporary_front"].exit_port, 20000)
-            self.assertLess(_kwargs["temporary_front"].exit_port, 60000)
-            self.assertNotEqual(_kwargs["temporary_front"].exit_port, 8083)
+            self.assertEqual(_kwargs["temporary_front"].exit_port, 8083)
+            self.assertIs(_kwargs["require_free_port"], resume is None)
+            self.assertNotIn("probe_ports", _kwargs)
             if front_egress_error is not None:
                 raise front_egress_error
             return "9.9.9.9"
@@ -236,6 +236,21 @@ class PcPrepareTests(unittest.TestCase):
         self.assertEqual(result.desired_front.client_connect_ip, "192.0.2.30")
         self.assertEqual(result.desired_front.dns_ipv4, "192.0.2.31")
         self.assertEqual(result.front_auth.password, PANEL_PASSWORD)
+
+    def test_legacy_random_probe_port_state_is_inert(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root / "state"
+            state.mkdir()
+            legacy = state / "front-probe-ports.json"
+            legacy.write_text("not valid legacy state\n", encoding="utf-8")
+
+            result, events, _ = self._run(root)
+            legacy_contents = legacy.read_text(encoding="utf-8")
+
+        self.assertEqual(result.desired_front.exit_port, 8083)
+        self.assertIn("front-egress", events)
+        self.assertEqual(legacy_contents, "not valid legacy state\n")
 
     def test_missing_site_aborts_before_any_exit_mutation(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -13,7 +13,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
@@ -41,7 +41,7 @@ from .models import (
     Handoff,
     TLS_MODE_PINNED,
 )
-from .osutil import atomic_write_text, ensure_dir, load_json, sha256_file
+from .osutil import ensure_dir, load_json, sha256_file
 from .remote_exit import RemoteExitTarget
 from .ssh_transport import (
     SFTPBatch,
@@ -68,12 +68,8 @@ from .validate import (
 _PROBE_CAPTURE_SECONDS = 15
 _PROBE_REQUESTS = 8
 _PROBE_REQUEST_TIMEOUT_SECONDS = 8
-_PROBE_PORT_COUNT = 3
+_PROBE_SAMPLE_COUNT = 3
 _MAX_PASSWORD_ATTEMPTS = 3
-_PROBE_PORT_MIN = 20000
-_PROBE_PORT_SPAN = 40000
-_PROBE_PORT_ATTEMPTS = 24
-_PROBE_PORT_STATE_NAME = "front-probe-ports.json"
 _MAX_LOCAL_HANDOFF_BYTES = 64 * 1024
 _MANAGED_EXIT_HANDOFF = "/var/lib/xhttp-setup/handoff.json"
 _MANAGED_EXIT_SERVICE = "xhttp-setup-xray.service"
@@ -295,129 +291,6 @@ def _remote_port_is_free(ssh: SSHCommand, port: int) -> bool:
     if result.returncode != 0:
         raise InstallerError("Не удалось проверить свободный TCP-порт на exit")
     return not result.stdout.strip()
-
-
-def _select_front_probe_ports(
-    ssh: SSHCommand, *, backend_port: int, ssh_port: int
-) -> tuple[int, ...]:
-    excluded = {validate_port(backend_port), validate_port(ssh_port)}
-    selected: list[int] = []
-    for _ in range(_PROBE_PORT_ATTEMPTS * _PROBE_PORT_COUNT):
-        candidate = _PROBE_PORT_MIN + secrets.randbelow(_PROBE_PORT_SPAN)
-        if candidate in excluded or candidate in selected:
-            continue
-        if _remote_port_is_free(ssh, candidate):
-            selected.append(candidate)
-            if len(selected) == _PROBE_PORT_COUNT:
-                return tuple(selected)
-    raise InstallerError(
-        "Не удалось выбрать три свободных случайных TCP-порта frontend probe"
-    )
-
-
-def _load_or_create_front_probe_ports(
-    ssh: SSHCommand,
-    *,
-    state_dir: Path,
-    exit_host: str,
-    backend_port: int,
-    ssh_port: int,
-    domain: str,
-) -> tuple[tuple[int, ...], bool]:
-    """Persist one CSPRNG challenge triple so cloud-firewall retry is usable."""
-
-    identity = {
-        "schema_version": 1,
-        "exit_host": validate_ipv4(exit_host),
-        "backend_port": validate_port(backend_port),
-        "ssh_port": validate_port(ssh_port),
-        "domain": normalize_domain(domain),
-    }
-    path = state_dir / _PROBE_PORT_STATE_NAME
-    existing = _validated_local_resume_artifact(path, label="frontend probe ports")
-    if existing is not None:
-        payload = load_json(existing)
-        if set(payload) != {*identity, "ports"} or any(
-            payload.get(key) != value for key, value in identity.items()
-        ):
-            raise InstallerError(
-                "Сохранённые frontend probe ports относятся к другому endpoint"
-            )
-        raw_ports = payload.get("ports")
-        if (
-            not isinstance(raw_ports, list)
-            or len(raw_ports) != _PROBE_PORT_COUNT
-            or any(
-                isinstance(port, bool) or not isinstance(port, int)
-                for port in raw_ports
-            )
-        ):
-            raise InstallerError("Повреждён state frontend probe ports")
-        ports = tuple(validate_port(port) for port in raw_ports)
-        if (
-            len(set(ports)) != _PROBE_PORT_COUNT
-            or any(
-                not (_PROBE_PORT_MIN <= port < _PROBE_PORT_MIN + _PROBE_PORT_SPAN)
-                for port in ports
-            )
-            or identity["backend_port"] in ports
-            or identity["ssh_port"] in ports
-        ):
-            raise InstallerError("Небезопасный state frontend probe ports")
-        if all(_remote_port_is_free(ssh, port) for port in ports):
-            return ports, True
-
-    ports = _select_front_probe_ports(
-        ssh,
-        backend_port=identity["backend_port"],
-        ssh_port=identity["ssh_port"],
-    )
-    payload = {**identity, "ports": list(ports)}
-    atomic_write_text(
-        path,
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-        0o600,
-    )
-    return ports, False
-
-
-def _consume_front_probe_ports(
-    *,
-    state_dir: Path,
-    ports: tuple[int, ...],
-    exit_host: str,
-    backend_port: int,
-    ssh_port: int,
-    domain: str,
-) -> None:
-    """Remove only the exact challenge state after all three samples pass."""
-
-    path = state_dir / _PROBE_PORT_STATE_NAME
-    existing = _validated_local_resume_artifact(path, label="frontend probe ports")
-    if existing is None:
-        raise InstallerError("State frontend probe ports исчез до завершения пробы")
-    expected = {
-        "schema_version": 1,
-        "exit_host": validate_ipv4(exit_host),
-        "backend_port": validate_port(backend_port),
-        "ssh_port": validate_port(ssh_port),
-        "domain": normalize_domain(domain),
-        "ports": list(ports),
-    }
-    if load_json(existing) != expected:
-        raise InstallerError("State frontend probe ports изменился во время пробы")
-    try:
-        existing.unlink()
-        if os.name == "posix":
-            directory_fd = os.open(existing.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-    except OSError as exc:
-        raise InstallerError(
-            "Не удалось удалить использованный state frontend probe ports"
-        ) from exc
 
 
 def _front_rollback_incomplete(error: BaseException) -> bool:
@@ -888,6 +761,8 @@ def _trigger_front_requests(
     not retained because their text contains the secret per-installation URL.
     """
 
+    wave_nonce = secrets.token_hex(8)
+
     def request(number: int) -> tuple[str, int | None]:
         try:
             request_kwargs: dict[str, TCPRoute] = {}
@@ -895,7 +770,7 @@ def _trigger_front_requests(
                 request_kwargs["route"] = https_route
             status = https_status(
                 f"https://{desired.domain}{desired.xhttp_path}/"
-                f"probe-{desired.exit_port}-{number}",
+                f"probe-{desired.exit_port}-{wave_nonce}-{number}",
                 connect_ip=desired.client_connect_ip,
                 pinned_peer_cert_sha256=desired.pinned_peer_cert_sha256,
                 timeout=_PROBE_REQUEST_TIMEOUT_SECONDS,
@@ -989,7 +864,7 @@ def _front_capture_failure_message(
         diagnosis = (
             "Отсутствие или неоднозначность SYN не классифицированы автоматически "
             "как блокировка cloud firewall; отдельно проверьте временный маршрут "
-            "Apache и внешний firewall"
+            "Apache и доступность TCP/8083 во внешнем firewall"
         )
     return f"{error}. {summary}. {diagnosis}"
 
@@ -1038,20 +913,19 @@ def measure_front_egress(
     temporary_front: FrontDesired,
     front_auth: SSHAuth,
     state_dir: Path,
-    probe_ports: tuple[int, ...],
+    require_free_port: bool = True,
     sftp_route: SSHRoute | None = None,
     https_route: TCPRoute | None = None,
     trusted_known_hosts: Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> str:
-    """Prove one Apache source IPv4 through three secret destination ports."""
+    """Prove one stable Apache source IPv4 directly through backend TCP/8083."""
 
     temporary_front = temporary_front.validate()
-    ports = tuple(validate_port(port) for port in probe_ports)
-    if len(ports) != _PROBE_PORT_COUNT or len(set(ports)) != _PROBE_PORT_COUNT:
-        raise InstallerError(
-            "Frontend egress probe требует три разных временных TCP-порта"
-        )
+    if temporary_front.exit_port != 8083:
+        raise InstallerError("Frontend egress probe должен использовать TCP/8083")
+    if type(require_free_port) is not bool:
+        raise TypeError("require_free_port must be bool")
     available = ssh.command(["command", "-v", "tcpdump"], check=False, timeout=20)
     if available.returncode != 0:
         raise InstallerError(
@@ -1070,15 +944,18 @@ def measure_front_egress(
     )
 
     samples: list[str] = []
-    for number, port in enumerate(ports, start=1):
+    for number in range(1, _PROBE_SAMPLE_COUNT + 1):
         if progress is not None:
-            progress(f"Проверяю frontend egress: независимая проба {number}/3")
-        sample_front = replace(temporary_front, exit_port=port).validate()
+            progress(
+                "Проверяю frontend egress на TCP/8083: "
+                f"независимая проба {number}/{_PROBE_SAMPLE_COUNT}"
+            )
         sample = _measure_front_egress_sample(
             ssh=ssh,
-            temporary_front=sample_front,
+            temporary_front=temporary_front,
             front_auth=front_auth,
             state_dir=state_dir,
+            require_free_port=require_free_port,
             sftp_route=sftp_route,
             https_route=https_route,
             trusted_known_hosts=trusted_known_hosts,
@@ -1098,13 +975,19 @@ def _measure_front_egress_sample(
     temporary_front: FrontDesired,
     front_auth: SSHAuth,
     state_dir: Path,
+    require_free_port: bool,
     sftp_route: SSHRoute | None = None,
     https_route: TCPRoute | None = None,
     trusted_known_hosts: Path | None = None,
 ) -> str:
     temporary_front = temporary_front.validate()
-    if not _remote_port_is_free(ssh, temporary_front.exit_port):
-        raise InstallerError("Временный frontend probe port уже занят на exit")
+    if require_free_port and not _remote_port_is_free(
+        ssh, temporary_front.exit_port
+    ):
+        raise InstallerError(
+            "TCP/8083 занят во время frontend probe; продолжение разрешено только "
+            "для подтверждённого managed exit"
+        )
 
     token = secrets.token_hex(16)
     ready_path = f"/tmp/xhttp-front-probe.{token}.ready"
@@ -1178,6 +1061,12 @@ def _measure_front_egress_sample(
         operation=capture_installed_route,
         **route_kwargs,
     )
+    if require_free_port and not _remote_port_is_free(
+        ssh, temporary_front.exit_port
+    ):
+        raise VerificationError(
+            "TCP/8083 стал занят во время frontend probe; результат не принят"
+        )
     if capture_result is not None and capture_result.returncode == 0:
         raise VerificationError(
             "Frontend egress capture переполнен и был обрезан; результат не принят"
@@ -1189,7 +1078,7 @@ def _measure_front_egress_sample(
         return parse_front_egress_capture(
             capture_result.stdout,
             expected_destination_port=temporary_front.exit_port,
-            minimum_endpoints=1,
+            minimum_endpoints=3,
         )
     except InstallerError as exc:
         raise VerificationError(
@@ -1503,23 +1392,6 @@ def prepare_pc_install(
             expected_egress = measure_remote_exit_egress(exit_ssh)
             xhttp_path = "/api/" + secrets.token_urlsafe(24)
 
-        probe_ports, probe_ports_reused = _load_or_create_front_probe_ports(
-            exit_ssh,
-            state_dir=output,
-            exit_host=inputs.exit_host,
-            backend_port=backend_port,
-            ssh_port=exit_target.port,
-            domain=inputs.domain,
-        )
-        reuse_label = "Повторно использую" if probe_ports_reused else "Выбраны"
-        step(
-            f"{reuse_label} три случайных frontend probe порта: "
-            + ", ".join(f"TCP/{port}" for port in probe_ports)
-        )
-        step(
-            "Если внешний cloud firewall VPS блокирует их, временно разрешите только "
-            "эти три порта и повторите запуск; мастер сохранит тот же список"
-        )
         temporary_front = FrontDesired(
             domain=inputs.domain,
             client_connect_ip=client_connect_ip,
@@ -1530,14 +1402,14 @@ def prepare_pc_install(
             document_root=document_root,
             ssh_host_key_sha256=sftp_fingerprint,
             exit_address=validate_ipv4(inputs.exit_host),
-            exit_port=probe_ports[0],
+            exit_port=backend_port,
             xhttp_path=xhttp_path,
             placeholder_mode="keep",
             tls_mode=tls_mode,
             pinned_peer_cert_sha256=cert_pin,
         ).validate()
 
-        step("Измеряю фактический исходящий IP Apache")
+        step("Измеряю фактический исходящий IP Apache напрямую через TCP/8083")
         if phase_callback is not None:
             phase_callback("front_probe_in_progress")
         try:
@@ -1551,18 +1423,10 @@ def prepare_pc_install(
                 temporary_front=temporary_front,
                 front_auth=front_auth,
                 state_dir=output / "front-egress-probe",
-                probe_ports=probe_ports,
+                require_free_port=(resume is None),
                 trusted_known_hosts=sftp_known_hosts,
                 progress=step,
                 **probe_kwargs,
-            )
-            _consume_front_probe_ports(
-                state_dir=output,
-                ports=probe_ports,
-                exit_host=inputs.exit_host,
-                backend_port=backend_port,
-                ssh_port=exit_target.port,
-                domain=inputs.domain,
             )
         except BaseException as exc:
             if phase_callback is not None and not _front_rollback_incomplete(exc):

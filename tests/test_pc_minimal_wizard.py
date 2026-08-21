@@ -754,6 +754,8 @@ class PcProviderFirewallCheckpointTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn(f"TCP/{desired.listen_port}", rendered)
         self.assertIn(f"{desired.front_egress_ip}/32", rendered)
+        self.assertIn("ограничьте", rendered)
+        self.assertNotIn("probe-порт", rendered)
         self.assertIn("если такой панели нет", rendered.lower())
         prompt.assert_called_once()
 

@@ -705,12 +705,6 @@ class PcBridgePreparationTests(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch(
-                    "xhttp_setup.pc_autosetup._select_front_probe_ports",
-                    return_value=(32001, 32002, 32003),
-                )
-            )
-            stack.enter_context(
-                mock.patch(
                     "xhttp_setup.remote_prepare.prepare_remote_exit",
                     prepare_exit_mock,
                 )
@@ -792,6 +786,11 @@ class PcBridgePreparationTests(unittest.TestCase):
         self.assertEqual(result.sftp_known_hosts, Path(temp) / "sftp.known_hosts")
         main_session = state["exit_ssh"].sessions[1]
         self.assertIs(state["probe_calls"][0]["ssh"], main_session)
+        self.assertEqual(
+            state["probe_calls"][0]["temporary_front"].exit_port, 8083
+        )
+        self.assertTrue(state["probe_calls"][0]["require_free_port"])
+        self.assertNotIn("probe_ports", state["probe_calls"][0])
         self.assertIs(state["prepare_exit"].call_args.args[0], main_session)
         self.assertIs(state["measure_exit"].call_args.args[0], main_session)
         self.assertLess(

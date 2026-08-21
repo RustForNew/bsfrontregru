@@ -1085,8 +1085,7 @@ def _confirm_pc_provider_firewall(desired: ExitDesired) -> None:
     print("\n→ Проверьте внешний cloud firewall/security group VPS")
     print(
         "  Если такой панели нет, ничего менять не нужно. Если она есть, "
-        "закройте ранее напечатанные временные probe-порты и разрешите "
-        f"входящий TCP/{desired.listen_port} только от "
+        f"ограничьте входящий TCP/{desired.listen_port} только адресом "
         f"{desired.front_egress_ip}/32."
     )
     input(

@@ -157,24 +157,23 @@
   `filter` table managed by `iptables-nft`, the notice set must exactly match the
   validated stdout table set, and duplicates are rejected. Only presentation
   case, whitespace and punctuation may vary; mixed or unknown diagnostics fail.
-- Frontend egress discovery uses three distinct CSPRNG destination ports in
-  separate, deadline-complete captures. The exact triple is stored with mode
-  `0600`, bound to the domain and exit/SSH/backend endpoint, printed for a
-  restrictive provider-firewall retry, and reused rather than guessed again.
-  It is retained only after an inconclusive or failed measurement and is
-  exact-state deleted immediately after all three samples agree; a deletion
-  failure stops the workflow before the measured address is trusted. After
-  agreement, the wizard prints the measured `/32` and blocks at an interactive
-  checkpoint before exit apply/E2E. The operator must close the temporary
-  probe ports and, when a provider firewall exists, allow only that `/32` to
-  the backend port before continuing; no-firewall installations simply
-  acknowledge the same checkpoint.
+- Frontend egress discovery uses three separate, deadline-complete captures on
+  the actual final backend TCP/8083. Every HTTPS wave has a fresh CSPRNG suffix,
+  every capture must contain at least three independent SYN source endpoints,
+  and all three waves must identify the same public IPv4. A fresh or unverified
+  pending installation also proves TCP/8083 free before and after every wave;
+  an occupied listener is accepted only after the existing managed Xray PID,
+  receipt, config and service were verified during exact resume.
   Each capture starts only after its temporary `.htaccess` route is installed;
-  a packet-cap exit, a wrong destination port, no public source, multiple
-  sources in one sample, or different sources across samples fails closed.
-  This is a bounded probabilistic attribution against ordinary Internet scan
-  noise, not cryptographic proof against a targeted continuous scanner or an
-  on-path attacker. The final authenticated Xray E2E remains mandatory and no
+  a packet-cap exit, a wrong destination port, too few endpoints, no public
+  source, multiple sources in one sample, or different sources across samples
+  fails closed. After agreement, the wizard prints the measured `/32` and blocks
+  at an interactive checkpoint before exit apply/E2E. When a provider firewall
+  exists, the operator must restrict TCP/8083 to that `/32` before continuing;
+  no-firewall installations simply acknowledge the same checkpoint.
+  TCP/8083 is predictable, so this remains bounded probabilistic attribution,
+  not cryptographic proof against a targeted continuous scanner, SYN spoofing or
+  an on-path attacker. The final authenticated Xray E2E remains mandatory and no
   client profile is issued from the SYN measurement alone.
 - The Windows bundle does not implement a second SSH stack. Its PowerShell
   launcher verifies the bundled runner and Linux zipapp SHA-256, prepares the
