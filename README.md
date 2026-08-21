@@ -41,11 +41,11 @@ REG.RU: `vipNNN.hosting.reg.ru` и `serverNNN.hosting.reg.ru`.
 
 2. В ISPmanager заранее вручную создайте сайт и настройте DNS/TLS по
    [короткому списку](docs/reg-ru-ispmanager-setup.txt). Мастер сайт не создаёт.
-3. После успешной публикации Release `v0.6.5` возьмите
-   `xhttp-setup-0.6.5-windows-wsl.zip` и его `.sha256` с одной страницы этого
+3. После успешной публикации Release `v0.6.6` возьмите
+   `xhttp-setup-0.6.6-windows-wsl.zip` и его `.sha256` с одной страницы этого
    Release. Не подменяйте их файлами другой версии. Выберите в Проводнике
    «Извлечь все» и дважды нажмите `START-WINDOWS.cmd`.
-4. Отвечайте на вопросы по одному. `0.6.5` предложит прямое подключение к
+4. Отвечайте на вопросы по одному. `0.6.6` предложит прямое подключение к
    REG.RU или необязательный SSH-мост. Никакие SHA-256, host-key fingerprint,
    UUID, XHTTP path, egress-IP, UFW-команды или `APPLY PC` вводить не нужно.
 5. Не закрывайте окно до сообщения об успешной сквозной проверке. Только после
@@ -57,7 +57,7 @@ REG.RU: `vipNNN.hosting.reg.ru` и `serverNNN.hosting.reg.ru`.
 
 ## Что нужно ввести
 
-В `0.6.5` PC-мастер спрашивает:
+В `0.6.6` PC-мастер спрашивает:
 
 1. IPv4 выходного сервера;
 2. SSH port выхода, обычно `22`;
@@ -324,17 +324,18 @@ recovery уже подтверждён как `succeeded` либо сбой пр
 
 ## Запуск на Linux
 
-Поддерживаемый контроллер — Debian 12+/Ubuntu 22.04+ с Python 3.10+. Скачайте
-`.pyz` и `.pyz.sha256` одного release, проверьте checksum и запустите:
+Поддерживаемый контроллер — Debian 12+/Ubuntu 22.04+ с Python 3.10+. После
+успешной публикации Release `v0.6.6` скачайте `.pyz` и `.pyz.sha256` этой версии,
+проверьте checksum и запустите:
 
 ```bash
 (
   set -Eeuo pipefail
-  HASH="$(tr -d '\r\n' < xhttp-setup-0.6.5.pyz.sha256)"
+  HASH="$(tr -d '\r\n' < xhttp-setup-0.6.6.pyz.sha256)"
   test "${#HASH}" -eq 64
-  printf '%s  xhttp-setup-0.6.5.pyz\n' "$HASH" | sha256sum -c -
-  python3 xhttp-setup-0.6.5.pyz --version
-  exec python3 xhttp-setup-0.6.5.pyz pc
+  printf '%s  xhttp-setup-0.6.6.pyz\n' "$HASH" | sha256sum -c -
+  python3 xhttp-setup-0.6.6.pyz --version
+  exec python3 xhttp-setup-0.6.6.pyz pc
 )
 ```
 
@@ -437,14 +438,14 @@ Release CI затем повторяет обе сборки из чистого
 байтовое совпадение `INSTRUCTION.txt`. Один успешный запуск сборщика без этой
 повторной проверки не считается доказательством воспроизводимого артефакта.
 
-Release `v0.6.5` считается готовым к установке только после успешного workflow
+Release `v0.6.6` считается готовым к установке только после успешного workflow
 и публикации ровно пяти проверенных файлов:
 
 ```text
-xhttp-setup-0.6.5.pyz
-xhttp-setup-0.6.5.pyz.sha256
-xhttp-setup-0.6.5-windows-wsl.zip
-xhttp-setup-0.6.5-windows-wsl.zip.sha256
+xhttp-setup-0.6.6.pyz
+xhttp-setup-0.6.6.pyz.sha256
+xhttp-setup-0.6.6-windows-wsl.zip
+xhttp-setup-0.6.6-windows-wsl.zip.sha256
 INSTRUCTION.txt
 ```
 
