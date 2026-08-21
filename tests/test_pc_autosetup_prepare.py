@@ -241,7 +241,7 @@ class PcPrepareTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             state = root / "state"
-            state.mkdir()
+            state.mkdir(mode=0o700)
             legacy = state / "front-probe-ports.json"
             legacy.write_text("not valid legacy state\n", encoding="utf-8")
 
