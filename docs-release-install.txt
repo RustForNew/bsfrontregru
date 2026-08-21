@@ -1,12 +1,12 @@
-Pinned public release download (v0.6.1). Keep the release tag pinned.
+Pinned public release download (v0.6.2). Keep the release tag pinned.
 This installs the minimal PC wizard documented in README.md and INSTRUCTION.txt.
 
 (
   set -Eeuo pipefail
 
   repo="RustForNew/bsfrontregru"
-  tag="v0.6.1"
-  asset="xhttp-setup-0.6.1.pyz"
+  tag="v0.6.2"
+  asset="xhttp-setup-0.6.2.pyz"
 
   command -v curl >/dev/null
   command -v python3 >/dev/null
