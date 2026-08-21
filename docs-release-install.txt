@@ -1,12 +1,13 @@
-Pinned public release download (v0.6.4). Keep the release tag pinned.
+Pinned release download (v0.6.5). Run only after the Release workflow succeeds
+and the immutable public Release exists. Keep the release tag pinned.
 This installs the minimal PC wizard documented in README.md and INSTRUCTION.txt.
 
 (
   set -Eeuo pipefail
 
   repo="RustForNew/bsfrontregru"
-  tag="v0.6.4"
-  asset="xhttp-setup-0.6.4.pyz"
+  tag="v0.6.5"
+  asset="xhttp-setup-0.6.5.pyz"
 
   command -v curl >/dev/null
   command -v python3 >/dev/null
