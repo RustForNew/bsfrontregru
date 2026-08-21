@@ -495,7 +495,8 @@ def _collect_pc_minimal_inputs() -> PcUserInputs:
             ),
         ).validate()
     panel_url = _validated_prompt(
-        "HTTPS-адрес панели REG.RU (например https://vip123.hosting.reg.ru:1500/)",
+        "HTTPS-адрес панели REG.RU (например https://vip123.hosting.reg.ru:1500/ "
+        "или https://server205.hosting.reg.ru:1500/)",
         validate_regru_panel_url,
     )
     panel_user = _validated_prompt("Логин REG.RU", validate_ssh_user)

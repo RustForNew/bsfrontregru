@@ -118,7 +118,8 @@ E2E. Их последующее включение не проверено эт
 Порт моста не спрашивается: всегда используется TCP/22. Затем в обоих режимах:
 
   6. точный HTTPS-адрес панели REG.RU,
-     например https://vip123.hosting.reg.ru:1500/
+     например https://vip123.hosting.reg.ru:1500/ или
+     https://server205.hosting.reg.ru:1500/
   7. основной логин REG.RU
   8. пароль панели REG.RU                 (ввод скрыт)
  9. IPv4 подключения REG.RU из поля «IP-адрес сервера»
@@ -380,8 +381,9 @@ VPS-провайдера этот внешний слой нельзя авто�
 отдельного cloud firewall нет, ничего вручную открывать не нужно.
 
 Минимальный PC-мастер предназначен именно для REG.RU ISPmanager с endpoint вида
-`vipNNN.hosting.reg.ru:1500`. Другой shared-hosting не является drop-in заменой:
-даже при разрешённом трафике для него нужен отдельный adapter/advanced workflow.
+`vipNNN.hosting.reg.ru:1500` или `serverNNN.hosting.reg.ru:1500`. Другой
+shared-hosting не является drop-in заменой: даже при разрешённом трафике для него
+нужен отдельный adapter/advanced workflow.
 
 
 LINUX

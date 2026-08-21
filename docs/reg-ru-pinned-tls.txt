@@ -144,7 +144,8 @@ RustForNew/bsfrontregru:
   EXIT_EGRESS_IP        исходящий IPv4 зарубежного VPS
   EXIT_SSH_PORT         фактический порт sshd, обычно 22
   BACKEND_PORT          8083
-  SFTP_HOST             hosting-node вида vipNNN.hosting.reg.ru
+  SFTP_HOST             hosting-node вида vipNNN.hosting.reg.ru или
+                        serverNNN.hosting.reg.ru
   SFTP_PORT             22
   SFTP_USER             пользователь хостинга
   DOCROOT               корень сайта из ISPmanager
@@ -439,7 +440,8 @@ Xray.
 ========================
 
 SFTP_HOST — hosting-node из адреса ISPmanager, например
-vipNNN.hosting.reg.ru. Не использовать CLIENT_CONNECT_IP или FTP IP.
+vipNNN.hosting.reg.ru или serverNNN.hosting.reg.ru. Не использовать
+CLIENT_CONNECT_IP или FTP IP.
 SFTP_PORT — 22.
 
 На российском bridge установить инструменты:

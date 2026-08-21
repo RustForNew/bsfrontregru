@@ -169,6 +169,16 @@ IP‑адрес сервера: 198.51.100.28
         self.assertEqual(credentials.panel_url, "https://vip999.hosting.reg.ru:1500/")
         self.assertEqual(credentials.ftp_server_ip, "198.51.100.28")
 
+    def test_accepts_server_panel_host_and_normalizes_case(self):
+        credentials = parse_regru_credentials(
+            regru_block(panel_url="HTTPS://SERVER205.HOSTING.REG.RU.:1500/")
+        )
+
+        self.assertEqual(
+            credentials.panel_url,
+            "https://server205.hosting.reg.ru:1500/",
+        )
+
     def test_accepts_label_punctuation_and_fullwidth_colon_without_changing_secret(
         self,
     ):
@@ -236,6 +246,21 @@ IP‑адрес сервера: 198.51.100.28
             regru_block(panel_url="https://panel.example.test:1500/"),
             regru_block(panel_url="https://vip999.hosting.reg.ru:8443/"),
             regru_block(panel_url="https://vip999.hosting.reg.ru:1500/unexpected"),
+            regru_block(panel_url="https://server.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://server205x.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://xserver205.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://foo205.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://scp81.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://spl12.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://sm12.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://server205.foo.hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://server205hosting.reg.ru:1500/"),
+            regru_block(panel_url="https://server205.hosting.reg.ru.evil:1500/"),
+            regru_block(panel_url="https://server205.hosting.reg.ru/"),
+            regru_block(panel_url="https://server205.hosting.reg.ru:8443/"),
+            regru_block(
+                panel_url="https://server205.hosting.reg.ru:1500/unexpected"
+            ),
         )
         for block in invalid_blocks:
             with self.subTest(), self.assertRaises(ValidationError) as caught:

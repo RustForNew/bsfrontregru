@@ -184,7 +184,8 @@ class PcMinimalInputTests(unittest.TestCase):
                 "SSH password выхода: ",
                 "Использовать мост для входа? [y/N]: ",
                 "HTTPS-адрес панели REG.RU "
-                "(например https://vip123.hosting.reg.ru:1500/): ",
+                "(например https://vip123.hosting.reg.ru:1500/ или "
+                "https://server205.hosting.reg.ru:1500/): ",
                 "Логин REG.RU: ",
                 "Пароль панели REG.RU: ",
                 "IPv4 подключения REG.RU (поле «IP-адрес сервера»): ",
@@ -244,7 +245,8 @@ class PcMinimalInputTests(unittest.TestCase):
                 "SSH login моста [root]: ",
                 "SSH password моста: ",
                 "HTTPS-адрес панели REG.RU "
-                "(например https://vip123.hosting.reg.ru:1500/): ",
+                "(например https://vip123.hosting.reg.ru:1500/ или "
+                "https://server205.hosting.reg.ru:1500/): ",
                 "Логин REG.RU: ",
                 "Пароль панели REG.RU: ",
                 "IPv4 подключения REG.RU (поле «IP-адрес сервера»): ",

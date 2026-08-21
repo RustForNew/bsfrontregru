@@ -23,7 +23,7 @@ _FIELD_LINE = re.compile(
     r"^\s*(?P<label>[^:：\r\n]{1,96})\s*[:：]\s*(?P<value>.*?)\s*$"
 )
 _MARKDOWN_LINK = re.compile(r"^\[([^\]\r\n]+)\]\(([^()\s]+)\)$")
-_REGRU_PANEL_HOST = re.compile(r"^vip[0-9]+\.hosting\.reg\.ru$")
+_REGRU_PANEL_HOST = re.compile(r"^(?:vip|server)[0-9]+\.hosting\.reg\.ru$")
 _DASHES = str.maketrans(
     {
         "\N{HYPHEN}": "-",

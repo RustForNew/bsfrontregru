@@ -83,6 +83,12 @@ VLESS Encryption, bare Xray exit без Remnawave. `METHOD-bs-front.md` и ви�
 
 ## Версии PC-мастера
 
+Исходный код `0.6.6` добавляет к строгому allowlist панели REG.RU штатную
+ISPmanager-семью `serverNNN.hosting.reg.ru`, сохраняя `vipNNN.hosting.reg.ru`.
+HTTPS, обязательный порт 1500, известные пути и запрет userinfo/query/fragment
+не ослаблены. До успешной публикации immutable Release `v0.6.6` текущим
+публичным Release остаётся `v0.6.5`.
+
 `v0.6.5` считается текущим публичным immutable Release только после успешных CI
 и Release workflow, проверки Windows launcher и публикации пяти артефактов. До
 этого текущим публичным Release остаётся `v0.6.4`. `v0.6.1` ошибочно отклоняет

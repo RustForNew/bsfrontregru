@@ -47,11 +47,12 @@
   separately with hidden password input. PC mode disables core dumps before
   reading credentials. The program cannot clear the host clipboard or its
   history.
-- REG.RU endpoints are restricted to ISPmanager login URLs on
-  `vip<digits>.hosting.reg.ru:1500` with a known path before the panel secret is
-  requested or sent. The endpoint uses the system CA store, rejects redirects
-  and has no userinfo, query or fragment. The PC flow performs only login and a
-  read-only exact site lookup; it never creates or edits a site.
+- REG.RU endpoints are restricted to ISPmanager login URLs on the known
+  `vip<digits>.hosting.reg.ru:1500` or
+  `server<digits>.hosting.reg.ru:1500` node families with a known path before
+  the panel secret is requested or sent. The endpoint uses the system CA store,
+  rejects redirects and has no userinfo, query or fragment. The PC flow performs
+  only login and a read-only exact site lookup; it never creates or edits a site.
 - The panel password is tried once as the primary-account SFTP password. A
   separate hidden SFTP password is requested, up to three total authentication
   attempts, only after
